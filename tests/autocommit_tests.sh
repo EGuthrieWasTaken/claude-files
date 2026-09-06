@@ -193,6 +193,25 @@ else
   bad "dirty-tree scoping" "remote src/app.py='$remote_app'"
 fi
 
+# --- 7c. an unreachable remote is not a "conflict" (regression) ------------
+# Any push failure used to be treated as divergence, so an auth or network
+# error was reported as a rebase conflict -- sending you after a merge problem
+# that does not exist.
+reset_fixture
+inc 'git -C /work/repo remote set-url origin /work/does-not-exist.git' >/dev/null
+echo "ours" > "$FIX/repo/shared/unreachable.txt"
+out=$(sidecar)
+if grep -q "not because the remote moved" <<<"$out" && ! grep -qi "conflict" <<<"$out"; then
+  ok "unreachable remote reports the real error, not a conflict"
+else
+  bad "push error classification" "$(grep -E 'ERROR' <<<"$out" | head -2 | tr '\n' ' ')"
+fi
+if local_log | grep -q "agent: sync"; then
+  ok "the commit is kept locally for the next retry"
+else
+  bad "commit retention" "commit was lost"
+fi
+
 # --- 8. runaway guard -------------------------------------------------------
 reset_fixture
 for i in $(seq 1 6); do echo "f$i" > "$FIX/repo/shared/file$i.txt"; done

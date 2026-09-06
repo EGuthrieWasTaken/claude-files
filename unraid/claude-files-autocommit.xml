@@ -59,6 +59,10 @@
           Description="Branch to commit and push. Must be the branch currently checked out in the repo; the container refuses to start otherwise."
           Type="Variable" Display="always" Required="false" Mask="false">main</Config>
 
+  <Config Name="Git Remote" Target="GIT_REMOTE" Default="origin" Mode=""
+          Description="Which remote to push to. Leave as origin unless you keep a separate SSH remote for the deploy key -- e.g. set this to 'deploy' so origin can stay HTTPS for your own use on the console. The container refuses to start if the named remote is not configured."
+          Type="Variable" Display="always" Required="false" Mask="false">origin</Config>
+
   <Config Name="SSH Deploy Key" Target="/keys/id_ed25519" Default="" Mode="ro"
           Description="Host path to a private deploy key with write access to this one repository. Mounted read-only and re-staged to tmpfs at 0600 inside the container. Leave blank if using a token instead."
           Type="Path" Display="always" Required="false" Mask="false"></Config>

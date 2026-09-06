@@ -318,6 +318,7 @@ Also handled:
 | `INTERVAL` | `120` | Seconds between polls. |
 | `QUIET_PERIOD` | `30` | Skip if a file changed this recently. `0` disables. |
 | `GIT_BRANCH` | current branch | Must match what's checked out. |
+| `GIT_REMOTE` | `origin` | Which remote to push to. Use a second SSH remote here to leave `origin` on HTTPS for host-side use. |
 | `MAX_CHANGED_FILES` | `1000` | Runaway guard. `0` disables. |
 | `SSH_KEY_PATH` | — | Deploy key, mounted read-only. Staged to tmpfs at 0600. |
 | `SSH_KNOWN_HOSTS_PATH` | — | Pins the host key. Without it, trust-on-first-use with a warning. |

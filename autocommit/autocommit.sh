@@ -94,12 +94,28 @@ setup_credentials() {
   local ssh_opts=""
 
   if [[ -n "$SSH_KEY_PATH" ]]; then
-    [[ -f "$SSH_KEY_PATH" ]] || die "SSH_KEY_PATH does not exist: $SSH_KEY_PATH"
+    # A folder mapped onto this path is the common misconfiguration: the
+    # container then sees a directory here, not the key. Say so explicitly --
+    # "does not exist" sends people looking for the wrong problem.
+    if [[ -d "$SSH_KEY_PATH" ]]; then
+      log FATAL "SSH_KEY_PATH is a directory, not a file: $SSH_KEY_PATH"
+      log FATAL "You have mapped a FOLDER to this path. Either:"
+      log FATAL "  (a) map the key FILE itself to $SSH_KEY_PATH, or"
+      log FATAL "  (b) map the folder to /keys and set SSH_KEY_PATH=/keys/<keyfilename>"
+      log FATAL "Contents seen at $SSH_KEY_PATH: $(ls -A "$SSH_KEY_PATH" 2>/dev/null | tr '\n' ' ')"
+      exit 1
+    fi
+    [[ -f "$SSH_KEY_PATH" ]] || die "SSH_KEY_PATH does not exist: $SSH_KEY_PATH (check the container path mapping)"
     # ssh refuses a key with loose permissions, and a read-only bind mount
     # from the host usually arrives as 0644. Copy to tmpfs and tighten.
     install -m 600 "$SSH_KEY_PATH" /tmp/id_key || die "could not stage the ssh key"
     ssh_opts="-i /tmp/id_key -o IdentitiesOnly=yes"
 
+    if [[ -d "$SSH_KNOWN_HOSTS_PATH" ]]; then
+      log WARN "SSH_KNOWN_HOSTS_PATH is a directory, not a file: $SSH_KNOWN_HOSTS_PATH"
+      log WARN "Map the known_hosts FILE here, or point this at a file inside a mounted folder."
+      SSH_KNOWN_HOSTS_PATH=""
+    fi
     if [[ -n "$SSH_KNOWN_HOSTS_PATH" && -f "$SSH_KNOWN_HOSTS_PATH" ]]; then
       install -m 600 "$SSH_KNOWN_HOSTS_PATH" /tmp/known_hosts
       ssh_opts="$ssh_opts -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/tmp/known_hosts"
@@ -212,7 +228,18 @@ sync_once() {
     return 0
   fi
 
-  log INFO "push rejected, rebasing onto $GIT_REMOTE/$GIT_BRANCH"
+  # Only a non-fast-forward rejection means the remote moved. Anything else --
+  # auth failure, DNS, an unreachable host -- must be reported as itself.
+  # Rebasing on top of such a failure produces a bogus "conflict" error that
+  # sends you looking for a merge problem that does not exist.
+  if ! grep -qiE 'non-fast-forward|fetch first|\[rejected\]|behind its remote|updates were rejected' <<<"$push_err"; then
+    log ERROR "push to $GIT_REMOTE/$GIT_BRANCH failed, and not because the remote moved:"
+    printf '%s\n' "$push_err" | head -10 | while read -r l; do [[ -n "$l" ]] && log ERROR "  $l"; done
+    log ERROR "the commit is kept locally and will retry next cycle"
+    return 1
+  fi
+
+  log INFO "push rejected as non-fast-forward, rebasing onto $GIT_REMOTE/$GIT_BRANCH"
 
   # Only reached on real divergence. --autostash is required, not optional:
   # any unrelated uncommitted edit elsewhere in the working tree makes rebase
@@ -225,8 +252,10 @@ sync_once() {
     printf '%s\n' "$dirty" | head -10 | while read -r l; do log WARN "  $l"; done
   fi
 
-  if ! git -C "$REPO_PATH" pull --rebase --autostash --quiet "$GIT_REMOTE" "$GIT_BRANCH"; then
-    log ERROR "rebase onto $GIT_REMOTE/$GIT_BRANCH hit a conflict; aborting it"
+  local rebase_err
+  if ! rebase_err="$(git -C "$REPO_PATH" pull --rebase --autostash "$GIT_REMOTE" "$GIT_BRANCH" 2>&1)"; then
+    log ERROR "rebase onto $GIT_REMOTE/$GIT_BRANCH failed:"
+    printf '%s\n' "$rebase_err" | head -10 | while read -r l; do [[ -n "$l" ]] && log ERROR "  $l"; done
     git -C "$REPO_PATH" rebase --abort 2>/dev/null
     log ERROR "the local commit is kept and will retry next cycle; resolve by hand if it persists"
     return 1

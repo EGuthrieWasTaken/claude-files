@@ -81,7 +81,7 @@ The image is published multi-arch on Docker Hub, so unRAID pulls `linux/amd64`
 on its own:
 
 ```bash
-docker pull eguthriewastaken2/claude-files:1.0.0
+docker pull eguthriewastaken2/claude-files:latest
 ```
 
 ### 3. Generate a token
@@ -105,7 +105,7 @@ it if you only want the API. To add the API by hand instead:
 
 | Field | Value |
 |---|---|
-| Repository | `eguthriewastaken2/claude-files:1.0.0` |
+| Repository | `eguthriewastaken2/claude-files:latest` |
 | Network Type | `bridge` |
 | Port | `8080` → `8080` |
 | Path | **Container** `/data` → **Host** `/mnt/user/appdata/repos/myrepo/shared` (Read/Write) |
@@ -361,7 +361,7 @@ docker buildx imagetools inspect eguthriewastaken2/claude-files:1.0.0
 The sidecar is a separate image, built the same way:
 
 ```bash
-docker buildx build --platform linux/amd64,linux/arm64 --tag eguthriewastaken2/claude-files-autocommit:1.0.0 --push ./autocommit
+docker buildx build --platform linux/amd64,linux/arm64 --tag eguthriewastaken2/claude-files-autocommit:1.0.0 --tag eguthriewastaken2/claude-files-autocommit:latest --push ./autocommit
 ```
 
 Building on separate machines and pushing to the same tag does **not** produce
@@ -373,6 +373,11 @@ docker buildx imagetools create --tag eguthriewastaken2/claude-files:1.0.0 eguth
 ```
 
 On Arch Linux, `docker buildx` is a separate package: `sudo pacman -S docker-buildx`.
+
+The unRAID templates pull `:latest`, so always push both tags. `docker-compose.yml`
+stays pinned to `:1.0.0` on purpose — compose deployments should be
+reproducible, and `:latest` there would silently change what runs on the next
+`up`.
 
 ---
 

@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>claude-files</Name>
-  <Repository>eguthriewastaken2/claude-files:1.0.0</Repository>
+  <Repository>eguthriewastaken2/claude-files:latest</Repository>
   <Registry>https://hub.docker.com/r/eguthriewastaken2/claude-files</Registry>
   <Network>bridge</Network>
   <MyIP/>

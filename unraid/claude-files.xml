@@ -1,0 +1,76 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>claude-files</Name>
+  <Repository>claude-files:1.0.0</Repository>
+  <Registry/>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support/>
+  <Project/>
+  <Overview>
+    REST file API confined to a single shared folder. Give Claude (or any
+    agent) upload/download/replace/delete access to one subfolder of a git
+    repository while the rest of the repository stays completely unreachable.
+
+    IMPORTANT: the host path below must point at the SUBFOLDER you want to
+    expose, never at the repository root. That bind mount is the security
+    boundary.
+  </Overview>
+  <Category>Productivity: Tools: Utilities:</Category>
+  <WebUI>http://[IP]:[PORT:8080]/docs</WebUI>
+  <TemplateURL/>
+  <Icon>https://raw.githubusercontent.com/yourname/claude-files/main/icon.png</Icon>
+  <ExtraParams>--read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m --cap-drop ALL --security-opt no-new-privileges:true --pids-limit 200 --memory 512m</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires/>
+
+  <Config Name="WebUI Port" Target="8080" Default="8080" Mode="tcp"
+          Description="Port the API listens on."
+          Type="Port" Display="always" Required="true" Mask="false">8080</Config>
+
+  <Config Name="Shared Folder" Target="/data" Default="" Mode="rw"
+          Description="HOST PATH OF THE SUBFOLDER TO EXPOSE. Point this at the subfolder only, e.g. /mnt/user/appdata/repos/myrepo/shared -- never at the repo root. Everything above this path is invisible to the container."
+          Type="Path" Display="always" Required="true" Mask="false"></Config>
+
+  <Config Name="API Token" Target="API_TOKEN" Default="" Mode=""
+          Description="Bearer token for full read/write access. Generate with: openssl rand -hex 32"
+          Type="Variable" Display="always" Required="true" Mask="true"></Config>
+
+  <Config Name="Read-only API Token" Target="API_TOKEN_READONLY" Default="" Mode=""
+          Description="Optional second token that can list and download but not write or delete."
+          Type="Variable" Display="always" Required="false" Mask="true"></Config>
+
+  <Config Name="Max Upload Bytes" Target="MAX_UPLOAD_BYTES" Default="268435456" Mode=""
+          Description="Largest accepted upload, in bytes. Default 256 MiB."
+          Type="Variable" Display="advanced" Required="false" Mask="false">268435456</Config>
+
+  <Config Name="Denied Names" Target="DENIED_NAMES" Default=".git,.gitmodules,.ssh" Mode=""
+          Description="Comma-separated path components that are always refused, at any depth."
+          Type="Variable" Display="advanced" Required="false" Mask="false">.git,.gitmodules,.ssh</Config>
+
+  <Config Name="Allow Delete" Target="ALLOW_DELETE" Default="true" Mode=""
+          Description="Set to false to make the API append/replace-only."
+          Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
+
+  <Config Name="Allow Hardlinked Files" Target="ALLOW_HARDLINKED_FILES" Default="false" Mode=""
+          Description="Leave false. When false, files with more than one hard link are refused, because such a file can alias content outside the shared folder."
+          Type="Variable" Display="advanced" Required="false" Mask="false">false</Config>
+
+  <Config Name="Enable Docs" Target="ENABLE_DOCS" Default="true" Mode=""
+          Description="Serve OpenAPI docs at /docs and /openapi.json."
+          Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
+
+  <Config Name="Rate Limit Per Minute" Target="RATE_LIMIT_PER_MINUTE" Default="600" Mode=""
+          Description="Requests per minute across all clients. 0 disables."
+          Type="Variable" Display="advanced" Required="false" Mask="false">600</Config>
+
+  <Config Name="PUID" Target="PUID" Default="99" Mode=""
+          Description="Informational. Set the container user with --user 99:100 in Extra Parameters if you need specific file ownership."
+          Type="Variable" Display="advanced" Required="false" Mask="false">99</Config>
+</Container>

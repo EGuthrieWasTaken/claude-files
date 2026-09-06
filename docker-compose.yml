@@ -1,0 +1,57 @@
+services:
+  claude-files:
+    build: .
+    image: claude-files:1.0.0
+    container_name: claude-files
+    restart: unless-stopped
+
+    # ------------------------------------------------------------------
+    # THE containment boundary. Bind-mount ONLY the subfolder you want
+    # exposed. The rest of the repository is not in the container's mount
+    # namespace, so no bug in the API can reach it.
+    #
+    #   left side  = the subfolder on the host  <-- change this
+    #   right side = always /data
+    # ------------------------------------------------------------------
+    volumes:
+      - /mnt/user/appdata/repos/myrepo/shared:/data
+
+    environment:
+      # openssl rand -hex 32
+      API_TOKEN: "${API_TOKEN:?set API_TOKEN in .env}"
+      # Optional second token that can read but not write.
+      API_TOKEN_READONLY: "${API_TOKEN_READONLY:-}"
+      MAX_UPLOAD_BYTES: "268435456"      # 256 MiB
+      DENIED_NAMES: ".git,.gitmodules,.ssh"
+      ALLOW_DELETE: "true"
+      ALLOW_HARDLINKED_FILES: "false"
+      ENABLE_DOCS: "true"
+      REQUIRE_MOUNT: "true"     # refuse to start if /data is not a bind mount
+      RATE_LIMIT_PER_MINUTE: "600"
+      LOG_LEVEL: "INFO"
+
+    # unRAID's nobody:users. Files the API writes will be owned by this.
+    user: "99:100"
+
+    ports:
+      - "8080:8080"
+
+    # ------------------------------------------------------------------
+    # Hardening. Each line removes a way out of the container.
+    # ------------------------------------------------------------------
+    read_only: true                      # rootfs is immutable; only /data is writable
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    cap_drop:
+      - ALL                              # no CAP_DAC_OVERRIDE, no CAP_SYS_ADMIN
+    security_opt:
+      - no-new-privileges:true           # setuid binaries cannot escalate
+    pids_limit: 200
+    mem_limit: 512m
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

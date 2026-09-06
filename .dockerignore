@@ -1,0 +1,5 @@
+.git
+tests
+unraid
+*.md
+**/__pycache__

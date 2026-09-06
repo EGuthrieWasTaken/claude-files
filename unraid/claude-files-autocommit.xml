@@ -1,0 +1,105 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>claude-files-autocommit</Name>
+  <Repository>eguthriewastaken2/claude-files-autocommit:1.0.0</Repository>
+  <Registry>https://hub.docker.com/r/eguthriewastaken2/claude-files-autocommit</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support/>
+  <Project/>
+  <Overview>
+    Optional companion to claude-files. Polls the shared folder and commits
+    and pushes whatever an agent writes there.
+
+    Unlike claude-files, this container mounts the REPOSITORY ROOT, because
+    it needs .git in order to make a commit. What keeps it in scope is the
+    Commit Subfolder setting below: every `git add` is scoped to that folder,
+    so the sidecar can only ever commit the same folder the API can write to.
+    Anything else in the working tree is left alone.
+
+    Set Commit Subfolder to the SAME folder that claude-files exposes. The
+    container refuses to start if it is empty, ".", absolute, or contains
+    "..", since any of those would silently widen it to the whole repository.
+
+    It polls rather than using inotify on purpose: unRAID's /mnt/user is a
+    FUSE layer and inotify through it silently drops events, which would mean
+    files that never get committed and nothing to tell you.
+  </Overview>
+  <Category>Productivity: Tools: Utilities:</Category>
+  <WebUI/>
+  <TemplateURL/>
+  <Icon/>
+  <ExtraParams>--read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=32m --cap-drop ALL --security-opt no-new-privileges:true --pids-limit 100 --memory 256m --user 99:100</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires>Pairs with the claude-files container pointed at the same folder.</Requires>
+
+  <Config Name="Repository Root" Target="/repo" Default="" Mode="rw"
+          Description="HOST PATH OF THE REPOSITORY ROOT (the folder containing .git), e.g. /mnt/user/appdata/repos/myrepo. This is wider than what claude-files mounts, because committing requires .git. Scope is enforced by Commit Subfolder below."
+          Type="Path" Display="always" Required="true" Mask="false"></Config>
+
+  <Config Name="Commit Subfolder" Target="SUBDIR" Default="shared" Mode=""
+          Description="Folder to commit, RELATIVE to the repository root. Must match the folder claude-files exposes. Every git add is scoped to this path. The container refuses to start if this is empty, '.', absolute, or contains '..'."
+          Type="Variable" Display="always" Required="true" Mask="false">shared</Config>
+
+  <Config Name="Poll Interval (seconds)" Target="INTERVAL" Default="120" Mode=""
+          Description="Seconds between checks for new files."
+          Type="Variable" Display="always" Required="false" Mask="false">120</Config>
+
+  <Config Name="Quiet Period (seconds)" Target="QUIET_PERIOD" Default="30" Mode=""
+          Description="Skip the commit if any file changed this recently, so a burst of uploads becomes one commit instead of catching a half-finished batch. 0 disables."
+          Type="Variable" Display="always" Required="false" Mask="false">30</Config>
+
+  <Config Name="Git Branch" Target="GIT_BRANCH" Default="main" Mode=""
+          Description="Branch to commit and push. Must be the branch currently checked out in the repo; the container refuses to start otherwise."
+          Type="Variable" Display="always" Required="false" Mask="false">main</Config>
+
+  <Config Name="SSH Deploy Key" Target="/keys/id_ed25519" Default="" Mode="ro"
+          Description="Host path to a private deploy key with write access to this one repository. Mounted read-only and re-staged to tmpfs at 0600 inside the container. Leave blank if using a token instead."
+          Type="Path" Display="always" Required="false" Mask="false"></Config>
+
+  <Config Name="SSH Key Path" Target="SSH_KEY_PATH" Default="/keys/id_ed25519" Mode=""
+          Description="Where the deploy key is mounted inside the container. Leave as-is unless you changed the path above. Clear this if you are using a token."
+          Type="Variable" Display="always" Required="false" Mask="false">/keys/id_ed25519</Config>
+
+  <Config Name="SSH known_hosts" Target="/keys/known_hosts" Default="" Mode="ro"
+          Description="Host path to a known_hosts file pinning your git host's key. Generate with: ssh-keyscan github.com &gt; known_hosts. Strongly recommended -- without it the sidecar trusts the host key on first use."
+          Type="Path" Display="always" Required="false" Mask="false"></Config>
+
+  <Config Name="SSH known_hosts Path" Target="SSH_KNOWN_HOSTS_PATH" Default="/keys/known_hosts" Mode=""
+          Description="Where known_hosts is mounted inside the container. Clear this to allow trust-on-first-use instead."
+          Type="Variable" Display="advanced" Required="false" Mask="false">/keys/known_hosts</Config>
+
+  <Config Name="Git Token" Target="GIT_TOKEN" Default="" Mode=""
+          Description="Personal access token, as an alternative to an SSH deploy key. Held in tmpfs and never written to disk. Leave blank when using a key."
+          Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
+
+  <Config Name="Max Changed Files" Target="MAX_CHANGED_FILES" Default="1000" Mode=""
+          Description="Runaway guard. If more than this many files changed in one poll, refuse to commit and log loudly rather than pushing what might be a mass deletion. 0 disables."
+          Type="Variable" Display="always" Required="false" Mask="false">1000</Config>
+
+  <Config Name="Push" Target="PUSH" Default="true" Mode=""
+          Description="Set to false to commit locally without pushing to the remote."
+          Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
+
+  <Config Name="Dry Run" Target="DRY_RUN" Default="false" Mode=""
+          Description="Log what would be committed and change nothing. Useful for a cycle or two when first setting this up."
+          Type="Variable" Display="advanced" Required="false" Mask="false">false</Config>
+
+  <Config Name="Commit Author Name" Target="GIT_AUTHOR_NAME" Default="claude-files autocommit" Mode=""
+          Description="Name recorded on the commits."
+          Type="Variable" Display="advanced" Required="false" Mask="false">claude-files autocommit</Config>
+
+  <Config Name="Commit Author Email" Target="GIT_AUTHOR_EMAIL" Default="autocommit@localhost" Mode=""
+          Description="Email recorded on the commits."
+          Type="Variable" Display="advanced" Required="false" Mask="false">autocommit@localhost</Config>
+
+  <Config Name="Commit Message Prefix" Target="COMMIT_PREFIX" Default="agent: sync" Mode=""
+          Description="Prefix for generated commit messages. The file count is appended, and the changed paths go in the commit body."
+          Type="Variable" Display="advanced" Required="false" Mask="false">agent: sync</Config>
+</Container>

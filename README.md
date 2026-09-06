@@ -92,9 +92,16 @@ openssl rand -hex 32
 
 ### 4. Add the container
 
-Copy `unraid/claude-files.xml` to `/boot/config/plugins/dockerMan/templates-user/`
-and it appears under **Docker → Add Container → Template**. Or add it by hand
-with these settings:
+Copy the templates to `/boot/config/plugins/dockerMan/templates-user/` and
+they appear under **Docker → Add Container → Template**:
+
+```bash
+cp unraid/claude-files.xml unraid/claude-files-autocommit.xml /boot/config/plugins/dockerMan/templates-user/
+```
+
+`claude-files-autocommit.xml` is the optional sidecar covered in
+[Auto-committing what agents write](#auto-committing-what-agents-write); skip
+it if you only want the API. To add the API by hand instead:
 
 | Field | Value |
 |---|---|
@@ -253,6 +260,19 @@ serves and agent output lands in git on its own.
 ```bash
 docker compose up -d autocommit
 ```
+
+On unRAID, add `unraid/claude-files-autocommit.xml` as a second container.
+Two fields matter:
+
+| Field | Value |
+|---|---|
+| Repository Root | the repo root — `/mnt/user/appdata/repos/myrepo`, the folder containing `.git` |
+| Commit Subfolder | `shared` — the same folder `claude-files` exposes |
+
+Point the deploy key and `known_hosts` at host paths and leave the rest at
+their defaults. If you declare an SSH key path but don't mount a key, the
+container refuses to start and says so in the log rather than running without
+push access.
 
 **It polls rather than watching with inotify, deliberately.** unRAID's
 `/mnt/user` is a FUSE layer, and inotify through it silently drops events —

@@ -22,7 +22,7 @@
   <WebUI>http://[IP]:[PORT:8080]/docs</WebUI>
   <TemplateURL/>
   <Icon/>
-  <ExtraParams>--read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m --cap-drop ALL --security-opt no-new-privileges:true --pids-limit 200 --memory 512m</ExtraParams>
+  <ExtraParams>--read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m --cap-drop ALL --security-opt no-new-privileges:true --pids-limit 200 --memory 512m --user 99:100</ExtraParams>
   <PostArgs/>
   <CPUset/>
   <DateInstalled/>
@@ -70,7 +70,7 @@
           Description="Requests per minute across all clients. 0 disables."
           Type="Variable" Display="advanced" Required="false" Mask="false">600</Config>
 
-  <Config Name="PUID" Target="PUID" Default="99" Mode=""
-          Description="Informational. Set the container user with --user 99:100 in Extra Parameters if you need specific file ownership."
-          Type="Variable" Display="advanced" Required="false" Mask="false">99</Config>
+  <Config Name="Require Mount" Target="REQUIRE_MOUNT" Default="true" Mode=""
+          Description="Refuse to start if the shared folder is not actually mounted. Leave true: it turns a typo in the host path into a loud failure instead of uploads that silently vanish with the container."
+          Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
 </Container>

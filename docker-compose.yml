@@ -1,7 +1,8 @@
 services:
   claude-files:
-    build: .
-    image: claude-files:1.0.0
+    image: eguthriewastaken2/claude-files:1.0.0
+    # Uncomment to build from source instead of pulling:
+    # build: .
     container_name: claude-files
     restart: unless-stopped
 
@@ -55,3 +56,53 @@ services:
       timeout: 5s
       retries: 3
       start_period: 5s
+
+  # ------------------------------------------------------------------------
+  # Optional sidecar: commits and pushes whatever the API writes.
+  #
+  # Note the asymmetry with the service above. This one mounts the REPO ROOT,
+  # because it needs .git to make a commit. Its containment is different in
+  # kind: SUBDIR scopes every `git add`, so it can only ever commit the same
+  # folder the API can write. Anything else in the working tree is left alone.
+  # ------------------------------------------------------------------------
+  autocommit:
+    image: eguthriewastaken2/claude-files-autocommit:1.0.0
+    # build: ./autocommit
+    container_name: claude-files-autocommit
+    restart: unless-stopped
+    depends_on:
+      - claude-files
+
+    volumes:
+      # The repo root -- .git is required to commit.
+      - /mnt/user/appdata/repos/myrepo:/repo
+      # A deploy key with write access to this one repo, read-only to us.
+      - /mnt/user/appdata/keys/deploy_ed25519:/keys/id_ed25519:ro
+      - /mnt/user/appdata/keys/known_hosts:/keys/known_hosts:ro
+
+    environment:
+      REPO_PATH: "/repo"
+      # Must match the folder claude-files exposes, relative to the repo root.
+      SUBDIR: "shared"
+      INTERVAL: "120"
+      QUIET_PERIOD: "30"
+      GIT_BRANCH: "main"
+      GIT_AUTHOR_NAME: "claude-files autocommit"
+      GIT_AUTHOR_EMAIL: "autocommit@localhost"
+      COMMIT_PREFIX: "agent: sync"
+      MAX_CHANGED_FILES: "1000"
+      SSH_KEY_PATH: "/keys/id_ed25519"
+      SSH_KNOWN_HOSTS_PATH: "/keys/known_hosts"
+      PUSH: "true"
+
+    user: "99:100"
+
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 100
+    mem_limit: 256m

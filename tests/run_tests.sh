@@ -16,7 +16,17 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
-FIXTURE="${FIXTURE_DIR:-$ROOT/.fixture}"
+FIXTURE_BASE="${FIXTURE_DIR:-$ROOT/.fixture}"
+FIXTURE_N=0
+FIXTURE=""
+
+# A fresh directory per step. Deleting and recreating one path leaves Docker
+# bind-mounting a stale inode on macOS, which shows up as an empty /data.
+new_fixture() {
+  FIXTURE_N=$((FIXTURE_N + 1))
+  FIXTURE="$FIXTURE_BASE/f$FIXTURE_N"
+  bash tests/make_fixture.sh "$FIXTURE" >/dev/null
+}
 IMAGE="claude-files:test"
 TOKEN="test-token-$(openssl rand -hex 16)"
 RO_TOKEN="test-ro-token-$(openssl rand -hex 16)"
@@ -24,7 +34,7 @@ FAIL=0
 
 cleanup() {
   docker rm -f cf-test-a cf-test-b >/dev/null 2>&1 || true
-  [[ "${KEEP_FIXTURE:-0}" == "1" ]] || rm -rf "$FIXTURE"
+  [[ "${KEEP_FIXTURE:-0}" == "1" ]] || rm -rf "$FIXTURE_BASE"
 }
 trap cleanup EXIT
 
@@ -60,7 +70,6 @@ run_mode() {
   echo "############################################################"
   echo "## MODE: $mode"
   echo "############################################################"
-  bash tests/make_fixture.sh "$FIXTURE" >/dev/null
   docker rm -f "$name" >/dev/null 2>&1 || true
   docker run "${common_flags[@]}" --name "$name" -p "127.0.0.1:$port:8080" "$@" "$IMAGE" >/dev/null
   wait_healthy "$name" "$port"
@@ -76,13 +85,14 @@ run_mode() {
 }
 
 # A) production layout: only the subfolder is mounted
+new_fixture   # must precede the call: $FIXTURE is expanded in the arguments
 run_mode "isolated (only subfolder mounted)" cf-test-a 18080 \
   -v "$FIXTURE/repo/shared:/data"
 
 # Prove the repo is genuinely absent from that container's namespace
 echo
 echo "==> Namespace check: what can the container actually see?"
-bash tests/make_fixture.sh "$FIXTURE" >/dev/null
+new_fixture
 docker run --rm -v "$FIXTURE/repo/shared:/data" --entrypoint python "$IMAGE" -c "
 import os
 print('  contents of /data      :', sorted(os.listdir('/data')))
@@ -107,7 +117,7 @@ fi
 # Stale temp files from an interrupted upload are swept at startup.
 echo
 echo "==> Startup sweep: stale upload temp files"
-bash tests/make_fixture.sh "$FIXTURE" >/dev/null
+new_fixture
 touch "$FIXTURE/repo/shared/.upload-deadbeef.tmp" "$FIXTURE/repo/shared/nested/.upload-cafe.tmp"
 if docker run --rm -e API_TOKEN=aaaaaaaaaaaaaaaaaaaa -v "$FIXTURE/repo/shared:/data" \
      --entrypoint python "$IMAGE" -c "
@@ -121,6 +131,7 @@ else
 fi
 
 # B) weakened layout: the whole repo is mounted, app-level checks stand alone
+new_fixture
 run_mode "app-only (whole repo mounted, no mount boundary)" cf-test-b 18081 \
   -v "$FIXTURE/repo:/repo" -e DATA_ROOT=/repo/shared
 

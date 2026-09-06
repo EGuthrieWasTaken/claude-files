@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>claude-files</Name>
-  <Repository>claude-files:1.0.0</Repository>
-  <Registry/>
+  <Repository>eguthriewastaken2/claude-files:1.0.0</Repository>
+  <Registry>https://hub.docker.com/r/eguthriewastaken2/claude-files</Registry>
   <Network>bridge</Network>
   <MyIP/>
   <Shell>sh</Shell>
@@ -21,7 +21,7 @@
   <Category>Productivity: Tools: Utilities:</Category>
   <WebUI>http://[IP]:[PORT:8080]/docs</WebUI>
   <TemplateURL/>
-  <Icon>https://raw.githubusercontent.com/yourname/claude-files/main/icon.png</Icon>
+  <Icon/>
   <ExtraParams>--read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m --cap-drop ALL --security-opt no-new-privileges:true --pids-limit 200 --memory 512m</ExtraParams>
   <PostArgs/>
   <CPUset/>

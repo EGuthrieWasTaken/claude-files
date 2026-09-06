@@ -15,7 +15,7 @@ FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="claude-files" \
       org.opencontainers.image.description="REST file API confined to a single shared folder" \
-      org.opencontainers.image.source="https://github.com/yourname/claude-files"
+      org.opencontainers.image.source="https://hub.docker.com/r/eguthriewastaken2/claude-files"
 
 ENV PATH="/venv/bin:$PATH" \
     PYTHONDONTWRITEBYTECODE=1 \

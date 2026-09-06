@@ -41,8 +41,11 @@ Put that token in `.env`, point the volume in `docker-compose.yml` at your
 subfolder, then:
 
 ```bash
-docker compose up -d --build
+docker compose up -d
 ```
+
+That pulls the published image. To run your own build instead, uncomment
+`build: .` in `docker-compose.yml` and use `docker compose up -d --build`.
 
 Verify:
 
@@ -72,12 +75,13 @@ If the folder doesn't exist yet:
 mkdir -p /mnt/user/appdata/repos/myrepo/shared && chown 99:100 /mnt/user/appdata/repos/myrepo/shared
 ```
 
-### 2. Build the image on the unRAID box
+### 2. Nothing to build
 
-There's no published image, so build it once:
+The image is published multi-arch on Docker Hub, so unRAID pulls `linux/amd64`
+on its own:
 
 ```bash
-cd /mnt/user/appdata && git clone <this-repo> claude-files-src && docker build -t claude-files:1.0.0 /mnt/user/appdata/claude-files-src
+docker pull eguthriewastaken2/claude-files:1.0.0
 ```
 
 ### 3. Generate a token
@@ -94,7 +98,7 @@ with these settings:
 
 | Field | Value |
 |---|---|
-| Repository | `claude-files:1.0.0` |
+| Repository | `eguthriewastaken2/claude-files:1.0.0` |
 | Network Type | `bridge` |
 | Port | `8080` → `8080` |
 | Path | **Container** `/data` → **Host** `/mnt/user/appdata/repos/myrepo/shared` (Read/Write) |
@@ -237,6 +241,112 @@ check re-hashes everything outside the shared folder and compares.
   folder. If something downstream executes what lands there, that's your
   boundary to think about, not this one.
 - **A kernel or Docker escape.** Out of scope for any container.
+
+---
+
+## Auto-committing what agents write
+
+`autocommit/` is an optional sidecar that polls the shared folder and commits
+and pushes whatever appears. Point it at the same folder `claude-files`
+serves and agent output lands in git on its own.
+
+```bash
+docker compose up -d autocommit
+```
+
+**It polls rather than watching with inotify, deliberately.** unRAID's
+`/mnt/user` is a FUSE layer, and inotify through it silently drops events —
+and a missed event is a file that never gets committed, with nothing to tell
+you. A poll cannot miss anything, and it batches a burst of forty uploads
+into one commit instead of forty.
+
+### What keeps it in scope
+
+The sidecar mounts the **repo root**, because `.git` is what it needs to make
+a commit. That's a wider mount than the API gets, so its containment is a
+different mechanism: `SUBDIR` scopes every `git add`, so the sidecar can only
+ever commit the same folder the API can write to. It refuses to start if
+`SUBDIR` is empty, `.`, absolute, or contains `..` — a misconfiguration there
+would silently widen it to the whole repository, so it fails loudly instead.
+
+Also handled:
+
+- **Bursts** — a `QUIET_PERIOD` defers the commit while files are still landing.
+- **In-flight uploads** — `.upload-*.tmp` files are excluded by pathspec, so a
+  poll never catches a half-written upload. Nothing is written to your
+  `.gitignore`.
+- **A diverged remote** — it pushes first and only rebases if that's rejected,
+  so the working tree is untouched in the common case. On divergence it
+  rebases with `--autostash`, which is required rather than optional: any
+  unrelated uncommitted edit in the repo makes `rebase` refuse to start, and
+  without it the sidecar would commit forever and never push again.
+- **A runaway agent** — `MAX_CHANGED_FILES` (default 1000) refuses the commit
+  and logs loudly rather than pushing a mass deletion.
+
+### Configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `REPO_PATH` | `/repo` | Repo working tree. Must contain `.git`. |
+| `SUBDIR` | *required* | Folder to commit, relative to the repo root. |
+| `INTERVAL` | `120` | Seconds between polls. |
+| `QUIET_PERIOD` | `30` | Skip if a file changed this recently. `0` disables. |
+| `GIT_BRANCH` | current branch | Must match what's checked out. |
+| `MAX_CHANGED_FILES` | `1000` | Runaway guard. `0` disables. |
+| `SSH_KEY_PATH` | — | Deploy key, mounted read-only. Staged to tmpfs at 0600. |
+| `SSH_KNOWN_HOSTS_PATH` | — | Pins the host key. Without it, trust-on-first-use with a warning. |
+| `GIT_TOKEN` | — | PAT instead of a key. Held in tmpfs, never written to disk. |
+| `PUSH` | `true` | `false` commits locally only. |
+| `DRY_RUN` | `false` | Log what would be committed, change nothing. |
+| `RUN_ONCE` | `false` | One pass and exit — use this to run it from cron instead. |
+
+`RUN_ONCE=true` is there if you'd rather drive it from a cron job than leave a
+daemon running. Same logic, no loop.
+
+### Tests
+
+```bash
+bash tests/autocommit_tests.sh
+```
+
+15 checks against a real bare-repo remote: scoping, deletions, the quiet
+period, temp-file exclusion, a diverged remote, a diverged remote *with*
+unrelated dirty files (verifying the stashed edits come back and don't get
+committed), the runaway guard, and every unsafe `SUBDIR` plus detached HEAD
+being refused at startup.
+
+---
+
+## Publishing a new version
+
+The image is multi-arch (`linux/amd64` for unRAID, `linux/arm64` for local
+work on Apple silicon). Build both in one shot and push a single manifest:
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 --tag eguthriewastaken2/claude-files:1.0.0 --tag eguthriewastaken2/claude-files:latest --push .
+```
+
+Confirm both architectures landed under one tag:
+
+```bash
+docker buildx imagetools inspect eguthriewastaken2/claude-files:1.0.0
+```
+
+The sidecar is a separate image, built the same way:
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 --tag eguthriewastaken2/claude-files-autocommit:1.0.0 --push ./autocommit
+```
+
+Building on separate machines and pushing to the same tag does **not** produce
+a multi-arch image -- the second push replaces the first. If you build
+natively on each host, push arch-suffixed tags and merge them:
+
+```bash
+docker buildx imagetools create --tag eguthriewastaken2/claude-files:1.0.0 eguthriewastaken2/claude-files:1.0.0-arm64 eguthriewastaken2/claude-files:1.0.0-amd64
+```
+
+On Arch Linux, `docker buildx` is a separate package: `sudo pacman -S docker-buildx`.
 
 ---
 

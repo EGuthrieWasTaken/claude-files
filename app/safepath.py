@@ -21,7 +21,7 @@ from __future__ import annotations
 import errno
 import os
 import stat
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -54,6 +54,28 @@ class Denied(PathError):
 class NotFound(PathError):
     def __init__(self, message: str = "No such file or directory") -> None:
         super().__init__(404, "not_found", message)
+
+
+class NoParent(PathError):
+    """A write named a path whose parent directory does not exist.
+
+    Distinct from NotFound so the caller can tell "the file isn't there" from
+    "the folder you're writing into isn't there" -- a 404 on a PUT reads as
+    the former and sends clients chasing the wrong problem.
+    """
+
+    def __init__(self, parent: str, missing: str) -> None:
+        super().__init__(
+            409,
+            "no_parent",
+            f"Parent directory '{parent}' does not exist"
+            + (f" (missing at '{missing}')" if missing != parent else "")
+            + ". Retry with parents enabled (`?parents=true` on a write, or "
+            '`"parents": true` in a /v1/move body), create it explicitly with '
+            f"POST /v1/mkdir/{parent}, or call GET /v1/list to see what exists.",
+        )
+        self.parent = parent
+        self.missing = missing
 
 
 class Conflict(PathError):
@@ -223,12 +245,46 @@ class Vault:
                 pass
 
     @contextmanager
-    def _parent_fd(self, parts: list[str]) -> Iterator[tuple[int, str]]:
-        """Yield (fd of the parent directory, final component name)."""
+    def _parent_fd(
+        self,
+        parts: list[str],
+        *,
+        for_write: bool = False,
+        create_parents: bool = False,
+    ) -> Iterator[tuple[int, str]]:
+        """Yield (fd of the parent directory, final component name).
+
+        ``for_write`` reports a missing parent as NoParent rather than a bare
+        404. Reads keep 404, which is the conventional answer there.
+        ``create_parents`` makes the parent chain first, like ``mkdir -p``.
+        """
         if not parts:
             raise Denied("is_root", "This operation cannot target the root directory")
-        with self._dir_fd(parts[:-1]) as fd:
+
+        if create_parents and len(parts) > 1:
+            self.mkdir(parts[:-1], parents=True)
+
+        with ExitStack() as stack:
+            try:
+                fd = stack.enter_context(self._dir_fd(parts[:-1]))
+            except NotFound as exc:
+                if for_write:
+                    raise self._no_parent_error(parts) from exc
+                raise
             yield fd, parts[-1]
+
+    def _no_parent_error(self, parts: list[str]) -> NoParent:
+        """Identify which ancestor is actually missing, for the error message."""
+        parent = join_components(parts[:-1])
+        missing = parent
+        for i in range(1, len(parts)):
+            try:
+                with self._dir_fd(parts[:i]):
+                    continue
+            except PathError:
+                missing = join_components(parts[:i])
+                break
+        return NoParent(parent, missing)
 
     def _assert_same_device(self, fd: int, where: str) -> None:
         """Refuse to descend into a different filesystem.
@@ -351,13 +407,17 @@ class Vault:
     # -- write ------------------------------------------------------------
 
     @contextmanager
-    def atomic_write(self, parts: list[str], *, overwrite: bool) -> Iterator[tuple[int, "Committer"]]:
+    def atomic_write(
+        self, parts: list[str], *, overwrite: bool, create_parents: bool = False
+    ) -> Iterator[tuple[int, "Committer"]]:
         """Create a temp file next to the target and rename it into place.
 
         Yields (write fd, committer).  If the body of the ``with`` raises, the
         temp file is removed and the target is left untouched.
         """
-        with self._parent_fd(parts) as (dir_fd, name):
+        with self._parent_fd(
+            parts, for_write=True, create_parents=create_parents
+        ) as (dir_fd, name):
             if not overwrite:
                 try:
                     os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
@@ -475,11 +535,15 @@ class Vault:
         except OSError as exc:
             raise _translate_oserror(exc, f"'{where}'") from exc
 
-    def move(self, src: list[str], dst: list[str], *, overwrite: bool) -> None:
+    def move(
+        self, src: list[str], dst: list[str], *, overwrite: bool, create_parents: bool = False
+    ) -> None:
         if not src or not dst:
             raise Denied("is_root", "Cannot move the root directory")
         with self._parent_fd(src) as (src_fd, src_name):
-            with self._parent_fd(dst) as (dst_fd, dst_name):
+            with self._parent_fd(
+                dst, for_write=True, create_parents=create_parents
+            ) as (dst_fd, dst_name):
                 try:
                     os.stat(src_name, dir_fd=src_fd, follow_symlinks=False)
                 except OSError as exc:

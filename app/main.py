@@ -88,6 +88,9 @@ class MoveRequest(BaseModel):
     src: str = Field(description="Source path, relative to the shared folder")
     dst: str = Field(description="Destination path, relative to the shared folder")
     overwrite: bool = False
+    parents: bool = Field(
+        default=False, description="Create missing parent directories of dst"
+    )
 
 
 class OkResponse(BaseModel):
@@ -280,7 +283,9 @@ def head_content(_: ReadAuth, path: str) -> Response:
     )
 
 
-async def _write_body(request: Request, parts: list[str], *, overwrite: bool) -> int:
+async def _write_body(
+    request: Request, parts: list[str], *, overwrite: bool, create_parents: bool
+) -> int:
     declared = request.headers.get("content-length")
     if declared is not None:
         try:
@@ -298,7 +303,9 @@ async def _write_body(request: Request, parts: list[str], *, overwrite: bool) ->
             ) from None
 
     written = 0
-    with VAULT.atomic_write(parts, overwrite=overwrite) as (fd, committer):
+    with VAULT.atomic_write(
+        parts, overwrite=overwrite, create_parents=create_parents
+    ) as (fd, committer):
         async for chunk in request.stream():
             if not chunk:
                 continue
@@ -318,22 +325,46 @@ async def _write_body(request: Request, parts: list[str], *, overwrite: bool) ->
 
 @app.put("/v1/content/{path:path}", response_model=OkResponse, tags=["write"],
          summary="Upload or replace a file (raw body)")
-async def put_content(request: Request, path: str, _: WriteAuth) -> OkResponse:
+async def put_content(
+    request: Request,
+    path: str,
+    _: WriteAuth,
+    parents: bool = Query(
+        False,
+        description=(
+            "Create any missing parent directories first, like `mkdir -p`. "
+            "Without this, writing into a directory that does not exist "
+            "fails with 409 no_parent."
+        ),
+    ),
+) -> OkResponse:
     parts = VAULT.components(path)
     if not parts:
         raise PathError(403, "is_root", "Cannot write to the root itself")
-    size = await _write_body(request, parts, overwrite=True)
+    size = await _write_body(request, parts, overwrite=True, create_parents=parents)
     log.info("wrote %s (%d bytes)", "/".join(parts), size)
     return OkResponse(path="/".join(parts), size=size, created=True)
 
 
 @app.post("/v1/content/{path:path}", response_model=OkResponse, tags=["write"],
           summary="Create a file; 409 if it already exists")
-async def post_content(request: Request, path: str, _: WriteAuth) -> OkResponse:
+async def post_content(
+    request: Request,
+    path: str,
+    _: WriteAuth,
+    parents: bool = Query(
+        False,
+        description=(
+            "Create any missing parent directories first, like `mkdir -p`. "
+            "Without this, writing into a directory that does not exist "
+            "fails with 409 no_parent."
+        ),
+    ),
+) -> OkResponse:
     parts = VAULT.components(path)
     if not parts:
         raise PathError(403, "is_root", "Cannot write to the root itself")
-    size = await _write_body(request, parts, overwrite=False)
+    size = await _write_body(request, parts, overwrite=False, create_parents=parents)
     log.info("created %s (%d bytes)", "/".join(parts), size)
     return OkResponse(path="/".join(parts), size=size, created=True)
 
@@ -374,7 +405,7 @@ def mkdir(
 def move(req: MoveRequest, _: WriteAuth) -> OkResponse:
     src = VAULT.components(req.src)
     dst = VAULT.components(req.dst)
-    VAULT.move(src, dst, overwrite=req.overwrite)
+    VAULT.move(src, dst, overwrite=req.overwrite, create_parents=req.parents)
     log.info("moved %s -> %s", "/".join(src), "/".join(dst))
     return OkResponse(path="/".join(dst))
 

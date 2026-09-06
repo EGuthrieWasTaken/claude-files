@@ -153,11 +153,11 @@ path is relative to the shared folder root.
 | `GET` | `/v1/stat/{path}` | Type, size, mtime for one path. |
 | `GET` | `/v1/content/{path}` | Download a file. |
 | `HEAD` | `/v1/content/{path}` | Size and mtime as headers. |
-| `PUT` | `/v1/content/{path}` | Create **or replace**. Raw body. |
-| `POST` | `/v1/content/{path}` | Create only; `409` if it exists. |
+| `PUT` | `/v1/content/{path}` | Create **or replace**. Raw body. `?parents=true` to create missing parents. |
+| `POST` | `/v1/content/{path}` | Create only; `409` if it exists. `?parents=true`. |
 | `DELETE` | `/v1/content/{path}` | Delete a file or dir. `?recursive=true` for non-empty dirs. |
 | `POST` | `/v1/mkdir/{path}` | Create a directory. `?parents=true` by default. |
-| `POST` | `/v1/move` | `{"src":…, "dst":…, "overwrite":false}` |
+| `POST` | `/v1/move` | `{"src":…, "dst":…, "overwrite":false, "parents":false}` |
 
 Writes are atomic: content goes to a temp file in the destination directory
 and is `rename()`d into place, so a reader never sees a half-written file.
@@ -172,8 +172,14 @@ curl -H "Authorization: Bearer $TOKEN" "$API/v1/content/reports/report.md" -o re
 curl -H "Authorization: Bearer $TOKEN" -X DELETE "$API/v1/content/reports/report.md"
 ```
 
+Writing into a directory that does not exist returns `409 no_parent` naming
+the missing folder, rather than a bare `404` that reads as "file not found".
+Pass `?parents=true` to create the chain in the same call, like `mkdir -p`.
+
 Errors are JSON: `{"code": "traversal", "message": "..."}`. Every rejection is
 logged at `WARNING`, so escape attempts show up in `docker logs`.
+
+`AGENT.md` in this repo is a paste-ready brief for handing to an agent.
 
 ---
 

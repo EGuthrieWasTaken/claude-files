@@ -191,6 +191,34 @@ def functional() -> None:
     else:
         R.bad("func", "recursive delete", f"got {st}/{st2}, wanted 409 then 200")
 
+    st, _, body = request("PUT", "/v1/content/miss/ing/deep.txt", body=b"x")
+    payload_ok = st == 409 and json.loads(body)["code"] == "no_parent" \
+        and "miss" in json.loads(body)["message"]
+    if payload_ok:
+        R.ok("func", "write to a missing parent -> 409 no_parent naming the folder")
+    else:
+        R.bad("func", "no_parent", f"status {st} body {body[:200]!r}")
+
+    st, _, _ = request("PUT", "/v1/content/miss/ing/deep.txt?parents=true", body=b"deep")
+    st2, _, body2 = request("GET", "/v1/content/miss/ing/deep.txt")
+    if st == 200 and body2 == b"deep":
+        R.ok("func", "?parents=true creates the whole chain")
+    else:
+        R.bad("func", "parents=true", f"got {st}/{st2}")
+
+    st, _, _ = request("POST", "/v1/content/miss2/a/b.txt?parents=true", body=b"p")
+    R.ok("func", "POST honours ?parents=true") if st == 200 \
+        else R.bad("func", "POST parents", f"status {st}")
+
+    st, _, _ = request("POST", "/v1/move", body=json.dumps(
+        {"src": "miss/ing/deep.txt", "dst": "moved/into/here.txt", "parents": True}).encode(),
+        headers={"Content-Type": "application/json"})
+    st2, _, _ = request("GET", "/v1/content/moved/into/here.txt")
+    if st == 200 and st2 == 200:
+        R.ok("func", "move honours parents:true")
+    else:
+        R.bad("func", "move parents", f"got {st}/{st2}")
+
     big = b"x" * (2 * 1024 * 1024 + 1)
     st, _, _ = request("PUT", "/v1/content/toobig.bin", body=big)
     if st == 413:
@@ -299,6 +327,12 @@ def escapes() -> None:
     escape_write("write to /etc/passwd",     "/v1/content/rootlink/etc/passwd",
                  Path("/etc/hostname") if Path("/etc/hostname").exists() else secrets)
     escape_write("create through ..",        "/v1/content/../planted.txt", secrets, method="POST")
+
+    # ?parents=true creates directories, so re-run the write attacks with it on
+    escape_write("parents=true through ..",      "/v1/content/../pwned.txt?parents=true", secrets)
+    escape_write("parents=true via symlink dir", "/v1/content/escape-dir/pwned.txt?parents=true", secrets)
+    escape_write("parents=true deep traversal",  "/v1/content/../../etc/pwned?parents=true", secrets)
+    escape_read("parents=true into .git",        "/v1/content/.git/hooks/evil?parents=true")
 
     # mkdir must not create a directory outside
     st, _, _ = request("POST", "/v1/mkdir/../planted-dir")

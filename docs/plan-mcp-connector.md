@@ -1,10 +1,26 @@
 # Feature request: an MCP connector surface for claude-files
 
-**Status: proposed. Nothing here is implemented.** Every "verified" note below
-means it was reproduced in a scratch environment against the real `mcp` SDK
-**on this repo's own pinned versions**, not that the code exists in this
-repository. The things marked *unverified* are the ones an implementer has to
-find out empirically, and they are called out as such.
+**Status: proposed, with all three decision gates now settled.** Nothing here
+is implemented. Every "verified" note below means it was reproduced in a
+scratch environment against the real `mcp` SDK **on this repo's own pinned
+versions**, not that the code exists in this repository. The things marked
+*unverified* are the ones an implementer still has to find out empirically,
+and they are called out as such.
+
+The three gates are resolved as follows; each section below records the
+reasoning:
+
+| Gate | Resolution |
+|---|---|
+| **1. Auth header** | **`X-API-Key`.** Confirmed working in practice — it is what the `meeting-transcriber` connector runs on today. Widen `_check_token()` to accept it. |
+| **2. Dependencies** | **Option A — hold every current pin** and let the resolver backtrack `mcp` to 1.12.4. No existing pin moves. |
+| **3. Image surface** | Optional at build time (`WITH_MCP`) + `ENABLE_MCP` env var, **defaulting to `true`**. |
+
+One thing changed while writing this up and is worth reading before the
+Dockerfile is touched: **Option A only survives if `requirements.txt` and
+`requirements-mcp.txt` are installed in a single `pip` invocation.** The
+sibling repo's separate-layer pattern reproduces the exact `starlette`
+conflict Option A exists to avoid. Measured both ways under decision gate 2.
 
 The reference implementation for all of this is the sibling repo
 `meeting-transcriber`, which already ships a working remote MCP endpoint:
@@ -90,10 +106,14 @@ context to buy nothing.
 
 ---
 
-## Decision gate 1 — which auth header the connector can actually send
+## Decision gate 1 — auth header: **resolved, `X-API-Key`**
 
-**Settle this first.** It is the only thing that can make the feature
-impossible, and it is cheap to check.
+**Resolved: replicate `meeting-transcriber`'s arrangement exactly.** That
+connector runs on a static `x-api-key` header today and it works, so there is
+nothing left to discover here and no reason to invent a second scheme. The
+open question was only ever whether `Authorization` would *also* be accepted
+as a custom header name; it does not need answering, because the header that
+is known to work is available.
 
 `_check_token()` (`app/main.py:127`) accepts exactly one credential shape:
 
@@ -101,21 +121,47 @@ impossible, and it is cheap to check.
 if not authorization or not authorization.startswith("Bearer "):
 ```
 
-`meeting-transcriber`'s Phase 4 verified live (2026-09-22) that claude.ai's
-add-custom-connector dialog tries OAuth discovery, fails, then offers **"No
-sign-in"** plus up to four static request headers — and that **`x-api-key` is
-one of its preset header-name options**. What that write-up does *not*
-establish is whether `Authorization` is accepted as a custom header name.
-Connector UIs commonly reserve `Authorization` for their own OAuth flow, and
-`meeting-transcriber` never had to find out because `app/auth.py` there
-accepts `X-API-Key` already.
+**The change:** widen it to also read the token from `X-API-Key`, mirroring
+`meeting-transcriber`'s `app/auth.py`. Shape it so the REST path is untouched
+and the precedence is explicit:
 
-**Recommendation: don't find out the hard way — accept both.** Widen
-`_check_token()` to read the token from `X-API-Key` when `Authorization` is
-absent. It is a handful of lines, it costs nothing in the REST path, and it
-removes the only real chance of this feature dead-ending at the dialog. Keep
-`Authorization: Bearer` as the documented primary so `AGENT.md` and every
-existing `curl` in `README.md` stay correct.
+```python
+def _check_token(authorization: str | None, api_key: str | None = None) -> str:
+    """Return "rw" or "ro". Accepts `Authorization: Bearer <token>` (the
+    documented REST credential) or `X-API-Key: <token>` (what the Claude
+    custom-connector dialog sends -- it offers a static header with
+    `x-api-key` as a preset name, and that is the arrangement the sibling
+    meeting-transcriber connector has been running on).
+    """
+    presented = None
+    if authorization and authorization.startswith("Bearer "):
+        presented = authorization[7:].strip()
+    elif api_key:
+        presented = api_key.strip()
+    if presented is None:
+        raise HTTPException(401, detail={"code": "unauthorized",
+                                         "message": "Missing bearer token"},
+                            headers={"WWW-Authenticate": "Bearer"})
+    ...
+```
+
+Both `require_read` and `require_write` (`app/main.py:147`, `:152`) grow a
+second `Annotated[str | None, Header()]` parameter for it, and the middleware
+in "Auth: reuse `_check_token`" below reads both headers off the raw request.
+
+Keep **`Authorization: Bearer` as the documented primary** — every `curl` in
+`README.md`, the `AGENT.md` brief, and any existing consumer stay correct
+unchanged. `X-API-Key` is the connector's door, documented as such.
+
+Two things to get right while touching this code:
+
+- **Use `hmac.compare_digest` on the new path too.** The existing comparisons
+  (`app/main.py:136`, `:138`) are constant-time and the new branch must land
+  in the same comparison, not a shortcut `==` beside it.
+- **Do not accept both headers in one request with different values.** If
+  `Authorization` is present it wins and `X-API-Key` is ignored, per the
+  `elif` above — no "try each until one matches", which would turn one request
+  into two guesses against the rate limiter.
 
 Two settings-level items that come with it:
 
@@ -129,13 +175,14 @@ Two settings-level items that come with it:
   given the read-only token, and the write tools must refuse it *audibly*
   (see "Token scope inside a tool" below).
 
-**Unverified, and the implementer's step 0:** stand the endpoint up, add it as
-a custom connector in Cowork, and record in this file which header names the
-dialog actually offers.
+**Still worth recording during the first real connector setup:** whether the
+dialog surfaces `x-api-key` as a preset or needs it typed as a custom header
+name, and the exact URL that was entered. Append it to this section so the
+next person setting up a second deployment does not re-derive it.
 
 ---
 
-## Decision gate 2 — the dependency cost, measured
+## Decision gate 2 — dependencies: **resolved, Option A (backtrack)**
 
 This repo's whole pitch is "small enough to audit in one sitting":
 `app/requirements.txt` is three pinned lines. `mcp` is not three lines.
@@ -161,8 +208,8 @@ overwriting a pin `fastapi==0.115.6` declares it cannot work with. A separate
 pattern — does **not** save you here, because unlike that repo's ML pins,
 `mcp` and `fastapi` genuinely share `starlette`.
 
-Three resolutions were measured. All three are clean installs; pick one in
-review:
+Three resolutions were measured. All three are clean installs; **A is the one
+to build.**
 
 | | `fastapi` | `pydantic` | `mcp` | `starlette` | Verdict |
 |---|---|---|---|---|---|
@@ -170,42 +217,136 @@ review:
 | **B. Hold `pydantic`, bump `fastapi`** | 0.141.1 | 2.10.4 *(unchanged)* | **1.12.4** | 1.6.0 | `pydantic` is what pins `mcp` back, so bumping `fastapi` alone buys nothing. |
 | **C. Bump both** | 0.141.1 | 2.13.5 | **1.30.0** | 1.6.0 | Newest SDK; matches `meeting-transcriber`'s verified set exactly. |
 
-**Recommendation: A.** `mcp` 1.12.4 was checked for feature parity against
-everything this plan needs and has all of it —
-`FastMCP(streamable_http_path=…, transport_security=…, stateless_http=…,
-json_response=…, instructions=…)` are all present in its `__init__`, and
-`mcp.server.transport_security.TransportSecuritySettings` exists. Every
-reproduction recorded in this document was run on **A** (`fastapi` 0.115.6 +
-`pydantic` 2.10.4 + `mcp` 1.12.4 + `starlette` 0.41.3), so the
-"verified" notes below describe the recommended configuration, not a different
-one.
+**Resolved: A.** Keeping a security-audited image's dependency graph still for
+a feature that is purely additive is worth more than the newest SDK. `mcp`
+1.12.4 was checked for feature parity against everything this plan needs and
+has all of it — `FastMCP(streamable_http_path=…, transport_security=…,
+stateless_http=…, json_response=…, instructions=…)` are all present in its
+`__init__`, and `mcp.server.transport_security.TransportSecuritySettings`
+exists. Every reproduction recorded in this document was run on **A**
+(`fastapi` 0.115.6 + `pydantic` 2.10.4 + `mcp` 1.12.4 + `starlette` 0.41.3),
+so the "verified" notes below describe the configuration that will actually be
+built, not a different one.
 
-Option A keeps a security-audited image's dependency graph from moving for a
-feature that is additive. Revisit if a concrete `mcp` ≥1.13 feature is needed;
-at that point take **C** wholesale, since it is already running in production
-in the sibling repo.
+Revisit only for a concrete `mcp` ≥1.13 feature. At that point take **C**
+wholesale rather than assembling a fourth combination — C is already running
+in production in the sibling repo, which is the only reason to prefer it.
 
-Whichever is chosen: **record the resolved versions in the PR description**,
-and add a `pip check` (or equivalent) to `tests/run_tests.sh` so a future
-resolver drift fails the suite instead of the tunnel.
+### What this means for the requirements files
+
+**Pin `mcp` explicitly rather than relying on the backtrack.** `mcp>=1.0,<2.0`
+happens to resolve to 1.12.4 *today* because `pydantic==2.10.4` and
+`starlette<0.42.0` squeeze it there, but that is the resolver reaching a
+conclusion, not a decision recorded in the repo. A future `mcp` 1.12.x patch,
+or a `pydantic` bump made for an unrelated reason, would silently move it.
+This repo tight-pins everything else for exactly this reason:
+
+```
+# app/requirements-mcp.txt
+# Optional: only needed for the /mcp connector endpoint (ENABLE_MCP).
+# Pinned, not ranged: 1.12.4 is the newest mcp that resolves against the
+# fastapi/pydantic pins in requirements.txt without moving them -- see
+# docs/plan-mcp-connector.md, "Decision gate 2". Bumping this may drag
+# starlette past fastapi's declared bound; check with `pip check`.
+mcp==1.12.4
+```
+
+### Option A only holds if it resolves in **one** `pip install`
+
+**Verified, and it dictates the Dockerfile.** The sibling repo installs its
+`requirements-mcp.txt` as a *separate* layer, specifically to keep the
+resolver away from its ML pins. Copying that pattern here **reproduces the
+exact break Option A was chosen to avoid**, because `mcp` and `fastapi` share
+`starlette` and pip resolves each invocation independently — it does not treat
+already-installed packages as constraints:
+
+```
+# two invocations -- the sibling repo's pattern
+$ pip install fastapi==0.115.6 "uvicorn[standard]==0.34.0" pydantic==2.10.4
+$ pip install mcp==1.12.4
+$ pip check
+fastapi 0.115.6 has requirement starlette<0.42.0,>=0.40.0, but you have starlette 1.6.0.
+```
+
+`sse-starlette` floats to 3.4.11, which drags `starlette` to 1.6.0, straight
+back through `fastapi`'s bound — **even with `mcp` itself pinned to 1.12.4.**
+
+One invocation, same pins, is clean:
+
+```
+# one invocation
+$ pip install fastapi==0.115.6 "uvicorn[standard]==0.34.0" pydantic==2.10.4 mcp==1.12.4
+$ pip check
+No broken requirements found.
+```
+
+So the build stage installs both files together, and the optional-ness is a
+build arg rather than a separate layer (`Dockerfile:9-11`):
+
+```dockerfile
+ARG WITH_MCP=1
+COPY app/requirements.txt app/requirements-mcp.txt ./
+RUN python -m venv /venv \
+ && if [ "$WITH_MCP" = "1" ]; then \
+      /venv/bin/pip install --no-cache-dir -r requirements.txt -r requirements-mcp.txt; \
+    else \
+      /venv/bin/pip install --no-cache-dir -r requirements.txt; \
+    fi \
+ && /venv/bin/pip check
+```
+
+The `pip check` in the build is deliberate: it makes a bad resolve fail the
+image build rather than surface as an import error in production. Losing the
+separate cache layer is a real but small cost — this is a three-package base,
+not an ML stack.
+
+**Record the full resolved set in the PR description**, and add a `pip check`
+to `tests/run_tests.sh` too, so drift fails the suite and not just the build.
+The expected set on A:
+
+| Package | Version | Source |
+|---|---|---|
+| `fastapi` | 0.115.6 | `requirements.txt` (unchanged) |
+| `uvicorn[standard]` | 0.34.0 | `requirements.txt` (unchanged) |
+| `pydantic` | 2.10.4 | `requirements.txt` (unchanged) |
+| `mcp` | 1.12.4 | `requirements-mcp.txt` (new) |
+| `starlette` | 0.41.3 | pulled in by `fastapi`/`mcp` — **the one to watch** |
+| `sse-starlette` | 3.0.3 | pulled in by `mcp` — what drags `starlette` if it floats |
+| `httpx` / `httpx-sse` | 0.28.1 / 0.4.3 | pulled in by `mcp` |
+| `anyio` | 4.15.1 | pulled in by `mcp`/`starlette` |
+| `pydantic-settings` | 2.15.0 | pulled in by `mcp` |
+| `jsonschema` | 4.26.0 | pulled in by `mcp` |
+| `python-multipart` | 0.0.32 | pulled in by `mcp` |
 
 ---
 
-## Decision gate 3 — does MCP belong in the hardened image at all?
+## Decision gate 3 — image surface: **resolved, optional build + `ENABLE_MCP=true`**
 
 The current image is `python:3.12-slim` + three packages, run `--read-only`,
-`--cap-drop ALL`, `no-new-privileges`, non-root, 512 MB, 200 pids. Adding
-thirteen transitive packages and a long-lived ASGI sub-application to it is a
-real change in audit surface for a container whose job is to be the one thing
-an autonomous agent can reach.
+`--cap-drop ALL`, `no-new-privileges`, non-root, 512 MB, 200 pids. Adding an
+ASGI sub-application and **14 new packages** — measured, not estimated:
+`mcp`, `httpx`, `httpcore`, `httpx-sse`, `sse-starlette`, `jsonschema`,
+`jsonschema-specifications`, `referencing`, `rpds-py`, `attrs`, `certifi`,
+`pydantic-settings`, `python-multipart`, `typing-inspection` — is a real
+change in audit surface for a container whose job is to be the one thing an
+autonomous agent can reach.
 
-**Recommendation: make it optional, and off unless configured.** Two guards,
-both cheap:
+Worth noting what is in that list: `httpx`/`httpcore`/`certifi` are an **HTTP
+client** stack, in an image that previously had no way to make outbound
+requests at all. `mcp` pulls them for its client half, which this server never
+uses. Nothing here *calls* them, and the container has no business reaching
+out, so this is worth a line in the README's security model rather than a
+veto — but an egress-restricted deployment is now a meaningfully different
+proposition than it was, and that should be said out loud rather than
+discovered.
 
-1. **Build-time.** Put `mcp` in its own `app/requirements-mcp.txt` and its own
-   Dockerfile layer after `app/requirements.txt` (`Dockerfile:9-11`). Guard
-   the import in `app/main.py`, as `meeting-transcriber`'s `app/main.py:713-720`
-   does:
+**Resolved: keep both guards, but ship it on.** Two mechanisms:
+
+1. **Build-time.** `app/requirements-mcp.txt`, installed in the same `pip`
+   invocation as `requirements.txt` under `ARG WITH_MCP` (see "Option A only
+   holds if it resolves in one `pip install`" above — *not* a separate layer).
+   Guard the import in `app/main.py`, as `meeting-transcriber`'s
+   `app/main.py:713-720` does:
 
    ```python
    try:
@@ -215,14 +356,35 @@ both cheap:
        log.info("mcp not installed; /mcp endpoint disabled (REST API unaffected)")
    ```
 
-   An image built without that layer still serves the REST API with `/mcp`
-   simply absent. That also gives you a genuinely minimal variant to publish
-   for anyone who wants today's audit surface.
+   An image built with `--build-arg WITH_MCP=0` still serves the REST API with
+   `/mcp` simply absent. That gives you a genuinely minimal variant to publish
+   for anyone who wants today's audit surface, and it is what the import guard
+   is for.
 
-2. **Run-time.** `ENABLE_MCP`, default **`false`**, in `Config`
-   (`app/config.py:33`), read with the existing `_env_bool`. Mounting an MCP
-   endpoint is a deliberate act, and a default-off flag means pulling the new
-   image never silently widens what a running deployment exposes.
+2. **Run-time.** `ENABLE_MCP`, default **`true`**, in `Config`
+   (`app/config.py:33`), read with the existing `_env_bool`. The connector is
+   the point of the feature; making every deployment set a flag to get the
+   thing it just pulled the image for is friction without a matching benefit,
+   given that `/mcp` is gated by the same token as every other route and by
+   the same `Vault`.
+
+   Two consequences to be deliberate about, since default-on is the less
+   conservative choice:
+
+   - **Pulling a new `:latest` starts serving `/mcp` on an existing
+     deployment.** The unRAID templates track `:latest` (`README.md`,
+     "Publishing a new version"), so this will happen without anyone asking
+     for it. It is defensible — the endpoint is unreachable without the
+     token — but it belongs in the release notes for that version, stated
+     plainly, not discovered.
+   - **`ENABLE_MCP=false` must be a real off switch**, not cosmetic: when
+     false, `mount_mcp()` is never called and neither route is registered, so
+     `/mcp` 404s exactly as it does on an image built without `mcp`. Test it
+     (test 8 below) rather than assuming the flag is threaded all the way
+     through.
+
+   Deployments that want the old surface set `ENABLE_MCP=false`, or run the
+   `WITH_MCP=0` image and get it at build time.
 
 Report the state in `GET /v1/info` (`app/main.py:207`) — add `"mcp_enabled"`
 so an operator can confirm what a deployment is actually serving without
@@ -348,7 +510,10 @@ whole surface with a `BaseHTTPMiddleware` wrapping the sub-app, exactly as
 class _RequireAuth(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         try:
-            scope = _check_token(request.headers.get("authorization"))
+            scope = _check_token(
+                request.headers.get("authorization"),
+                request.headers.get("x-api-key"),   # what the connector sends
+            )
         except HTTPException as exc:
             return JSONResponse(exc.detail, status_code=exc.status_code,
                                 headers=exc.headers or {})
@@ -358,6 +523,12 @@ class _RequireAuth(BaseHTTPMiddleware):
 
 This also means an unauthenticated request never reaches a tool, which is what
 you want: no tool body should ever be the first thing to check a credential.
+
+The `WWW-Authenticate: Bearer` header `_check_token` raises with
+(`app/main.py:133`) is now slightly misleading on this surface, since the
+connector authenticates with `X-API-Key`. Leave it — it is correct for the
+REST path, harmless here, and the 401 body already carries a `code` and
+`message` that say what happened.
 
 **Call `_rate_limit()` here too** (`app/main.py:116`). It is a module-global
 deque shared with the REST path, and if the middleware skips it the MCP
@@ -531,16 +702,27 @@ inside it, not beside it.**
    `truncated: true` with a byte count and the REST pointer; a binary file is
    refused with an explanatory message; `encoding="base64"` over its cap is
    refused.
-8. **Import guard.** With `mcp` absent, the app still boots and serves REST
-   with `/mcp` absent. With `ENABLE_MCP=false`, likewise. `meeting-transcriber`'s
-   "test 9" notes that this is fiddlier than it looks — a subprocess hides the
-   branch from coverage, and an in-process `sys.meta_path` blocker is
-   insufficient on its own because the stale package attribute satisfies the
-   import.
-9. **Security headers** present on an MCP response (`nosniff`, `no-referrer`,
-   `no-store`).
-10. **`pip check`** after install, so a resolver drift that re-breaks the
-    `starlette` bound fails the build rather than the tunnel.
+8. **Both off switches, separately.** With `mcp` absent (a `WITH_MCP=0`
+   image), the app boots and serves REST with `/mcp` absent. With `mcp`
+   installed but `ENABLE_MCP=false`, `/mcp` **404s** — assert the status, not
+   just that no tool ran, since the failure mode of a half-threaded flag is a
+   mounted-but-unlisted endpoint. `meeting-transcriber`'s "test 9" notes the
+   import-guard half is fiddlier than it looks: a subprocess hides the branch
+   from coverage, and an in-process `sys.meta_path` blocker is insufficient on
+   its own because the stale package attribute satisfies the import.
+9. **`X-API-Key` on the REST path too.** Widening `_check_token` touches every
+   authenticated route, so `tests/escape_suite.py`'s functional section
+   (`tests/escape_suite.py:105`) should cover: `X-API-Key` accepted where
+   `Authorization` is today, the read-only token still read-only through it,
+   a wrong `X-API-Key` still 401, and `Authorization` winning when both are
+   present with different values.
+10. **Security headers** present on an MCP response (`nosniff`, `no-referrer`,
+    `no-store`).
+11. **`pip check`** in both the image build and the suite, so a resolver drift
+    that re-breaks the `starlette` bound fails loudly. This is the regression
+    test for the two-invocations trap in decision gate 2 — worth writing
+    against a deliberately split install once, to see it catch the thing it
+    exists for.
 
 Follow the existing style: a standalone script with a `Results` accumulator and
 a non-zero exit, like `tests/escape_suite.py`. This repo has no pytest
@@ -552,31 +734,48 @@ convention and does not need one.
 
 - **`README.md`** — an "MCP connector" section: what it is, both hard
   limitations stated plainly, the Cloudflare Access bypass, `ENABLE_MCP`, and
-  the step-by-step for adding it in Cowork. The security model section needs a
-  sentence on the MCP surface being the same `Vault` behind the same token.
+  the step-by-step for adding it in Cowork (URL is `https://<host>/mcp`, auth
+  is "No sign-in" plus a static `x-api-key` header holding `API_TOKEN`). The
+  security model section needs a sentence on the MCP surface being the same
+  `Vault` behind the same token. The `Configuration` table gains the four new
+  variables; the API table gains `/mcp`.
+- **The version's release notes** — that pulling this image starts serving
+  `/mcp` by default, and that `ENABLE_MCP=false` turns it off. See decision
+  gate 3.
 - **`AGENT.md`** — a note at the top: if you have the connector, use the tools;
-  this document is for the REST fallback and for large or binary files.
-- **`.env.example`** — `ENABLE_MCP`, `MCP_PUBLIC_HOSTNAME`,
+  this document is for the REST fallback and for large or binary files. Also
+  mention `X-API-Key` as an accepted alternative to `Authorization: Bearer`.
+- **`.env.example`** — `ENABLE_MCP` (with `true` shown as the default and a
+  comment saying what turning it off does), `MCP_PUBLIC_HOSTNAME`,
   `MCP_INLINE_LIMIT_CHARS`, `MCP_BASE64_LIMIT_BYTES`.
 - **`unraid/claude-files.xml`** — the same variables as template fields.
-- **`docker-compose.yml`** — the new env vars, commented and defaulted off.
+  `MCP_PUBLIC_HOSTNAME` in particular wants to be visible there, since the
+  tunnel hostname is exactly the thing an unRAID user knows and the SDK's
+  rebinding guard is otherwise a silent 421.
+- **`docker-compose.yml`** — the new env vars, commented, at their defaults.
 - **This file** — replace "proposed" with what was actually built, record the
-  step-0 findings (header names the dialog offers, whether stateless works),
-  and note anything that turned out differently. That is the convention
-  `meeting-transcriber`'s `CLAUDE.md` describes and it is what makes these
-  documents worth writing.
+  connector-setup findings, and note anything that turned out differently.
+  That is the convention `meeting-transcriber`'s `CLAUDE.md` describes and it
+  is what makes these documents worth writing.
 
 ---
 
 ## Open questions
 
-1. **Which header does the connector dialog actually accept?** Decision gate 1.
-   Answer empirically before writing code; the recommendation (accept both
-   `Authorization: Bearer` and `X-API-Key`) is cheap insurance either way.
-2. **Which dependency resolution — A, B or C?** Recommendation is **A**, hold
-   every current pin and let `mcp` backtrack to 1.12.4, which was checked to
-   have every feature this plan uses. Revisit only for a concrete newer-SDK
-   need.
+Gates 1, 2 and 3 are settled — see the table at the top and their sections.
+What remains open:
+
+1. **Does the connector accept a stateless server?** The only "unverified"
+   item left in the implementation. It should — the spec supports it, and the
+   recommendation (`stateless_http=True`, `json_response=True`) suits a
+   container this small behind a tunnel. If it does not, fall back to stateful
+   and record here what the failure looked like; nothing else in the design
+   depends on it.
+2. **Does the shared rate-limit budget hold up?** `_rate_limit()` is one
+   600/min deque across REST and MCP, and an MCP session spends several calls
+   on handshake before doing any work. If a connector session starts 429ing in
+   normal use, the fix is a separate counter for `/mcp`, not a higher shared
+   limit — say so here when it happens.
 3. **Does the no-append rule survive contact with real use?** If writing long
    documents through the connector turns out to be genuinely painful, the
    honest fix is a `PATCH`-style endpoint designed with the atomicity guarantee

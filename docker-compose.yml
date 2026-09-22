@@ -31,6 +31,17 @@ services:
       RATE_LIMIT_PER_MINUTE: "600"
       LOG_LEVEL: "INFO"
 
+      # -- Optional MCP connector (see README.md, "MCP connector") --------
+      ENABLE_MCP: "true"        # mount /mcp; set false to disable at runtime
+      # This service's public hostname, e.g. claude-files.example.dev. Used
+      # only to allow-list the Host header the MCP SDK's DNS-rebinding guard
+      # checks; left blank, that guard is disabled rather than 421ing every
+      # request through the tunnel. /mcp is still gated by API_TOKEN either
+      # way.
+      MCP_PUBLIC_HOSTNAME: ""
+      MCP_INLINE_LIMIT_CHARS: "100000"    # read_file's inline text budget
+      MCP_BASE64_LIMIT_BYTES: "1048576"   # 1 MiB -- read_file/write_file's base64 cap
+
     # unRAID's nobody:users. Files the API writes will be owned by this.
     user: "99:100"
 

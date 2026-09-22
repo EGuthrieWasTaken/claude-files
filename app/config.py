@@ -43,6 +43,10 @@ class Config:
     enable_docs: bool = True
     rate_limit_per_minute: int = 600
     require_mount: bool = True
+    enable_mcp: bool = True
+    mcp_public_hostname: str = ""
+    mcp_inline_limit_chars: int = 100_000
+    mcp_base64_limit_bytes: int = 1024 * 1024
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -73,4 +77,8 @@ class Config:
             enable_docs=_env_bool("ENABLE_DOCS", True),
             rate_limit_per_minute=_env_int("RATE_LIMIT_PER_MINUTE", 600),
             require_mount=_env_bool("REQUIRE_MOUNT", True),
+            enable_mcp=_env_bool("ENABLE_MCP", True),
+            mcp_public_hostname=os.environ.get("MCP_PUBLIC_HOSTNAME", "").strip(),
+            mcp_inline_limit_chars=_env_int("MCP_INLINE_LIMIT_CHARS", 100_000),
+            mcp_base64_limit_bytes=_env_int("MCP_BASE64_LIMIT_BYTES", 1024 * 1024),
         )

@@ -5,10 +5,28 @@ FROM python:3.12-slim AS build
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
 
+# Build the optional /mcp connector endpoint in by default. `WITH_MCP=0`
+# produces a minimal image with today's audit surface (no mcp/httpx/etc.)
+# and /mcp simply absent -- see docs/plan-mcp-connector.md, "Decision gate 3".
+ARG WITH_MCP=1
+
 WORKDIR /build
-COPY app/requirements.txt .
+COPY app/requirements.txt app/requirements-mcp.txt ./
+# requirements.txt and requirements-mcp.txt MUST be installed in a single
+# invocation, not two -- mcp and fastapi share starlette, and pip resolves
+# each invocation independently, so a separate `pip install -r
+# requirements-mcp.txt` afterwards would let sse-starlette drag starlette
+# past fastapi's declared bound even with mcp itself pinned. See
+# docs/plan-mcp-connector.md, "Option A only holds if it resolves in one pip
+# install". `pip check` here turns a bad resolve into a failed build instead
+# of a production import error.
 RUN python -m venv /venv \
- && /venv/bin/pip install --no-cache-dir -r requirements.txt
+ && if [ "$WITH_MCP" = "1" ]; then \
+      /venv/bin/pip install --no-cache-dir -r requirements.txt -r requirements-mcp.txt; \
+    else \
+      /venv/bin/pip install --no-cache-dir -r requirements.txt; \
+    fi \
+ && /venv/bin/pip check
 
 
 FROM python:3.12-slim

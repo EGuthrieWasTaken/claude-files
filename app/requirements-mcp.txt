@@ -1,0 +1,18 @@
+# The MCP SDK, for the optional Streamable HTTP connector endpoint at /mcp
+# (app/mcp_endpoint.py -- see docs/plan-mcp-connector.md for the full design).
+#
+# Pinned, not ranged: 1.12.4 is the newest mcp that resolves against the
+# fastapi==0.115.6 / pydantic==2.10.4 pins in requirements.txt without moving
+# either of them -- see docs/plan-mcp-connector.md, "Decision gate 2". A
+# future mcp patch release, or a pydantic bump made for an unrelated reason,
+# could otherwise silently drag mcp (and starlette along with it) somewhere
+# else. Bumping this pin may drag starlette past fastapi's declared bound;
+# verify with `pip check` before moving it.
+#
+# MUST be installed in the SAME pip invocation as requirements.txt, not as a
+# separate layer -- mcp and fastapi share starlette, and installing them
+# separately lets sse-starlette's own resolve drag starlette past fastapi's
+# bound even with mcp itself pinned here. See the Dockerfile and
+# docs/plan-mcp-connector.md, "Option A only holds if it resolves in one pip
+# install".
+mcp==1.12.4

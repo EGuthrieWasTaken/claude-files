@@ -627,7 +627,7 @@ def chunked_writes() -> None:
                 break
             seq += 1
         call_tool("abort_write", {"upload_id": uid})
-        if refused and str(MAX_UPLOAD_BYTES) in refusal_text:
+        if refused and f"{MAX_UPLOAD_BYTES:,}" in refusal_text:
             R.ok("chunk", "cumulative MAX_UPLOAD_BYTES enforced during chunking, names the limit")
         else:
             R.bad("chunk", "cumulative cap", f"refused={refused} after {seq} chunks -> {refusal_text[:200]!r}")
@@ -716,19 +716,24 @@ def chunked_writes() -> None:
         status, is_err, out = call_tool("begin_write", {"path": "mcp-abandoned.bin"})
         uid = out["upload_id"]
         call_tool("write_chunk", {"upload_id": uid, "seq": 0, "content": "orphaned"})
-        tmp_before = list((REPO / "shared").glob(".upload-*.tmp"))
+        tmp_before = {p.name for p in (REPO / "shared").glob(".upload-*.tmp")}
         time.sleep(UPLOAD_SESSION_TTL_SECONDS + 2)
-        # Reaping is lazy -- triggered by the next begin_write/write_chunk.
-        call_tool("begin_write", {"path": "mcp-reap-trigger.bin"})
-        tmp_after = list((REPO / "shared").glob(".upload-*.tmp"))
+        # Reaping is lazy -- triggered by the next begin_write/write_chunk. This
+        # call opens its own session (with its own new temp file), so compare
+        # by name -- tmp_before's specific file(s) must be gone -- rather than
+        # by count, which a freshly-added temp file would keep flat.
+        status2, is_err2, out2 = call_tool("begin_write", {"path": "mcp-reap-trigger.bin"})
+        tmp_after = {p.name for p in (REPO / "shared").glob(".upload-*.tmp")}
         _s, unknown_err, _o = call_tool("write_chunk", {"upload_id": uid, "seq": 1, "content": "x"})
         dest_missing = not (REPO / "shared" / "mcp-abandoned.bin").exists()
-        if unknown_err and dest_missing and len(tmp_after) < len(tmp_before):
+        if unknown_err and dest_missing and not (tmp_before & tmp_after):
             R.ok("chunk", "an idle session past its TTL is reaped (temp file gone, upload_id unknown)")
         else:
             R.bad("chunk", "TTL reap",
                   f"unknown_err={unknown_err} dest_missing={dest_missing} "
-                  f"tmp before/after={len(tmp_before)}/{len(tmp_after)}")
+                  f"tmp before={sorted(tmp_before)} after={sorted(tmp_after)}")
+        if not is_err2:
+            call_tool("abort_write", {"upload_id": out2["upload_id"]})
     else:
         print(f"  {DIM}SKIP  [chunk] TTL reap test -- MCP_UPLOAD_SESSION_TTL_SECONDS="
               f"{UPLOAD_SESSION_TTL_SECONDS} is too long to wait out{RESET}")

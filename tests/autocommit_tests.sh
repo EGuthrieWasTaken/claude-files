@@ -258,11 +258,15 @@ fi
 # --- 10. PUSH=false and DRY_RUN --------------------------------------------
 reset_fixture
 echo "local only" > "$FIX/repo/shared/local.txt"
-sidecar -e PUSH=false >/dev/null
-if local_log | grep -q "agent: sync" && ! remote_files | grep -q "local.txt"; then
+push_false_out=$(sidecar -e PUSH=false)
+llog="$(local_log)"; rfiles="$(remote_files)"
+if grep -q "agent: sync" <<<"$llog" && ! grep -q "local.txt" <<<"$rfiles"; then
   ok "PUSH=false commits locally without pushing"
 else
-  bad "PUSH=false" "pushed anyway"
+  # Diagnostic dump -- this check has failed intermittently in CI without an
+  # obvious cause from the pass/fail result alone; capture everything needed
+  # to root-cause it on the next occurrence instead of guessing blind again.
+  bad "PUSH=false" "local_log=$(tr '\n' '|' <<<"$llog") remote_files=$(tr '\n' '|' <<<"$rfiles") sidecar_out=$(tr '\n' '|' <<<"$push_false_out")"
 fi
 
 reset_fixture

@@ -222,9 +222,24 @@ if [[ "$nomcp_status" == "404" && "$rest_status" == "200" ]]; then
 else
   echo "  FAIL  /mcp -> $nomcp_status (wanted 404), REST -> $rest_status (wanted 200)"; FAIL=1
 fi
-docker logs cf-test-nomcp 2>&1 | grep -q "mcp not installed" \
-  && echo "  PASS  log explains why /mcp is absent" \
-  || { echo "  FAIL  log does not explain the missing /mcp mount"; FAIL=1; }
+# The line is logged at import time, well before /health can respond, but
+# docker logs' own delivery to this CLI call can lag a beat behind the
+# container actually being healthy -- retry briefly rather than requiring
+# one immediate grep to win a race that isn't the thing under test.
+nomcp_log_ok=0
+for _ in $(seq 1 10); do
+  if docker logs cf-test-nomcp 2>&1 | grep -q "mcp not installed"; then
+    nomcp_log_ok=1; break
+  fi
+  sleep 0.3
+done
+if [[ "$nomcp_log_ok" == "1" ]]; then
+  echo "  PASS  log explains why /mcp is absent"
+else
+  echo "  FAIL  log does not explain the missing /mcp mount"
+  docker logs cf-test-nomcp 2>&1 | tail -20
+  FAIL=1
+fi
 docker rm -f cf-test-nomcp >/dev/null 2>&1 || true
 
 echo

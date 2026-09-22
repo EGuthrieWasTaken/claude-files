@@ -468,7 +468,10 @@ def integrity_floor() -> None:
         "content": base64.b64encode(over).decode("ascii"),
         "encoding": "base64",
     })
-    if advertised_cap == BASE64_LIMIT_BYTES and is_err2 and str(advertised_cap) in str(out):
+    # The app formats the byte count with a thousands separator (f"{cap:,}"),
+    # so match that rendering rather than the bare str(int).
+    if (advertised_cap == BASE64_LIMIT_BYTES and is_err2
+            and f"{advertised_cap:,}" in str(out)):
         R.ok("floor", "get_folder_info's advertised base64 cap matches what's enforced",
              f"(cap={advertised_cap})")
     else:
@@ -538,7 +541,6 @@ def chunked_writes() -> None:
 
     # 7. Ordering: skipped, repeated, out-of-order seq all refused; a resend
     #    after a failed call succeeds.
-    call_tool("begin_write", {"path": "mcp-order-throwaway.bin"})  # noise, ignored
     status, is_err, out = call_tool("begin_write", {"path": "mcp-ordering.txt"})
     uid = out["upload_id"]
     _s, skip_err, _o = call_tool("write_chunk", {"upload_id": uid, "seq": 1, "content": "x"})
@@ -574,10 +576,7 @@ def chunked_writes() -> None:
         ("wrong expect_bytes", {"expect_bytes": 999_999}, "mcp-commit-badbytes.bin"),
         ("neither expect_*", {}, "mcp-commit-noverify.bin"),
     ]:
-        call_tool("begin_write", {"path": dest})
         status, is_err, out = call_tool("begin_write", {"path": dest})
-        # begin_write again refuses (overwrite=true default doesn't matter here,
-        # we want a session against `dest`); use the second session's id.
         uid = out["upload_id"] if not is_err else None
         if uid:
             call_tool("write_chunk", {"upload_id": uid, "seq": 0, "content": "hello"})

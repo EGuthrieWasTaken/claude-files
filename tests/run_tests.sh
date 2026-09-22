@@ -33,8 +33,14 @@ TOKEN="test-token-$(openssl rand -hex 16)"
 RO_TOKEN="test-ro-token-$(openssl rand -hex 16)"
 # Deliberately small so tests/mcp_escape_suite.py's budget checks (truncation,
 # binary/base64 refusal) exercise real boundaries instead of never tripping.
+# Must stay comfortably above write_file's own hardcoded 1KB
+# require-verification threshold (app/mcp_endpoint.py) -- 1024 here would
+# make every "over 1KB, no expect_*" test collide with "over the single-shot
+# cap" instead, refused for the wrong reason. Matches the production default
+# (app/config.py) so the test boundary is the real one, not an arbitrary
+# smaller stand-in.
 MCP_INLINE_LIMIT_CHARS=2000
-MCP_BASE64_LIMIT_BYTES=1024
+MCP_BASE64_LIMIT_BYTES=8192
 # Deliberately short/small so tests/mcp_escape_suite.py's chunked-write
 # checks (TTL reap, concurrency cap) exercise real boundaries in seconds
 # instead of never tripping or requiring a 900s sleep.

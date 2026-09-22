@@ -436,10 +436,12 @@ def integrity_floor() -> None:
 
     # 3. Round trip: read_file -> write_file forwarding the returned
     #    sha256/bytes succeeds and the destination is byte-identical.
+    roundtrip_src = os.urandom(4096)
     call_tool("write_file", {
         "path": "mcp-roundtrip-src.bin",
-        "content": base64.b64encode(os.urandom(4096)).decode("ascii"),
+        "content": base64.b64encode(roundtrip_src).decode("ascii"),
         "encoding": "base64",
+        "expect_bytes": len(roundtrip_src),
     })
     status, is_err, src = call_tool("read_file", {"path": "mcp-roundtrip-src.bin", "encoding": "base64"})
     status, is_err, out = call_tool("write_file", {
@@ -746,6 +748,7 @@ def copy_tests() -> None:
         "path": "mcp-copy-src.bin",
         "content": base64.b64encode(payload).decode("ascii"),
         "encoding": "base64",
+        "expect_bytes": len(payload),
     })
     status, is_err, out = call_tool("copy_file", {"src": "mcp-copy-src.bin", "dst": "mcp-copy-dst.bin"})
     same = (REPO / "shared" / "mcp-copy-src.bin").read_bytes() == (REPO / "shared" / "mcp-copy-dst.bin").read_bytes() \

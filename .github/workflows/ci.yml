@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  quick-checks:
+    name: Syntax checks (Python, shell)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Byte-compile app and test modules
+        run: python -m py_compile app/*.py tests/*.py
+
+      - name: Shell syntax check
+        run: |
+          for f in tests/*.sh autocommit/*.sh; do
+            echo "checking $f"
+            bash -n "$f"
+          done
+
+  containment-suite:
+    name: API containment & functional suite (both container modes)
+    needs: quick-checks
+    runs-on: ubuntu-latest
+    # tests/run_tests.sh builds the image twice (WITH_MCP=1 and WITH_MCP=0),
+    # runs it under two mount configurations, and drives both
+    # tests/escape_suite.py (REST) and tests/mcp_escape_suite.py (/mcp) against
+    # each -- see that script for what "both modes" means and why both must
+    # pass independently of the mount boundary.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run tests/run_tests.sh
+        run: bash tests/run_tests.sh
+
+  autocommit-suite:
+    name: Autocommit sidecar suite
+    needs: quick-checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the autocommit sidecar image
+        run: docker build -t claude-files-autocommit:test ./autocommit
+
+      - name: Run tests/autocommit_tests.sh
+        run: bash tests/autocommit_tests.sh

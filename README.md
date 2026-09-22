@@ -1,12 +1,15 @@
 # claude-files
 
+[![CI](https://github.com/EGuthrieWasTaken/claude-files/actions/workflows/ci.yml/badge.svg)](https://github.com/EGuthrieWasTaken/claude-files/actions/workflows/ci.yml)
+
 A small REST API, in a hardened container, that gives an agent
 upload / download / replace / delete access to **exactly one folder** and
 nothing else. Built to hand Claude cloud processes a write target inside a
 git repository while the rest of the repository stays unreachable.
 
-56 checks pass in each of two container configurations, including every
-escape attempt in `tests/escape_suite.py`. See
+Every escape attempt in `tests/escape_suite.py` and `tests/mcp_escape_suite.py`
+passes in each of two container configurations, on every pull request (see the
+CI badge above, and `.github/workflows/ci.yml`). See
 [Security model](#security-model).
 
 ---
@@ -341,6 +344,10 @@ it to a single request.
 ```bash
 bash tests/run_tests.sh
 ```
+
+CI runs exactly this on every pull request (`.github/workflows/ci.yml`), plus
+`tests/autocommit_tests.sh` against the sidecar image — there is no separate
+CI-only test list to keep in sync.
 
 This builds the image and runs the suite against two configurations:
 

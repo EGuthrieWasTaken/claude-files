@@ -64,6 +64,7 @@ R = Results()
 
 
 def request(method: str, path: str, *, body=None, token: str | None = TOKEN,
+            api_key: str | None = None,
             headers: dict | None = None) -> tuple[int, dict, bytes]:
     """Send a request with the path EXACTLY as given -- no normalisation."""
     host, _, port = BASE.partition(":")
@@ -71,6 +72,8 @@ def request(method: str, path: str, *, body=None, token: str | None = TOKEN,
     hdrs = dict(headers or {})
     if token:
         hdrs["Authorization"] = f"Bearer {token}"
+    if api_key:
+        hdrs["X-API-Key"] = api_key
     try:
         conn.request(method, path, body=body, headers=hdrs)
         resp = conn.getresponse()
@@ -234,6 +237,31 @@ def functional() -> None:
             R.ok("func", "read-only token cannot write or delete")
         else:
             R.bad("func", "read-only token", f"got {st}/{st2}/{st3}, wanted 200/403/403")
+
+    # --- X-API-Key: the header the MCP connector dialog sends -------------
+    # (docs/plan-mcp-connector.md, test 9)
+    st, _, _ = request("GET", "/v1/list", token=None, api_key=TOKEN)
+    R.ok("func", "X-API-Key accepted where Authorization is today") if st == 200 \
+        else R.bad("func", "X-API-Key accepted", f"status {st}")
+
+    st, _, _ = request("GET", "/v1/list", token=None, api_key="wrong-token-0123456789abcdef")
+    R.ok("func", "wrong X-API-Key -> 401") if st == 401 \
+        else R.bad("func", "wrong X-API-Key", f"status {st}")
+
+    if RO_TOKEN:
+        st, _, _ = request("GET", "/v1/list", token=None, api_key=RO_TOKEN)
+        st2, _, _ = request("PUT", "/v1/content/ro2.txt", body=b"x", token=None, api_key=RO_TOKEN)
+        if st == 200 and st2 == 403:
+            R.ok("func", "read-only token via X-API-Key stays read-only")
+        else:
+            R.bad("func", "read-only X-API-Key", f"got {st}/{st2}, wanted 200/403")
+
+    # Authorization wins when both headers are present with different values
+    # -- never "try each until one matches" (that would be two guesses
+    # against the rate limiter from one request).
+    st, _, _ = request("GET", "/v1/list", token=TOKEN, api_key="wrong-token-0123456789abcdef")
+    R.ok("func", "Authorization wins over a conflicting X-API-Key") if st == 200 \
+        else R.bad("func", "Authorization precedence", f"status {st}, wanted 200")
 
 
 # ==========================================================================

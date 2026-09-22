@@ -28,18 +28,30 @@ new_fixture() {
   bash tests/make_fixture.sh "$FIXTURE" >/dev/null
 }
 IMAGE="claude-files:test"
+IMAGE_NOMCP="claude-files:test-nomcp"
 TOKEN="test-token-$(openssl rand -hex 16)"
 RO_TOKEN="test-ro-token-$(openssl rand -hex 16)"
+# Deliberately small so tests/mcp_escape_suite.py's budget checks (truncation,
+# binary/base64 refusal) exercise real boundaries instead of never tripping.
+MCP_INLINE_LIMIT_CHARS=2000
+MCP_BASE64_LIMIT_BYTES=1024
 FAIL=0
 
 cleanup() {
-  docker rm -f cf-test-a cf-test-b >/dev/null 2>&1 || true
+  docker rm -f cf-test-a cf-test-b cf-test-nomcp cf-test-offswitch >/dev/null 2>&1 || true
   [[ "${KEEP_FIXTURE:-0}" == "1" ]] || rm -rf "$FIXTURE_BASE"
 }
 trap cleanup EXIT
 
-echo "==> Building image"
+echo "==> Building image (WITH_MCP=1, the default)"
 docker build -q -t "$IMAGE" . >/dev/null
+
+echo "==> pip check inside the built image (test 11: catches the two-invocations trap)"
+if docker run --rm --entrypoint /venv/bin/pip "$IMAGE" check; then
+  echo "  PASS  no broken requirements (fastapi/mcp/starlette resolve cleanly)"
+else
+  echo "  FAIL  pip check found a broken dependency graph"; FAIL=1
+fi
 
 wait_healthy() {
   local name=$1 port=$2
@@ -62,6 +74,9 @@ common_flags=(
   -e API_TOKEN_READONLY="$RO_TOKEN"
   -e MAX_UPLOAD_BYTES=2097152
   -e LOG_LEVEL=INFO
+  -e ENABLE_MCP=true
+  -e MCP_INLINE_LIMIT_CHARS="$MCP_INLINE_LIMIT_CHARS"
+  -e MCP_BASE64_LIMIT_BYTES="$MCP_BASE64_LIMIT_BYTES"
 )
 
 run_mode() {
@@ -79,8 +94,25 @@ run_mode() {
     python3 tests/escape_suite.py || FAIL=1
 
   echo
+  echo "--- MCP connector: same containment suite via /mcp tools/call ---"
+  BASE_URL="127.0.0.1:$port" API_TOKEN="$TOKEN" API_TOKEN_READONLY="$RO_TOKEN" \
+  FIXTURE_REPO="$FIXTURE/repo" MODE="$mode" \
+  MCP_INLINE_LIMIT_CHARS="$MCP_INLINE_LIMIT_CHARS" MCP_BASE64_LIMIT_BYTES="$MCP_BASE64_LIMIT_BYTES" \
+    python3 tests/mcp_escape_suite.py || FAIL=1
+
+  echo
   echo "--- server log: denials recorded ---"
   docker logs "$name" 2>&1 | grep -c "denied" | sed 's/^/  denied requests logged: /' || true
+  # Regression test for docs/plan-mcp-connector.md's "security regression":
+  # FastMCP swallows a tool's exception into a 200 isError result, so a
+  # rejected /mcp path would be invisible in the logs unless app/mcp_endpoint
+  # .py's _guard logs it itself, tagged distinctly from the REST "denied ...".
+  mcp_denied=$(docker logs "$name" 2>&1 | grep -c "denied MCP" || true)
+  if [[ "$mcp_denied" -gt 0 ]]; then
+    echo "  PASS  $mcp_denied MCP denial(s) logged (denied MCP ...)"
+  else
+    echo "  FAIL  no 'denied MCP ...' lines in the log -- MCP rejections are invisible"; FAIL=1
+  fi
   docker rm -f "$name" >/dev/null 2>&1 || true
 }
 
@@ -134,6 +166,56 @@ fi
 new_fixture
 run_mode "app-only (whole repo mounted, no mount boundary)" cf-test-b 18081 \
   -v "$FIXTURE/repo:/repo" -e DATA_ROOT=/repo/shared
+
+# --------------------------------------------------------------------------
+# Both /mcp off switches, tested separately (docs/plan-mcp-connector.md,
+# test 8): a half-threaded flag's failure mode is a mounted-but-unlisted
+# endpoint, so both assert the actual HTTP status, not just "no tool ran".
+# --------------------------------------------------------------------------
+
+echo
+echo "==> Building image (WITH_MCP=0: mcp package not installed at all)"
+docker build -q --build-arg WITH_MCP=0 -t "$IMAGE_NOMCP" . >/dev/null
+
+echo
+echo "==> Off switch 1/2: WITH_MCP=0 image serves REST with /mcp absent"
+new_fixture
+docker rm -f cf-test-nomcp >/dev/null 2>&1 || true
+docker run "${common_flags[@]}" --name cf-test-nomcp -p "127.0.0.1:18082:8080" \
+  -v "$FIXTURE/repo/shared:/data" "$IMAGE_NOMCP" >/dev/null
+wait_healthy cf-test-nomcp 18082
+nomcp_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:18082/mcp" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" -d '{}')
+rest_status=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:18082/v1/list" \
+  -H "Authorization: Bearer $TOKEN")
+if [[ "$nomcp_status" == "404" && "$rest_status" == "200" ]]; then
+  echo "  PASS  /mcp -> 404 (mcp not installed), REST API unaffected (200)"
+else
+  echo "  FAIL  /mcp -> $nomcp_status (wanted 404), REST -> $rest_status (wanted 200)"; FAIL=1
+fi
+docker logs cf-test-nomcp 2>&1 | grep -q "mcp not installed" \
+  && echo "  PASS  log explains why /mcp is absent" \
+  || { echo "  FAIL  log does not explain the missing /mcp mount"; FAIL=1; }
+docker rm -f cf-test-nomcp >/dev/null 2>&1 || true
+
+echo
+echo "==> Off switch 2/2: ENABLE_MCP=false 404s even though mcp IS installed"
+new_fixture
+docker rm -f cf-test-offswitch >/dev/null 2>&1 || true
+docker run "${common_flags[@]}" --name cf-test-offswitch -p "127.0.0.1:18083:8080" \
+  -e ENABLE_MCP=false -v "$FIXTURE/repo/shared:/data" "$IMAGE" >/dev/null
+wait_healthy cf-test-offswitch 18083
+offswitch_status=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:18083/mcp" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" -d '{}')
+info_body=$(curl -s "http://127.0.0.1:18083/v1/info" -H "Authorization: Bearer $TOKEN")
+if [[ "$offswitch_status" == "404" ]] && grep -q '"mcp_enabled":false' <<<"$info_body"; then
+  echo "  PASS  ENABLE_MCP=false -> /mcp 404s, /v1/info reports mcp_enabled:false"
+else
+  echo "  FAIL  /mcp -> $offswitch_status (wanted 404), info -> $info_body"; FAIL=1
+fi
+docker rm -f cf-test-offswitch >/dev/null 2>&1 || true
 
 echo
 if [[ $FAIL -eq 0 ]]; then

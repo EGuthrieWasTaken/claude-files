@@ -1,11 +1,28 @@
 # Feature request: an MCP connector surface for claude-files
 
-**Status: proposed, with all three decision gates now settled.** Nothing here
-is implemented. Every "verified" note below means it was reproduced in a
-scratch environment against the real `mcp` SDK **on this repo's own pinned
-versions**, not that the code exists in this repository. The things marked
-*unverified* are the ones an implementer still has to find out empirically,
-and they are called out as such.
+**Status: implemented**, per this document as written -- `app/mcp_endpoint.py`
+mounts `/mcp`, `app/main.py` is widened for `X-API-Key` and converted to a
+proper `lifespan`, `requirements-mcp.txt` + the Dockerfile's `WITH_MCP` build
+arg carry decision gate 2/3, and `tests/mcp_escape_suite.py` drives the same
+containment suite as `tests/escape_suite.py` through `tools/call`. All three
+decision gates below were built exactly as resolved (`X-API-Key`, Option A's
+pinned `mcp==1.12.4` installed in one `pip` invocation, `ENABLE_MCP` defaulting
+true alongside the `WITH_MCP` build arg).
+
+**What was NOT re-verified while implementing this**, and is worth flagging
+for whoever deploys it first: every "Verified" note this document inherited
+from `meeting-transcriber`'s own build (the four mounting gotchas, the
+`stateless_http=True` transport, `FastMCP(instructions=...)` surfacing) was
+reproduced there against the real SDK, not re-reproduced here -- this
+implementation trusts that prior verification rather than repeating it,
+since the same `mcp==1.12.4` pin and the same mounting pattern are in play.
+What genuinely has **not** been exercised against a live container or a real
+claude.ai connector dialog in *this* repo is: `docker build`/`tests/run_tests.sh`
+itself (no Docker daemon was available in the environment this was built in),
+and the open questions below, which were already unresolved before this pass
+and remain so. Run `tests/run_tests.sh` before treating this as
+production-verified, and record real connector-setup findings in the section
+below the first time it's added as a live connector.
 
 The three gates are resolved as follows; each section below records the
 reasoning:
@@ -482,6 +499,25 @@ the tunnel hostname is rejected before reaching a tool. Add
 on; when unset, disable the guard outright **and log a warning once**, rather
 than 421ing silently. `/mcp` is gated by the token check either way.
 
+**Gotcha 5 -- found during this implementation, not in the original plan:
+`mcp==1.12.4` cannot register a tool from a module with `from __future__
+import annotations`.** Every other module in this repo uses it; `app/mcp_endpoint.py`
+deliberately does not, and says why inline. `Tool.from_function()`
+(`mcp/server/fastmcp/tools/base.py`) calls `inspect.signature(fn)` without
+`eval_str=True`, then `issubclass(param.annotation, Context)` on whatever it
+gets. With PEP 563 active, every parameter's annotation is a plain string
+(`"str"`, `"int | None"`, ...) rather than a real type object, and
+`issubclass("str", Context)` raises `TypeError: issubclass() arg 1 must be a
+class` -- for *any* parameter, not just `Context`- or union-typed ones.
+**Verified directly against the pinned SDK**: a single-parameter `def
+plain(path: str)` tool fails to register with the future import present and
+registers fine without it. This was not caught by this document's earlier
+"verified" notes because none of them exercised actual tool *parameter*
+registration (`@mcp.tool()` on a function with arguments) -- they were all
+about mounting, routing, and auth. Since this module targets Python 3.12
+(the Dockerfile's base image), dropping the future import costs nothing:
+`X | None` and `list[...]` are native syntax there.
+
 ### Transport mode: stateless and JSON, not SSE
 
 Recommendation: `FastMCP(..., stateless_http=True, json_response=True)`.
@@ -638,7 +674,8 @@ That is a duplication — record it in `AGENT.md` with a pointer, and keep
 
 ## Tool surface
 
-Nine tools, one per REST capability plus an info tool. Names are chosen to read
+Eight tools, one per REST capability plus an info tool -- the ninth, `find_files`,
+was deferred; see open question 5. Names are chosen to read
 well in a tool list, not to mirror HTTP verbs.
 
 | Tool | Maps to | Notes |
@@ -788,6 +825,8 @@ What remains open:
    wants to consume a document. Connector support for resources is uneven
    across surfaces, so: tools first, resources as a follow-on once the tool
    surface is proven.
-5. **Should `find_files` ship in v1?** Only if `list_files(recursive=True)`
-   proves clumsy in real use. Adding it later is easy; removing a tool from a
-   published connector is not.
+5. **Should `find_files` ship in v1?** **Resolved for this pass: no.** It did
+   not ship -- there is no real usage yet to judge `list_files(recursive=True)`
+   clumsy by, and the whole point of leaving it out was that adding it later
+   is cheap while removing a published tool is not. Revisit once the eight
+   shipped tools have seen real use.

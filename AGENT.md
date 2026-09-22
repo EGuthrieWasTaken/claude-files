@@ -1,11 +1,21 @@
 # File API access
 
-You have write access to one shared folder on a remote machine through a REST
-API. Use it whenever you need to hand back a file rather than paste content
+You have write access to one shared folder on a remote machine. **If you have
+an MCP connector for this service (tools named `list_files`, `read_file`,
+`write_file`, ...), use those instead of the REST calls below** — they're
+typed, discoverable, and don't need this brief pasted into context. This
+document is for the REST fallback: when no connector is available, and for
+files too large or too binary for a tool result (the connector's tools say so
+explicitly when that happens, and name the REST endpoint below to use
+instead).
+
+Use it whenever you need to hand back a file rather than paste content
 into the conversation: reports, generated data, build artifacts, logs.
 
 **Base URL:** `https://claude-files.guthrieec.dev`
 **Auth:** every request except `/health` needs `Authorization: Bearer $CLAUDE_FILES_TOKEN`
+(or `X-API-Key: $CLAUDE_FILES_TOKEN` — the header the MCP connector dialog uses;
+`Authorization` is the documented primary and wins if both are sent).
 
 The token is a credential. Never write it into a file you upload, never put
 it in a URL or query string, and never echo it into output that gets saved.

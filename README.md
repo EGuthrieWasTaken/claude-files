@@ -158,6 +158,7 @@ path is relative to the shared folder root.
 | `DELETE` | `/v1/content/{path}` | Delete a file or dir. `?recursive=true` for non-empty dirs. |
 | `POST` | `/v1/mkdir/{path}` | Create a directory. `?parents=true` by default. |
 | `POST` | `/v1/move` | `{"src":…, "dst":…, "overwrite":false, "parents":false}` |
+| `POST`/`GET`/`DELETE` | `/mcp` | Optional Streamable HTTP MCP connector — see [MCP connector](#mcp-connector). |
 
 Writes are atomic: content goes to a temp file in the destination directory
 and is `rename()`d into place, so a reader never sees a half-written file.
@@ -180,6 +181,54 @@ Errors are JSON: `{"code": "traversal", "message": "..."}`. Every rejection is
 logged at `WARNING`, so escape attempts show up in `docker logs`.
 
 `AGENT.md` in this repo is a paste-ready brief for handing to an agent.
+
+---
+
+## MCP connector
+
+`/mcp` is a second front end onto the same shared folder, for agent surfaces
+that speak MCP tools rather than composing raw HTTP calls — Cowork, the
+claude.ai web app, and mobile all fall into this bucket. It does not replace
+the REST API above; anything too large or too binary for a tool result still
+goes over REST, and the MCP tools say so explicitly when that happens. Full
+design brief: `docs/plan-mcp-connector.md`.
+
+**Two hard limitations, both structural, not bugs to fix later:**
+
+1. **Tool results are JSON in a model's context window.** There's no bulk
+   transfer path, so `/mcp` enforces its own budget well below
+   `MAX_UPLOAD_BYTES` (`MCP_INLINE_LIMIT_CHARS`, default 100 000 characters).
+   A file over that budget comes back as a preview, the real byte count, and a
+   note pointing at the REST download endpoint — never a silent cut.
+2. **Binary is worse than large.** `read_file` decodes UTF-8 by default and
+   refuses a file with a NUL byte or that fails to decode, naming the REST
+   endpoint instead of returning mojibake. `encoding="base64"` opts in for a
+   small binary file, capped far below the text budget
+   (`MCP_BASE64_LIMIT_BYTES`, default 1 MiB) — base64 inflates size by a third
+   and buys nothing since the model can't read it anyway.
+
+### Adding it as a connector
+
+1. Set `ENABLE_MCP=true` (the default) and, if this service sits behind a
+   reverse proxy or tunnel, `MCP_PUBLIC_HOSTNAME` to its public hostname —
+   otherwise the MCP SDK's DNS-rebinding guard is disabled outright rather
+   than 421ing every real request (`/mcp` is still gated by `API_TOKEN`
+   either way).
+2. If Cloudflare Access sits in front of this hostname, add a **Bypass
+   policy scoped to `/mcp` only** — the app's own token check is the gate;
+   don't disable Access on the whole hostname for this.
+3. In claude.ai / Cowork, add a custom connector: URL is `https://<host>/mcp`,
+   auth is "No sign-in" plus a static header — `x-api-key` is one of its
+   preset header names — holding `API_TOKEN` (or `API_TOKEN_READONLY` for a
+   read-only connector).
+
+Every REST route also accepts `X-API-Key: <token>` now, as an alternative to
+`Authorization: Bearer <token>` — that's what the connector dialog sends.
+`Authorization` remains the documented primary and wins if both are present
+on one request.
+
+`GET /v1/info` reports `mcp_enabled` so you can confirm what a deployment is
+actually serving without probing `/mcp` directly.
 
 ---
 
@@ -217,6 +266,14 @@ Also on by default: `.git`, `.gitmodules`, and `.ssh` are refused as path
 components at any depth, and regular files with more than one hard link are
 refused, because a hard link created on the host can alias a file outside the
 mounted subtree. Set `ALLOW_HARDLINKED_FILES=true` only if you have a reason.
+
+The optional `/mcp` connector (see [MCP connector](#mcp-connector)) is the
+same three layers behind the same token check — it is a second front end onto
+the same `Vault`, not a second implementation of path handling. Every MCP
+tool routes its filesystem calls through the identical `VAULT.components()`
+validation the REST routes use, and a rejected path is still logged, just
+tagged `denied MCP …` instead of `denied POST …` so the two surfaces stay
+distinguishable in `docker logs`.
 
 ### Verifying it yourself
 
@@ -346,6 +403,14 @@ being refused at startup.
 
 ## Publishing a new version
 
+> **This version's release notes should say:** pulling this image starts
+> serving the [MCP connector](#mcp-connector) at `/mcp` by default (unRAID
+> templates track `:latest`, so this happens without anyone asking for it).
+> It's defensible — `/mcp` is gated by the same `API_TOKEN` as every other
+> route — but say it plainly rather than let it be discovered. Set
+> `ENABLE_MCP=false` to opt out, or build with `--build-arg WITH_MCP=0` for
+> an image that doesn't have the `mcp` package at all.
+
 The image is multi-arch (`linux/amd64` for unRAID, `linux/arm64` for local
 work on Apple silicon). Build both in one shot and push a single manifest:
 
@@ -396,5 +461,9 @@ reproducible, and `:latest` there would silently change what runs on the next
 | `ALLOW_HARDLINKED_FILES` | `false` | Leave false. |
 | `REQUIRE_MOUNT` | `true` | Refuse to start if `DATA_ROOT` isn't a mount point. |
 | `ENABLE_DOCS` | `true` | Serve `/docs` and `/openapi.json`. |
-| `RATE_LIMIT_PER_MINUTE` | `600` | `0` disables. |
+| `RATE_LIMIT_PER_MINUTE` | `600` | `0` disables. Shared between REST and `/mcp`. |
 | `LOG_LEVEL` | `INFO` | |
+| `ENABLE_MCP` | `true` | Mount the [MCP connector](#mcp-connector) at `/mcp`. `false` disables it without rebuilding. |
+| `MCP_PUBLIC_HOSTNAME` | — | This service's public hostname, for the MCP SDK's DNS-rebinding guard. Unset disables that guard rather than 421ing real requests. |
+| `MCP_INLINE_LIMIT_CHARS` | `100000` | `read_file`'s inline text budget, in characters. |
+| `MCP_BASE64_LIMIT_BYTES` | `1048576` | `read_file`/`write_file`'s cap on source bytes when `encoding="base64"`. |

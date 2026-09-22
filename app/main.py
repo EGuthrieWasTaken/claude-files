@@ -12,6 +12,7 @@ import logging
 import os
 import time
 from collections import deque
+from contextlib import asynccontextmanager
 from typing import Annotated, Any, Iterator
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
@@ -55,6 +56,43 @@ the shared folder.
 Authenticate with `Authorization: Bearer <token>`.
 """
 
+
+@asynccontextmanager
+async def _mcp_session_scope():
+    """Enter the MCP SDK's own session-manager lifespan, if /mcp is mounted.
+
+    Mounting mcp_endpoint's sub-app does not run its lifespan on its own --
+    Starlette does not forward ASGI lifespan events into a mounted
+    sub-application -- so it has to be entered explicitly, from this app's
+    own lifespan. Skipping this produces a server that starts fine and then
+    fails on the first /mcp tool call with "Task group is not initialized."
+    A no-op when the mount is absent (not installed, or ENABLE_MCP=false) --
+    see the ImportError guard at the bottom of this file, which is what sets
+    `_mcp_endpoint` and runs before this function is ever awaited.
+    """
+    if _mcp_endpoint is not None:
+        async with _mcp_endpoint.mcp.session_manager.run():
+            yield
+    else:
+        yield
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    swept = VAULT.sweep_temp_files()
+    if swept:
+        log.info("removed %d stale upload temp file(s)", swept)
+    log.info(
+        "claude-files serving %s (delete=%s, max_upload=%d, denied=%s)",
+        VAULT.root_path,
+        CONFIG.allow_delete,
+        CONFIG.max_upload_bytes,
+        sorted(CONFIG.denied_names),
+    )
+    async with _mcp_session_scope():
+        yield
+
+
 app = FastAPI(
     title="claude-files",
     description=DESCRIPTION,
@@ -62,6 +100,7 @@ app = FastAPI(
     docs_url="/docs" if CONFIG.enable_docs else None,
     redoc_url=None,
     openapi_url="/openapi.json" if CONFIG.enable_docs else None,
+    lifespan=lifespan,
 )
 
 
@@ -124,15 +163,28 @@ def _rate_limit() -> None:
     _hits.append(now)
 
 
-def _check_token(authorization: str | None) -> str:
-    """Return "rw" or "ro"."""
-    if not authorization or not authorization.startswith("Bearer "):
+def _check_token(authorization: str | None, api_key: str | None = None) -> str:
+    """Return "rw" or "ro".
+
+    Accepts `Authorization: Bearer <token>` (the documented REST credential)
+    or `X-API-Key: <token>` (what the claude.ai custom-connector dialog
+    sends -- it offers a static header with `x-api-key` as a preset name,
+    the arrangement the sibling meeting-transcriber connector already runs
+    on). If `Authorization` is present it wins and `X-API-Key` is ignored --
+    never "try each until one matches", which would turn one request into
+    two guesses against the rate limiter.
+    """
+    presented = None
+    if authorization and authorization.startswith("Bearer "):
+        presented = authorization[7:].strip()
+    elif api_key:
+        presented = api_key.strip()
+    if presented is None:
         raise HTTPException(
             401,
             detail={"code": "unauthorized", "message": "Missing bearer token"},
             headers={"WWW-Authenticate": "Bearer"},
         )
-    presented = authorization[7:].strip()
     if hmac.compare_digest(presented, CONFIG.token):
         return "rw"
     if CONFIG.readonly_token and hmac.compare_digest(presented, CONFIG.readonly_token):
@@ -144,14 +196,20 @@ def _check_token(authorization: str | None) -> str:
     )
 
 
-def require_read(authorization: Annotated[str | None, Header()] = None) -> str:
+def require_read(
+    authorization: Annotated[str | None, Header()] = None,
+    x_api_key: Annotated[str | None, Header()] = None,
+) -> str:
     _rate_limit()
-    return _check_token(authorization)
+    return _check_token(authorization, x_api_key)
 
 
-def require_write(authorization: Annotated[str | None, Header()] = None) -> str:
+def require_write(
+    authorization: Annotated[str | None, Header()] = None,
+    x_api_key: Annotated[str | None, Header()] = None,
+) -> str:
     _rate_limit()
-    scope = _check_token(authorization)
+    scope = _check_token(authorization, x_api_key)
     if scope != "rw":
         raise HTTPException(
             403, detail={"code": "readonly", "message": "This token is read-only"}
@@ -212,6 +270,7 @@ def info(_: ReadAuth) -> dict[str, Any]:
         "denied_names": sorted(CONFIG.denied_names),
         "allow_delete": CONFIG.allow_delete,
         "allow_hardlinked_files": CONFIG.allow_hardlinked_files,
+        "mcp_enabled": _mcp_endpoint is not None,
     }
 
 
@@ -410,15 +469,30 @@ def move(req: MoveRequest, _: WriteAuth) -> OkResponse:
     return OkResponse(path="/".join(dst))
 
 
-@app.on_event("startup")
-def _startup() -> None:
-    swept = VAULT.sweep_temp_files()
-    if swept:
-        log.info("removed %d stale upload temp file(s)", swept)
-    log.info(
-        "claude-files serving %s (delete=%s, max_upload=%d, denied=%s)",
-        VAULT.root_path,
-        CONFIG.allow_delete,
-        CONFIG.max_upload_bytes,
-        sorted(CONFIG.denied_names),
-    )
+# --------------------------------------------------------------------------
+# Remote MCP (optional) -- docs/plan-mcp-connector.md
+# --------------------------------------------------------------------------
+# `mcp` is declared in requirements-mcp.txt, installed in the SAME pip
+# invocation as requirements.txt (not a separate Docker layer -- see
+# docs/plan-mcp-connector.md, "Decision gate 2": mcp and fastapi share
+# starlette, and installing them in separate invocations lets pip's resolver
+# drag sse-starlette's starlette past fastapi's declared bound, breaking the
+# image even though mcp itself is pinned). An image built with
+# `--build-arg WITH_MCP=0` has no requirements-mcp.txt installed at all, so
+# this import fails and /mcp is simply absent -- the REST API is unaffected
+# either way. `lifespan()` above references `_mcp_endpoint` before this
+# point in the file runs; that's fine, it's a module global looked up when
+# `lifespan()` is actually awaited (at server startup), never before this
+# module finishes importing.
+try:
+    from . import mcp_endpoint as _mcp_endpoint
+except ImportError:
+    _mcp_endpoint = None
+    log.info("mcp not installed; /mcp endpoint disabled (REST API unaffected)")
+else:
+    if CONFIG.enable_mcp:
+        _mcp_endpoint.mount_mcp(app)
+        log.info("Streamable HTTP MCP endpoint mounted at /mcp")
+    else:
+        _mcp_endpoint = None
+        log.info("ENABLE_MCP=false; /mcp endpoint disabled")

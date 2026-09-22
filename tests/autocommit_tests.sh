@@ -20,13 +20,25 @@ bad() { FAIL=$((FAIL+1)); printf "  ${R}FAIL${N} %s -- %s\n" "$1" "$2"; }
 cleanup() { [[ "${KEEP_FIXTURE:-0}" == "1" ]] || rm -rf "$FIX"; }
 trap cleanup EXIT
 
+# Match the container's uid:gid to whoever owns $FIX on disk (reset_fixture
+# runs as this same user). The image's baked-in default is a fixed non-root
+# uid (1000:1000, autocommit/Dockerfile) -- fine on Docker Desktop's bind
+# mounts, which don't enforce host-side Unix permissions, but on a native
+# Linux host (GitHub Actions runners included) a bind mount keeps real host
+# ownership, and 1000:1000 almost never matches the invoking user, so every
+# `git add`/`commit`/`checkout` fails with a permission error underneath
+# git's own error text. Real deployments hit the same class of problem and
+# solve it the same way -- docker-compose.yml's `user: "99:100"` for unRAID
+# is this exact override, just for the main API image instead of this one.
+DOCKER_USER=(--user "$(id -u):$(id -g)")
+
 inc() {
-  docker run --rm -v "$FIX:/work" --entrypoint bash "$IMG" -c \
+  docker run --rm "${DOCKER_USER[@]}" -v "$FIX:/work" --entrypoint bash "$IMG" -c \
     "export HOME=/tmp; git config --global --add safe.directory '*' >/dev/null 2>&1; $1" 2>&1
 }
 
 sidecar() { # extra env as args
-  docker run --rm -v "$FIX:/work" \
+  docker run --rm "${DOCKER_USER[@]}" -v "$FIX:/work" \
     -e REPO_PATH=/work/repo -e SUBDIR=shared -e RUN_ONCE=true -e QUIET_PERIOD=0 \
     "$@" "$IMG" 2>&1
 }
@@ -228,7 +240,7 @@ reset_fixture
 allref=0
 for entry in "empty SUBDIR|" "repo root|." "absolute|/etc" "traversal|shared/../.."; do
   label="${entry%%|*}"; value="${entry#*|}"
-  out=$(docker run --rm -v "$FIX:/work" -e REPO_PATH=/work/repo \
+  out=$(docker run --rm "${DOCKER_USER[@]}" -v "$FIX:/work" -e REPO_PATH=/work/repo \
         -e SUBDIR="$value" -e RUN_ONCE=true "$IMG" 2>&1); rc=$?
   if [[ $rc -eq 0 ]]; then bad "validation: $label" "started anyway"; allref=1; fi
 done

@@ -71,6 +71,16 @@ wait_healthy() {
 common_flags=(
   --rm -d
   --read-only
+  # Match the container's uid:gid to whoever owns the fixture on disk
+  # (make_fixture.sh runs as this same user). The image's baked-in default
+  # is a fixed non-root uid (1000:1000, Dockerfile) -- fine on Docker
+  # Desktop's bind mounts, which don't enforce host-side Unix permissions,
+  # but on a native Linux host (GitHub Actions runners included) a bind
+  # mount keeps real host ownership, and 1000:1000 almost never matches the
+  # invoking user, so every write 403s with "Permission denied". Real
+  # deployments hit the same thing and solve it the same way --
+  # docker-compose.yml's `user: "99:100"` for unRAID is this exact override.
+  --user "$(id -u):$(id -g)"
   --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m
   --cap-drop ALL
   --security-opt no-new-privileges:true
@@ -163,7 +173,7 @@ echo
 echo "==> Startup sweep: stale upload temp files"
 new_fixture
 touch "$FIXTURE/repo/shared/.upload-deadbeef.tmp" "$FIXTURE/repo/shared/nested/.upload-cafe.tmp"
-if docker run --rm -e API_TOKEN=aaaaaaaaaaaaaaaaaaaa -v "$FIXTURE/repo/shared:/data" \
+if docker run --rm --user "$(id -u):$(id -g)" -e API_TOKEN=aaaaaaaaaaaaaaaaaaaa -v "$FIXTURE/repo/shared:/data" \
      --entrypoint python "$IMAGE" -c "
 from app.safepath import Vault
 v = Vault('/data')

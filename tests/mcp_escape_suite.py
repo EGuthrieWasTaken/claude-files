@@ -213,7 +213,7 @@ def functional() -> None:
 
     status, is_err, out = call_tool("write_file", {"path": "mcp-report.txt", "content": "replaced", "overwrite": True})
     status2, _e2, out2 = call_tool("read_file", {"path": "mcp-report.txt"})
-    if status == 200 and out2.get("text") == "replaced":
+    if status == 200 and not _e2 and out2.get("text") == "replaced":
         R.ok("func", "write_file(overwrite=true) replaces an existing file")
     else:
         R.bad("func", "overwrite=true", f"got {status}/{status2}, text {out2!r}"[:200])

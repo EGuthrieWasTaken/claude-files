@@ -35,6 +35,12 @@ RO_TOKEN="test-ro-token-$(openssl rand -hex 16)"
 # binary/base64 refusal) exercise real boundaries instead of never tripping.
 MCP_INLINE_LIMIT_CHARS=2000
 MCP_BASE64_LIMIT_BYTES=1024
+# Deliberately short/small so tests/mcp_escape_suite.py's chunked-write
+# checks (TTL reap, concurrency cap) exercise real boundaries in seconds
+# instead of never tripping or requiring a 900s sleep.
+MCP_UPLOAD_SESSION_TTL_SECONDS=3
+MCP_MAX_CONCURRENT_UPLOADS=4
+MCP_UPLOAD_CHUNK_ADVISORY_BYTES=3072
 FAIL=0
 
 cleanup() {
@@ -77,6 +83,9 @@ common_flags=(
   -e ENABLE_MCP=true
   -e MCP_INLINE_LIMIT_CHARS="$MCP_INLINE_LIMIT_CHARS"
   -e MCP_BASE64_LIMIT_BYTES="$MCP_BASE64_LIMIT_BYTES"
+  -e MCP_UPLOAD_SESSION_TTL_SECONDS="$MCP_UPLOAD_SESSION_TTL_SECONDS"
+  -e MCP_MAX_CONCURRENT_UPLOADS="$MCP_MAX_CONCURRENT_UPLOADS"
+  -e MCP_UPLOAD_CHUNK_ADVISORY_BYTES="$MCP_UPLOAD_CHUNK_ADVISORY_BYTES"
 )
 
 run_mode() {
@@ -98,6 +107,9 @@ run_mode() {
   BASE_URL="127.0.0.1:$port" API_TOKEN="$TOKEN" API_TOKEN_READONLY="$RO_TOKEN" \
   FIXTURE_REPO="$FIXTURE/repo" MODE="$mode" \
   MCP_INLINE_LIMIT_CHARS="$MCP_INLINE_LIMIT_CHARS" MCP_BASE64_LIMIT_BYTES="$MCP_BASE64_LIMIT_BYTES" \
+  MAX_UPLOAD_BYTES=2097152 \
+  MCP_UPLOAD_SESSION_TTL_SECONDS="$MCP_UPLOAD_SESSION_TTL_SECONDS" \
+  MCP_MAX_CONCURRENT_UPLOADS="$MCP_MAX_CONCURRENT_UPLOADS" \
     python3 tests/mcp_escape_suite.py || FAIL=1
 
   echo

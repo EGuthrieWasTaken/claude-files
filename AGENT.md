@@ -9,6 +9,14 @@ files too large or too binary for a tool result (the connector's tools say so
 explicitly when that happens, and name the REST endpoint below to use
 instead).
 
+If the connector's `write_file` refuses a file as too large (or your own
+output would clearly overrun a few KB in one call), use its
+`begin_write`/`write_chunk`/`commit_write`/`abort_write` tools instead of
+forcing it through one inline call — `commit_write` needs the byte count or a
+sha256 hash to verify against. Copying a file that's already in the folder?
+Use `copy_file` (or `POST /v1/copy` below) instead of reading it out and
+writing it back in — the bytes never pass through your context either way.
+
 Use it whenever you need to hand back a file rather than paste content
 into the conversation: reports, generated data, build artifacts, logs.
 
@@ -43,6 +51,7 @@ different approach.
 | `DELETE` | `/v1/content/{path}` | Delete. `?recursive=true` for a non-empty directory |
 | `POST` | `/v1/mkdir/{path}` | Create a directory (parents created by default) |
 | `POST` | `/v1/move` | Body: `{"src":"a.txt","dst":"b.txt","overwrite":false,"parents":false}` |
+| `POST` | `/v1/copy` | Body: `{"src":"a.txt","dst":"b.txt","overwrite":false,"parents":false}` — server-side copy, no size ceiling |
 | `GET` | `/v1/info` | Current limits and policy |
 
 Full spec: `GET /openapi.json`.

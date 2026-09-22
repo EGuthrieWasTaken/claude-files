@@ -1,6 +1,11 @@
 # Plan: fix silent truncation on MCP writes, and add chunked write sessions
 
-**Status: specified, not implemented. Ready to hand to an implementer.**
+**Status: implemented.** Part 1 (the integrity floor), Part 2 (chunked write
+sessions), and the `copy_file` follow-on from "Considered and not chosen" (A)
+are all shipped in `app/mcp_endpoint.py`, `app/safepath.py`, and
+`app/config.py`. What differed from this brief, and why, is recorded in
+"Implementation notes" at the end of this document — read that before
+assuming the text above still describes the code exactly.
 
 The capability option was chosen: **Option B, chunked write sessions.** This
 document is now an implementation brief for that plus the integrity floor it
@@ -554,3 +559,65 @@ report" beats "clean up" when the recovery path is unclear.
 3. **Add `copy_file` as a follow-on?** It is ~30 lines and would have made the
    incident a non-event. Revisit once Option B is in and there is evidence about
    which case is actually common.
+
+   Resolved: added in the same change as Part 1/2, rather than deferred. See
+   "Implementation notes" below.
+
+## Implementation notes
+
+Recorded after building Part 1, Part 2, and `copy_file`, so the reasoning
+that survives isn't just what was planned but what actually shipped and why
+it differs.
+
+- **`copy_file` was added now, not deferred.** Open question 3 above framed
+  it as "revisit later" — it was added in this same change instead, as an
+  explicitly-requested additive follow-on. It's `Vault.copy` (`app/safepath.py`),
+  composed entirely from the existing `open_read` and `atomic_write`
+  primitives — no new containment logic, same as the plan's estimate. Unlike
+  the four chunked-write tools, `copy_file` **does** get a REST equivalent
+  (`POST /v1/copy`, body shaped like `/v1/move`): the "no REST equivalent,
+  deliberately" argument in this document is specific to chunked sessions
+  (REST already streams an arbitrarily large body with no output-token
+  ceiling, so it has no problem to solve there) and doesn't apply to a
+  same-process server-side copy, where REST and MCP being one implementation
+  is the general rule this document didn't have a reason to break.
+- **`_guard` now also catches and logs a plain `ValueError`,** not just
+  `PathError`. The brief's "Every error goes through `_guard` ... so denials
+  stay logged" line, and test 19, read as applying to every denial from the
+  new tools — wrong `seq`, an unknown `upload_id`, a `commit_write` hash
+  mismatch, the concurrency cap — not only path-containment ones. Those are
+  raised as plain `ValueError`, which the original `_guard` (translating only
+  `PathError`) would not have logged. Extending it is a strict superset of
+  the old behavior: every existing tool's validation errors (e.g.
+  `write_file`'s pre-existing base64-cap refusal) now also log, which no
+  test depended on the absence of.
+- **Base64 chunk sealing, not in the brief.** The brief's boundary rule
+  ("split only on a 4-character boundary") is necessary but not quite
+  sufficient: a *non-final* chunk that happens to carry `=` padding is still
+  valid standalone base64 (it just decodes to fewer bytes than intended), so
+  without an extra check, a chunk after it would silently append past what
+  the padding marked as the end of the stream — the same class of silent
+  corruption this whole document exists to close, just moved to a chunk
+  boundary instead of a base64 boundary. Fix: the first chunk containing `=`
+  seals the session (`_UploadSession.sealed`); any `write_chunk` after that
+  is refused, naming `commit_write`/`abort_write`. In practice this never
+  fires for a well-behaved caller slicing consistently at 4-character
+  boundaries, because the total base64 length of N bytes is always a
+  multiple of 4 (standard padding), so if every prior chunk is also a
+  multiple of 4, the final chunk's length is forced to be one too — the
+  seal only ever catches an actual mistake.
+- **The concurrency cap (`MCP_MAX_CONCURRENT_UPLOADS`) is global**, not
+  per-token — there are only two tokens in play and the session dict is
+  already single-process, so a global cap was the simpler reading of "an
+  in-process dict... single process only" rather than an unstated per-token
+  partition.
+- **Cumulative `MAX_UPLOAD_BYTES` enforcement doesn't mutate session state on
+  refusal.** A `write_chunk` call that would push the running total over the
+  cap is refused before anything is written and before `next_seq`/
+  `bytes_received` advance, so the same `seq` can be retried with a smaller
+  chunk, or the caller can `abort_write`, without the session being left in
+  a half-advanced state.
+- **Defaults landed exactly as proposed** in "Open question 1"
+  (`MCP_BASE64_LIMIT_BYTES=8192`, `MCP_UPLOAD_CHUNK_ADVISORY_BYTES=3072`) —
+  unvalidated against further live traffic beyond the one incident, same
+  caveat as the open question states.

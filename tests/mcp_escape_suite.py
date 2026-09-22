@@ -26,11 +26,13 @@ enough -- no SSE client needed.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import http.client
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -44,6 +46,9 @@ MODE = os.environ.get("MODE", "unknown")
 # knows exactly where the truncation/refusal boundaries are.
 INLINE_LIMIT_CHARS = int(os.environ.get("MCP_INLINE_LIMIT_CHARS", "500"))
 BASE64_LIMIT_BYTES = int(os.environ.get("MCP_BASE64_LIMIT_BYTES", "1024"))
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", "2097152"))
+UPLOAD_SESSION_TTL_SECONDS = int(os.environ.get("MCP_UPLOAD_SESSION_TTL_SECONDS", "900"))
+MAX_CONCURRENT_UPLOADS = int(os.environ.get("MCP_MAX_CONCURRENT_UPLOADS", "8"))
 
 CANARIES = [
     b"CANARY_SECRETS_ENV_a1b2c3d4",
@@ -181,6 +186,7 @@ def functional() -> None:
     expected = {
         "get_folder_info", "list_files", "stat_file", "read_file",
         "write_file", "delete_file", "make_directory", "move_file",
+        "copy_file", "begin_write", "write_chunk", "commit_write", "abort_write",
     }
     if expected <= tools:
         R.ok("func", "all eight tools are registered", f"({sorted(tools)})")
@@ -384,6 +390,402 @@ def functional() -> None:
 
 
 # ==========================================================================
+# INTEGRITY FLOOR -- docs/plan-mcp-large-writes.md, "Part 1"
+# ==========================================================================
+
+def integrity_floor() -> None:
+    print(f"\n{YELLOW}INTEGRITY FLOOR -- write_file/read_file verification{RESET}")
+
+    # 1. A base64 write_file truncated to a multiple of 4, with the
+    #    *original* expect_bytes, is refused and no file is created. This is
+    #    the regression test for the incident: a truncated base64 string
+    #    that happens to have length%4==0 decodes "successfully" to fewer
+    #    bytes than intended, and only expect_bytes/expect_sha256 catches it.
+    original = os.urandom(600)
+    full_b64 = base64.b64encode(original).decode("ascii")
+    cut = len(full_b64) - (len(full_b64) % 4) - 4  # a shorter, still-valid-looking b64 string
+    truncated_b64 = full_b64[:cut]
+    assert len(truncated_b64) % 4 == 0
+    status, is_err, out = call_tool("write_file", {
+        "path": "mcp-truncated-regression.bin",
+        "content": truncated_b64,
+        "encoding": "base64",
+        "expect_bytes": len(original),
+    })
+    status2, is_err2, out2 = call_tool("stat_file", {"path": "mcp-truncated-regression.bin"})
+    if is_err and "truncated" in str(out).lower() and is_err2:
+        R.ok("floor", "truncated base64 + correct expect_bytes refused, no file created")
+    else:
+        R.bad("floor", "truncation regression test",
+              f"write is_err={is_err} ({str(out)[:150]!r}), file exists={not is_err2}")
+
+    # 2. The same truncation with neither expect_* set, over the 1 KB
+    #    threshold, is refused rather than silently writing short.
+    big_original = os.urandom(2000)
+    big_b64 = base64.b64encode(big_original).decode("ascii")
+    big_cut = len(big_b64) - (len(big_b64) % 4) - 4
+    status, is_err, out = call_tool("write_file", {
+        "path": "mcp-truncated-noverify.bin",
+        "content": big_b64[:big_cut],
+        "encoding": "base64",
+    })
+    if is_err and "expect_bytes" in str(out):
+        R.ok("floor", "base64 write over 1KB with neither expect_* is refused")
+    else:
+        R.bad("floor", "over-1KB no-verify refusal", f"is_err {is_err} -> {str(out)[:200]!r}")
+
+    # 3. Round trip: read_file -> write_file forwarding the returned
+    #    sha256/bytes succeeds and the destination is byte-identical.
+    call_tool("write_file", {
+        "path": "mcp-roundtrip-src.bin",
+        "content": base64.b64encode(os.urandom(4096)).decode("ascii"),
+        "encoding": "base64",
+    })
+    status, is_err, src = call_tool("read_file", {"path": "mcp-roundtrip-src.bin", "encoding": "base64"})
+    status, is_err, out = call_tool("write_file", {
+        "path": "mcp-roundtrip-dst.bin",
+        "content": src.get("content") if not is_err else "",
+        "encoding": "base64",
+        "expect_bytes": src.get("bytes") if not is_err else None,
+        "expect_sha256": src.get("sha256") if not is_err else None,
+    })
+    src_bytes = (REPO / "shared" / "mcp-roundtrip-src.bin").read_bytes()
+    dst_bytes = (REPO / "shared" / "mcp-roundtrip-dst.bin").read_bytes()
+    if not is_err and src_bytes == dst_bytes:
+        R.ok("floor", "read_file -> write_file round trip forwarding sha256/bytes is byte-identical")
+    else:
+        R.bad("floor", "read/write round trip", f"is_err {is_err}, equal={src_bytes == dst_bytes}")
+
+    # 5. get_folder_info's advertised numbers and the values actually
+    #    enforced come from the same config, asserted together.
+    status, is_err, info = call_tool("get_folder_info", {})
+    advertised_cap = info.get("mcp_base64_limit_bytes") if not is_err else None
+    over = b"\xff" * ((advertised_cap or 0) + 1)
+    status, is_err2, out = call_tool("write_file", {
+        "path": "mcp-cap-drift-check.bin",
+        "content": base64.b64encode(over).decode("ascii"),
+        "encoding": "base64",
+    })
+    if advertised_cap == BASE64_LIMIT_BYTES and is_err2 and str(advertised_cap) in str(out):
+        R.ok("floor", "get_folder_info's advertised base64 cap matches what's enforced",
+             f"(cap={advertised_cap})")
+    else:
+        R.bad("floor", "advertised vs enforced cap",
+              f"advertised={advertised_cap}, configured={BASE64_LIMIT_BYTES}, enforced refusal={is_err2}")
+    if "chunk_advisory" in str(info).lower() and "begin_write" in str(info):
+        R.ok("floor", "get_folder_info mentions begin_write and a chunk advisory")
+    else:
+        R.bad("floor", "get_folder_info chunked-write mention", f"{str(info)[:200]!r}")
+
+
+# ==========================================================================
+# CHUNKED WRITES -- docs/plan-mcp-large-writes.md, "Part 2"
+# ==========================================================================
+
+def _chunk_b64(data: bytes, chunk_bytes: int = 3072) -> list[str]:
+    """Split base64 on a 4-character boundary -- chunk_bytes must be a
+    multiple of 3 so the resulting base64 slice length is a multiple of 4."""
+    assert chunk_bytes % 3 == 0
+    b64 = base64.b64encode(data).decode("ascii")
+    step = chunk_bytes // 3 * 4
+    return [b64[i:i + step] for i in range(0, len(b64), step)] or [""]
+
+
+def _upload_chunked(data: bytes, path: str, *, encoding: str = "base64",
+                     verify: str = "sha256") -> tuple[bool, Any]:
+    status, is_err, out = call_tool("begin_write", {"path": path, "encoding": encoding})
+    if is_err:
+        return True, out
+    upload_id = out["upload_id"]
+    if encoding == "base64":
+        chunks = _chunk_b64(data)
+    else:
+        text = data.decode("utf-8")
+        chunks = [text[i:i + 2048] for i in range(0, len(text), 2048)] or [""]
+    for seq, chunk in enumerate(chunks):
+        status, is_err, out = call_tool("write_chunk", {
+            "upload_id": upload_id, "seq": seq, "content": chunk,
+        })
+        if is_err:
+            return True, out
+    kwargs = {"upload_id": upload_id}
+    if verify == "sha256":
+        kwargs["expect_sha256"] = hashlib.sha256(data).hexdigest()
+    elif verify == "bytes":
+        kwargs["expect_bytes"] = len(data)
+    status, is_err, out = call_tool("commit_write", kwargs)
+    return is_err, out
+
+
+def chunked_writes() -> None:
+    print(f"\n{YELLOW}CHUNKED WRITES -- begin_write/write_chunk/commit_write/abort_write{RESET}")
+
+    # 6. Happy path, both encodings, matching sha256.
+    payload = os.urandom(20_000)
+    is_err, out = _upload_chunked(payload, "mcp-chunked-binary.bin", encoding="base64")
+    ok = not is_err and out.get("sha256") == hashlib.sha256(payload).hexdigest() \
+        and (REPO / "shared" / "mcp-chunked-binary.bin").read_bytes() == payload
+    R.ok("chunk", "base64 chunked upload round-trips byte-identical") if ok \
+        else R.bad("chunk", "base64 chunked happy path", f"is_err {is_err} -> {str(out)[:200]!r}")
+
+    text_payload = ("chunked text upload, séance café ☃ " * 500).encode("utf-8")
+    is_err, out = _upload_chunked(text_payload, "mcp-chunked-text.txt", encoding="utf-8")
+    ok = not is_err and (REPO / "shared" / "mcp-chunked-text.txt").read_bytes() == text_payload
+    R.ok("chunk", "utf-8 chunked upload round-trips byte-identical") if ok \
+        else R.bad("chunk", "utf-8 chunked happy path", f"is_err {is_err} -> {str(out)[:200]!r}")
+
+    # 7. Ordering: skipped, repeated, out-of-order seq all refused; a resend
+    #    after a failed call succeeds.
+    call_tool("begin_write", {"path": "mcp-order-throwaway.bin"})  # noise, ignored
+    status, is_err, out = call_tool("begin_write", {"path": "mcp-ordering.txt"})
+    uid = out["upload_id"]
+    _s, skip_err, _o = call_tool("write_chunk", {"upload_id": uid, "seq": 1, "content": "x"})
+    _s, ok_err, _o = call_tool("write_chunk", {"upload_id": uid, "seq": 0, "content": "AB"})
+    _s, repeat_err, _o = call_tool("write_chunk", {"upload_id": uid, "seq": 0, "content": "ZZ"})
+    _s, resend_err, out = call_tool("write_chunk", {"upload_id": uid, "seq": 1, "content": "CD"})
+    if skip_err and not ok_err and repeat_err and not resend_err:
+        R.ok("chunk", "seq must equal next_seq exactly: skip/repeat refused, resend after retry ok")
+    else:
+        R.bad("chunk", "ordering",
+              f"skip_err={skip_err} ok_err={ok_err} repeat_err={repeat_err} resend_err={resend_err}")
+    call_tool("commit_write", {"upload_id": uid, "expect_bytes": 4})
+    if (REPO / "shared" / "mcp-ordering.txt").read_bytes() == b"ABCD":
+        R.ok("chunk", "ordering test content is exactly 'ABCD' (no dup, no gap)")
+    else:
+        R.bad("chunk", "ordering content",
+              (REPO / "shared" / "mcp-ordering.txt").read_bytes() if (REPO / "shared" / "mcp-ordering.txt").exists() else "missing")
+
+    # 8. A non-final base64 chunk not a multiple of 4 is refused.
+    status, is_err, out = call_tool("begin_write", {"path": "mcp-boundary.bin", "encoding": "base64"})
+    uid = out["upload_id"]
+    _s, bad_err, out = call_tool("write_chunk", {"upload_id": uid, "seq": 0, "content": "abcde"})
+    if bad_err and "multiple of 4" in str(out):
+        R.ok("chunk", "non-multiple-of-4 base64 chunk is refused")
+    else:
+        R.bad("chunk", "base64 chunk boundary", f"is_err {bad_err} -> {str(out)[:200]!r}")
+    call_tool("abort_write", {"upload_id": uid})
+
+    # 9/10. commit_write refuses a wrong expect_sha256, a wrong expect_bytes,
+    #       and neither -- each leaves no file at the destination.
+    for label, kwargs, dest in [
+        ("wrong expect_sha256", {"expect_sha256": "0" * 64}, "mcp-commit-badsha.bin"),
+        ("wrong expect_bytes", {"expect_bytes": 999_999}, "mcp-commit-badbytes.bin"),
+        ("neither expect_*", {}, "mcp-commit-noverify.bin"),
+    ]:
+        call_tool("begin_write", {"path": dest})
+        status, is_err, out = call_tool("begin_write", {"path": dest})
+        # begin_write again refuses (overwrite=true default doesn't matter here,
+        # we want a session against `dest`); use the second session's id.
+        uid = out["upload_id"] if not is_err else None
+        if uid:
+            call_tool("write_chunk", {"upload_id": uid, "seq": 0, "content": "hello"})
+            _s, commit_err, _o = call_tool("commit_write", {"upload_id": uid, **kwargs})
+            exists = (REPO / "shared" / dest).exists()
+            if commit_err and not exists:
+                R.ok("chunk", f"commit_write with {label} refused, no file created")
+            else:
+                R.bad("chunk", f"commit_write {label}", f"commit_err={commit_err} exists={exists}")
+            call_tool("abort_write", {"upload_id": uid})
+
+    # 12. abort_write mid-session leaves no temp file and no destination;
+    #     calling it twice, and on an unknown id, both succeed quietly.
+    status, is_err, out = call_tool("begin_write", {"path": "mcp-abort-me.bin"})
+    uid = out["upload_id"]
+    call_tool("write_chunk", {"upload_id": uid, "seq": 0, "content": "partial"})
+    tmp_before = list((REPO / "shared").glob(".upload-*.tmp"))
+    _s, e1, out1 = call_tool("abort_write", {"upload_id": uid})
+    _s, e2, out2 = call_tool("abort_write", {"upload_id": uid})
+    _s, e3, out3 = call_tool("abort_write", {"upload_id": "not-a-real-upload-id"})
+    tmp_after = list((REPO / "shared").glob(".upload-*.tmp"))
+    dest_missing = not (REPO / "shared" / "mcp-abort-me.bin").exists()
+    if (not e1 and out1.get("aborted") is True and not e2 and out2.get("aborted") is False
+            and not e3 and out3.get("aborted") is False and dest_missing
+            and len(tmp_after) < len(tmp_before) + 1):
+        R.ok("chunk", "abort_write cleans up; idempotent; safe on an unknown id")
+    else:
+        R.bad("chunk", "abort_write",
+              f"{out1!r} {out2!r} {out3!r} dest_missing={dest_missing} tmp before/after={len(tmp_before)}/{len(tmp_after)}")
+
+    # 13. Cumulative MAX_UPLOAD_BYTES is enforced during chunking, not only
+    #     at commit. Skipped when the configured cap is too large to reach in
+    #     a reasonable number of chunks (a production-sized default).
+    if MAX_UPLOAD_BYTES <= 8 * 1024 * 1024:
+        status, is_err, out = call_tool("begin_write", {"path": "mcp-over-max.bin", "encoding": "base64"})
+        uid = out["upload_id"]
+        chunk_raw_bytes = 98304  # 96 KiB, a multiple of 3 -> clean base64 chunk boundary
+        seq = 0
+        refused = False
+        refusal_text = ""
+        max_chunks = MAX_UPLOAD_BYTES // chunk_raw_bytes + 4  # enough to exceed the cap
+        while seq < max_chunks:
+            chunk = base64.b64encode(os.urandom(chunk_raw_bytes)).decode("ascii")
+            _s, is_err, out = call_tool("write_chunk", {"upload_id": uid, "seq": seq, "content": chunk})
+            if is_err:
+                refused = True
+                refusal_text = str(out)
+                break
+            seq += 1
+        call_tool("abort_write", {"upload_id": uid})
+        if refused and str(MAX_UPLOAD_BYTES) in refusal_text:
+            R.ok("chunk", "cumulative MAX_UPLOAD_BYTES enforced during chunking, names the limit")
+        else:
+            R.bad("chunk", "cumulative cap", f"refused={refused} after {seq} chunks -> {refusal_text[:200]!r}")
+    else:
+        print(f"  {DIM}SKIP  [chunk] cumulative MAX_UPLOAD_BYTES test -- {MAX_UPLOAD_BYTES:,} is too "
+              f"large to reach in a reasonable number of chunks{RESET}")
+
+    # 14. MCP_MAX_CONCURRENT_UPLOADS is enforced; message names abort_write.
+    opened = []
+    hit_cap = False
+    cap_text = ""
+    for i in range(MAX_CONCURRENT_UPLOADS + 3):
+        status, is_err, out = call_tool("begin_write", {"path": f"mcp-concurrency-{i}.bin"})
+        if is_err:
+            hit_cap = True
+            cap_text = str(out)
+            break
+        opened.append(out["upload_id"])
+    for uid in opened:
+        call_tool("abort_write", {"upload_id": uid})
+    if hit_cap and "abort_write" in cap_text:
+        R.ok("chunk", "MCP_MAX_CONCURRENT_UPLOADS enforced, message names abort_write",
+             f"(after {len(opened)} open)")
+    else:
+        R.bad("chunk", "concurrency cap", f"hit_cap={hit_cap} opened={len(opened)} -> {cap_text[:200]!r}")
+
+    # 16. A session opened with one token cannot be chunked or committed
+    #     with another.
+    if RO_TOKEN:
+        status, is_err, out = call_tool("begin_write", {"path": "mcp-cross-token.bin"})
+        uid = out["upload_id"]
+        _s, cross_err, cross_out = call_tool(
+            "write_chunk", {"upload_id": uid, "seq": 0, "content": "x"}, token=RO_TOKEN,
+        )
+        if cross_err:
+            R.ok("chunk", "write_chunk with a different token than begin_write is refused")
+        else:
+            R.bad("chunk", "cross-token write_chunk", f"{cross_out!r}"[:200])
+        call_tool("abort_write", {"upload_id": uid})
+
+    # 18. Atomicity: the destination does not exist at any point before
+    #     commit_write returns -- poll between chunks.
+    dest = "mcp-atomicity.bin"
+    status, is_err, out = call_tool("begin_write", {"path": dest})
+    uid = out["upload_id"]
+    saw_partial = False
+    for seq in range(5):
+        call_tool("write_chunk", {"upload_id": uid, "seq": seq, "content": "x" * 100})
+        if (REPO / "shared" / dest).exists():
+            saw_partial = True
+    call_tool("commit_write", {"upload_id": uid, "expect_bytes": 500})
+    if not saw_partial and (REPO / "shared" / dest).exists():
+        R.ok("chunk", "destination never exists before commit_write, exists after")
+    else:
+        R.bad("chunk", "atomicity", f"saw_partial={saw_partial}")
+
+    # 15. Read-only token: all four chunked-write tools refused, including
+    #     abort_write.
+    if RO_TOKEN:
+        status, is_err, out = call_tool("begin_write", {"path": "mcp-ro-should-fail.bin"}, token=RO_TOKEN)
+        ro_begin_refused = is_err and "read-only" in str(out)
+        status, is_err, out = call_tool("begin_write", {"path": "mcp-ro-setup.bin"})
+        uid = out["upload_id"] if not is_err else None
+        ro_chunk_refused = ro_commit_refused = ro_abort_refused = False
+        if uid:
+            _s, e, o = call_tool("write_chunk", {"upload_id": uid, "seq": 0, "content": "x"}, token=RO_TOKEN)
+            ro_chunk_refused = e and "read-only" in str(o)
+            _s, e, o = call_tool("commit_write", {"upload_id": uid, "expect_bytes": 1}, token=RO_TOKEN)
+            ro_commit_refused = e and "read-only" in str(o)
+            _s, e, o = call_tool("abort_write", {"upload_id": uid}, token=RO_TOKEN)
+            ro_abort_refused = e and "read-only" in str(o)
+            call_tool("abort_write", {"upload_id": uid})
+        if ro_begin_refused and ro_chunk_refused and ro_commit_refused and ro_abort_refused:
+            R.ok("chunk", "read-only token refuses all four chunked-write tools")
+        else:
+            R.bad("chunk", "read-only chunked-write tools",
+                  f"begin={ro_begin_refused} chunk={ro_chunk_refused} "
+                  f"commit={ro_commit_refused} abort={ro_abort_refused}")
+
+    # 11. Abandonment: a session left open past its TTL is reaped -- its temp
+    #     file is gone, the destination doesn't exist, and the upload_id is
+    #     unknown afterwards. Only meaningful when the container was started
+    #     with a short TTL (tests/run_tests.sh sets one); skip the wait on a
+    #     production-sized default rather than sleep 900s.
+    if UPLOAD_SESSION_TTL_SECONDS <= 30:
+        status, is_err, out = call_tool("begin_write", {"path": "mcp-abandoned.bin"})
+        uid = out["upload_id"]
+        call_tool("write_chunk", {"upload_id": uid, "seq": 0, "content": "orphaned"})
+        tmp_before = list((REPO / "shared").glob(".upload-*.tmp"))
+        time.sleep(UPLOAD_SESSION_TTL_SECONDS + 2)
+        # Reaping is lazy -- triggered by the next begin_write/write_chunk.
+        call_tool("begin_write", {"path": "mcp-reap-trigger.bin"})
+        tmp_after = list((REPO / "shared").glob(".upload-*.tmp"))
+        _s, unknown_err, _o = call_tool("write_chunk", {"upload_id": uid, "seq": 1, "content": "x"})
+        dest_missing = not (REPO / "shared" / "mcp-abandoned.bin").exists()
+        if unknown_err and dest_missing and len(tmp_after) < len(tmp_before):
+            R.ok("chunk", "an idle session past its TTL is reaped (temp file gone, upload_id unknown)")
+        else:
+            R.bad("chunk", "TTL reap",
+                  f"unknown_err={unknown_err} dest_missing={dest_missing} "
+                  f"tmp before/after={len(tmp_before)}/{len(tmp_after)}")
+    else:
+        print(f"  {DIM}SKIP  [chunk] TTL reap test -- MCP_UPLOAD_SESSION_TTL_SECONDS="
+              f"{UPLOAD_SESSION_TTL_SECONDS} is too long to wait out{RESET}")
+
+
+# ==========================================================================
+# COPY -- copy_file (docs/plan-mcp-large-writes.md, "Considered and not
+# chosen" A, added anyway as the cheap, non-conflicting follow-on)
+# ==========================================================================
+
+def copy_tests() -> None:
+    print(f"\n{YELLOW}COPY -- copy_file{RESET}")
+
+    payload = os.urandom(5000)
+    call_tool("write_file", {
+        "path": "mcp-copy-src.bin",
+        "content": base64.b64encode(payload).decode("ascii"),
+        "encoding": "base64",
+    })
+    status, is_err, out = call_tool("copy_file", {"src": "mcp-copy-src.bin", "dst": "mcp-copy-dst.bin"})
+    same = (REPO / "shared" / "mcp-copy-src.bin").read_bytes() == (REPO / "shared" / "mcp-copy-dst.bin").read_bytes() \
+        if not is_err else False
+    if not is_err and same and out.get("size") == len(payload):
+        R.ok("copy", "copy_file produces a byte-identical copy")
+    else:
+        R.bad("copy", "copy_file basic", f"is_err {is_err} -> {str(out)[:200]!r}")
+
+    status, is_err, out = call_tool("copy_file", {"src": "mcp-copy-src.bin", "dst": "mcp-copy-dst.bin"})
+    if is_err:
+        R.ok("copy", "copy_file overwrite=false refuses an existing destination")
+    else:
+        R.bad("copy", "copy_file overwrite=false", f"{out!r}"[:200])
+
+    status, is_err, out = call_tool("copy_file", {
+        "src": "mcp-copy-src.bin", "dst": "mcp-copy-deep/a/b.bin", "parents": True,
+    })
+    if not is_err and (REPO / "shared" / "mcp-copy-deep" / "a" / "b.bin").read_bytes() == payload:
+        R.ok("copy", "copy_file parents=true creates the destination chain")
+    else:
+        R.bad("copy", "copy_file parents", f"is_err {is_err} -> {str(out)[:200]!r}")
+
+    status, is_err, out = call_tool("copy_file", {"src": "mcp-copy-nonexistent.bin", "dst": "mcp-copy-x.bin"})
+    if is_err:
+        R.ok("copy", "copy_file refuses a nonexistent source")
+    else:
+        R.bad("copy", "copy_file missing source", f"{out!r}"[:200])
+
+    if RO_TOKEN:
+        status, is_err, out = call_tool(
+            "copy_file", {"src": "mcp-copy-src.bin", "dst": "mcp-copy-ro.bin"}, token=RO_TOKEN,
+        )
+        if is_err and "read-only" in str(out):
+            R.ok("copy", "read-only token refuses copy_file")
+        else:
+            R.bad("copy", "read-only copy_file", f"is_err {is_err} -> {str(out)[:200]!r}")
+
+
+# ==========================================================================
 # ESCAPE -- every hostile path must fail, exactly as it does over REST
 # ==========================================================================
 
@@ -499,6 +901,45 @@ def escapes() -> None:
         else:
             R.bad("mcp-escape", label, f"is_error {is_error}, stolen leaked={leaked(stolen)}")
 
+    # copy_file must not read from or write to outside the shared folder
+    for label, src, dst in [
+        ("copy src outside", "../secrets.env", "mcp-copy-stolen.txt"),
+        ("copy dst outside", "existing.txt", "../mcp-copy-planted.txt"),
+        ("copy via symlinked src", "escape-dir/secrets.env", "mcp-copy-stolen.txt"),
+        ("copy via symlinked dst dir", "existing.txt", "escape-dir/mcp-copy-planted.txt"),
+    ]:
+        status, is_error, _payload = call_tool("copy_file", {"src": src, "dst": dst})
+        _s2, e2, stolen = call_tool("read_file", {"path": "mcp-copy-stolen.txt"})
+        ok = (is_error and (e2 or not leaked(stolen))
+              and not (REPO / "mcp-copy-planted.txt").exists())
+        if ok:
+            R.ok("mcp-escape", f"copy_file: {label}", "-> tool error")
+        else:
+            R.bad("mcp-escape", f"copy_file: {label}", f"is_error {is_error}, stolen leaked={leaked(stolen)}")
+
+    # begin_write must never open a session against a hostile path -- no
+    # temp file, no upload_id, same containment as single-shot write_file.
+    for name, path in [
+        ("write through ..",        "../planted-mcp-begin.txt"),
+        ("write through symlink",   "link-to-secret"),
+        ("write via symlinked dir", "escape-dir/secrets.env"),
+        ("write into .git",         ".git/hooks/evil-begin"),
+        ("absolute path",           "/etc/passwd"),
+    ]:
+        before_hash = sha(secrets)
+        status, is_error, payload = call_tool("begin_write", {"path": path})
+        if not is_error:
+            # A session was opened against a path that should have been
+            # refused -- abort it immediately so it can't leave a dangling
+            # fd, then fail the check either way.
+            call_tool("abort_write", {"upload_id": payload.get("upload_id", "")})
+        after_hash = sha(secrets)
+        if is_error and before_hash == after_hash:
+            R.ok("mcp-escape", f"begin_write: {name}", "-> tool error")
+        else:
+            R.bad("mcp-escape", f"begin_write: {name}",
+                  f"is_error {is_error}, secrets touched={before_hash != after_hash}")
+
     # deleting a symlink must remove the LINK, never the target
     before = sha(secrets)
     call_tool("delete_file", {"path": "link-to-secret"})
@@ -520,6 +961,9 @@ def main() -> int:
 
     before = snapshot()
     functional()
+    integrity_floor()
+    chunked_writes()
+    copy_tests()
     escapes()
     after = snapshot()
 

@@ -561,6 +561,36 @@ class Vault:
                 except OSError as exc:
                     raise _translate_oserror(exc, "the rename") from exc
 
+    def copy(
+        self, src: list[str], dst: list[str], *, overwrite: bool, create_parents: bool = False
+    ) -> int:
+        """Copy a file's bytes within the shared folder. Returns bytes written.
+
+        Composed entirely from ``open_read`` and ``atomic_write`` -- the same
+        containment-audited primitives every other read/write goes through,
+        so this needs no new validation logic of its own. The destination is
+        written the same way a client-driven write is: to a temp file, then
+        renamed into place, so a reader never sees a partial copy.
+        """
+        if not src or not dst:
+            raise Denied("is_root", "Cannot copy the root directory")
+        src_fd, _st = self.open_read(src)
+        try:
+            written = 0
+            with self.atomic_write(
+                dst, overwrite=overwrite, create_parents=create_parents
+            ) as (dst_fd, committer):
+                while True:
+                    chunk = os.read(src_fd, 256 * 1024)
+                    if not chunk:
+                        break
+                    os.write(dst_fd, chunk)
+                    written += len(chunk)
+                committer.commit(dst_fd)
+            return written
+        finally:
+            os.close(src_fd)
+
 
 class Committer:
     """Renames the temp file into place, or cleans it up."""

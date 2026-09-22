@@ -132,6 +132,15 @@ class MoveRequest(BaseModel):
     )
 
 
+class CopyRequest(BaseModel):
+    src: str = Field(description="Source path, relative to the shared folder")
+    dst: str = Field(description="Destination path, relative to the shared folder")
+    overwrite: bool = False
+    parents: bool = Field(
+        default=False, description="Create missing parent directories of dst"
+    )
+
+
 class OkResponse(BaseModel):
     ok: bool = True
     path: str = ""
@@ -467,6 +476,16 @@ def move(req: MoveRequest, _: WriteAuth) -> OkResponse:
     VAULT.move(src, dst, overwrite=req.overwrite, create_parents=req.parents)
     log.info("moved %s -> %s", "/".join(src), "/".join(dst))
     return OkResponse(path="/".join(dst))
+
+
+@app.post("/v1/copy", response_model=OkResponse, tags=["write"],
+          summary="Copy a file within the shared folder")
+def copy(req: CopyRequest, _: WriteAuth) -> OkResponse:
+    src = VAULT.components(req.src)
+    dst = VAULT.components(req.dst)
+    size = VAULT.copy(src, dst, overwrite=req.overwrite, create_parents=req.parents)
+    log.info("copied %s -> %s (%d bytes)", "/".join(src), "/".join(dst), size)
+    return OkResponse(path="/".join(dst), size=size, created=True)
 
 
 # --------------------------------------------------------------------------

@@ -40,7 +40,11 @@ services:
       # way.
       MCP_PUBLIC_HOSTNAME: ""
       MCP_INLINE_LIMIT_CHARS: "100000"    # read_file's inline text budget
-      MCP_BASE64_LIMIT_BYTES: "1048576"   # 1 MiB -- read_file/write_file's base64 cap
+      MCP_BASE64_LIMIT_BYTES: "8192"      # write_file's single-shot base64 cap (advisory); over
+                                           # it, write_file refuses and names begin_write
+      MCP_UPLOAD_SESSION_TTL_SECONDS: "900"   # begin_write session idle timeout
+      MCP_MAX_CONCURRENT_UPLOADS: "8"         # cap on open chunked-upload sessions
+      MCP_UPLOAD_CHUNK_ADVISORY_BYTES: "3072" # suggested write_chunk size (advisory only)
 
     # unRAID's nobody:users. Files the API writes will be owned by this.
     user: "99:100"

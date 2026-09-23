@@ -29,6 +29,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import http.client
+import itertools
 import json
 import os
 import sys
@@ -110,8 +111,16 @@ def mcp_raw(body: bytes, *, path: str = "/mcp", token: str | None = TOKEN,
         conn.close()
 
 
-def mcp_call(method: str, params: dict | None = None, *, id_: int = 1,
+_next_id = itertools.count(1)
+
+
+def mcp_call(method: str, params: dict | None = None, *, id_: int | None = None,
              **kw) -> tuple[int, dict, bytes]:
+    # Every call used to share the literal id=1. If anything in the stack
+    # ever keys a response to a request by id, that's exactly the setup for
+    # a slow response under load to get matched to the wrong call.
+    if id_ is None:
+        id_ = next(_next_id)
     body = json.dumps({
         "jsonrpc": "2.0", "id": id_, "method": method, "params": params or {},
     }).encode()

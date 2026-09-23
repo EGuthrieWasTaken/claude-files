@@ -36,4 +36,12 @@ ln -s /                    shared/rootlink
 ln -s ../../secrets.env    shared/nested/deep-link
 ln    secrets.env          shared/hardlink-to-secret
 
+# Separate copies dedicated to "delete a symlink, spare its target" tests.
+# escape_suite.py (REST) and mcp_escape_suite.py (MCP) both run this check,
+# and tests/run_tests.sh runs them back-to-back against the same fixture --
+# deleting link-to-secret/escape-dir themselves would remove the read/write
+# escape targets the suite that runs second still needs.
+ln -s ../secrets.env       shared/link-to-secret-del
+ln -s ..                   shared/escape-dir-del
+
 echo "fixture ready at $FIXTURE/repo"

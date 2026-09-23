@@ -29,7 +29,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import http.client
-import itertools
 import json
 import os
 import sys
@@ -111,16 +110,8 @@ def mcp_raw(body: bytes, *, path: str = "/mcp", token: str | None = TOKEN,
         conn.close()
 
 
-_next_id = itertools.count(1)
-
-
-def mcp_call(method: str, params: dict | None = None, *, id_: int | None = None,
+def mcp_call(method: str, params: dict | None = None, *, id_: int = 1,
              **kw) -> tuple[int, dict, bytes]:
-    # Every call used to share the literal id=1. If anything in the stack
-    # ever keys a response to a request by id, that's exactly the setup for
-    # a slow response under load to get matched to the wrong call.
-    if id_ is None:
-        id_ = next(_next_id)
     body = json.dumps({
         "jsonrpc": "2.0", "id": id_, "method": method, "params": params or {},
     }).encode()
@@ -956,15 +947,19 @@ def escapes() -> None:
             R.bad("mcp-escape", f"begin_write: {name}",
                   f"is_error {is_error}, secrets touched={before_hash != after_hash}")
 
-    # deleting a symlink must remove the LINK, never the target
+    # deleting a symlink must remove the LINK, never the target. Uses its own
+    # dedicated symlinks (not link-to-secret/escape-dir) so this doesn't
+    # consume the read/write escape targets this suite's own tests above --
+    # and escape_suite.py's, when run_tests.sh runs it against this same
+    # fixture first -- still need.
     before = sha(secrets)
-    call_tool("delete_file", {"path": "link-to-secret"})
+    call_tool("delete_file", {"path": "link-to-secret-del"})
     if secrets.exists() and sha(secrets) == before:
         R.ok("mcp-escape", "delete_file on a symlink spares its target")
     else:
         R.bad("mcp-escape", "delete_file on a symlink", "the target outside the folder was affected")
 
-    call_tool("delete_file", {"path": "escape-dir", "recursive": True})
+    call_tool("delete_file", {"path": "escape-dir-del", "recursive": True})
     still_there = (REPO / "secrets.env").exists() and (REPO / "src" / "app.py").exists()
     if still_there:
         R.ok("mcp-escape", "recursive delete_file through symlink spares the repo")

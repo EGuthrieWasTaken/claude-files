@@ -297,6 +297,15 @@ def require_read(
     return _check_token(authorization, x_api_key)
 
 
+READONLY_MESSAGE = (
+    "This token is read-only: it can list, stat, and read files, but every "
+    "write, delete, move, copy, and upload is refused. Retrying won't help. "
+    "If this task needs to write, ask the user for a read-write token "
+    "(API_TOKEN). get_folder_info (MCP) or GET /v1/info (REST) reports a "
+    "token's scope as token_scope."
+)
+
+
 def require_write(
     authorization: Annotated[str | None, Header()] = None,
     x_api_key: Annotated[str | None, Header()] = None,
@@ -305,7 +314,7 @@ def require_write(
     scope = _check_token(authorization, x_api_key)
     if scope != "rw":
         raise HTTPException(
-            403, detail={"code": "readonly", "message": "This token is read-only"}
+            403, detail={"code": "readonly", "message": READONLY_MESSAGE}
         )
     return scope
 
@@ -369,8 +378,10 @@ def _bridge_script_path() -> str | None:
 
 
 @app.get("/v1/info", tags=["meta"], summary="Server limits and policy")
-def info(_: ReadAuth) -> dict[str, Any]:
+def info(scope: ReadAuth) -> dict[str, Any]:
     return {
+        "token_scope": scope,
+        "writes_allowed": scope == "rw",
         "max_upload_bytes": CONFIG.max_upload_bytes,
         "max_list_entries": CONFIG.max_list_entries,
         "denied_names": sorted(CONFIG.denied_names),

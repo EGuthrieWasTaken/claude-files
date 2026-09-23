@@ -27,6 +27,12 @@ into the conversation: reports, generated data, build artifacts, logs.
 (or `X-API-Key: $CLAUDE_FILES_TOKEN` — the header the MCP connector dialog uses;
 `Authorization` is the documented primary and wins if both are sent).
 
+**Check whether your token can write before you try.** Call the
+connector's `get_folder_info` (or `GET /v1/info`): `writes_allowed: false`
+means a read-only token. Reads still work, but every write is refused with a
+`readonly` error, and retrying won't change that. Tell the user the task needs
+a read-write token.
+
 The token is a credential. Never write it into a file you upload, never put
 it in a URL or query string, and never echo it into output that gets saved.
 
@@ -103,7 +109,7 @@ different approach.
 | `POST` | `/v1/uploads` | Create a one-time upload ticket for an existing local file |
 | `PUT`/`POST` | `/v1/uploads/{id}/{secret}` | Upload the bytes for a ticket. **No bearer token.** |
 | `GET` | `/v1/uploads/{id}` | Ticket status and progress |
-| `GET` | `/v1/info` | Current limits and policy |
+| `GET` | `/v1/info` | Current limits and policy, plus this token's `token_scope` (`rw`/`ro`) and `writes_allowed` |
 | `GET` | `/v1/bridge.py` | Download the local upload/download bridge — see "Uploading a file you generated" |
 
 Full spec: `GET /openapi.json`.

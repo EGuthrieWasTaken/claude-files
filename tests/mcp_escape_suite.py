@@ -195,7 +195,8 @@ def functional() -> None:
         R.bad("func", "tool registration", f"got {sorted(tools)}, missing {expected - tools}")
 
     status, is_err, info = call_tool("get_folder_info", {})
-    if status == 200 and not is_err and info.get("token_scope") == "rw":
+    if status == 200 and not is_err and info.get("token_scope") == "rw" \
+            and info.get("writes_allowed") is True:
         R.ok("func", "get_folder_info reports rw scope for the full token")
     else:
         R.bad("func", "get_folder_info", f"status {status} is_err {is_err} -> {info!r}"[:200])
@@ -284,6 +285,19 @@ def functional() -> None:
                 R.bad("func", f"read-only token refuses {tool}", f"is_err {is_err} -> {payload!r}"[:200])
         if all_refused:
             R.ok("func", "read-only token refuses every write tool, same message as REST")
+
+        _s, _e, payload = call_tool("write_file", {"path": "ro-should-fail.txt", "content": "x"},
+                                    token=RO_TOKEN)
+        if "read-write token" in str(payload) and "get_folder_info" in str(payload):
+            R.ok("func", "read-only refusal tells the agent what to do next")
+        else:
+            R.bad("func", "read-only refusal message", f"{payload!r}"[:200])
+
+        _s, is_err, info = call_tool("get_folder_info", {}, token=RO_TOKEN)
+        if not is_err and info.get("token_scope") == "ro" and info.get("writes_allowed") is False:
+            R.ok("func", "get_folder_info reports ro scope and writes_allowed=false")
+        else:
+            R.bad("func", "get_folder_info ro scope", f"{info!r}"[:200])
 
         status, is_err, out = call_tool("list_files", {}, token=RO_TOKEN)
         if not is_err:

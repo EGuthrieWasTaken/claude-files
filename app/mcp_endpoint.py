@@ -250,11 +250,13 @@ def _guard(op: str, fn, *args, **kwargs):  # type: ignore[no-untyped-def]
 
 
 def _require_write(ctx: Context) -> None:
+    from . import main as appmain
+
     request = ctx.request_context.request
     if request is None or getattr(request.state, "token_scope", None) != "rw":
         # Same text as require_write's HTTPException (app/main.py) -- one
         # string to grep for, not two.
-        raise ValueError("This token is read-only")
+        raise ValueError(appmain.READONLY_MESSAGE)
 
 
 def _read_all(fd: int, chunk: int = 256 * 1024) -> bytes:
@@ -352,10 +354,11 @@ def _reap_expired_sessions() -> None:
 
 @mcp.tool()
 def get_folder_info(ctx: Context) -> dict[str, Any]:
-    """Server limits, policy, and this token's scope (rw/ro). Call this
-    first -- it also reports the inline size budgets read_file and
-    write_file operate under, and the chunk size begin_write/write_chunk
-    advise."""
+    """Server limits, policy, and this token's scope. Call this first:
+    `writes_allowed` is false for a read-only token, in which case every
+    write tool will be refused, so don't attempt one. It also reports the
+    inline size budgets read_file and write_file operate under, and the
+    chunk size begin_write/write_chunk advise."""
     from . import main as appmain
 
     request = ctx.request_context.request
@@ -367,6 +370,13 @@ def get_folder_info(ctx: Context) -> dict[str, Any]:
         "allow_delete": appmain.CONFIG.allow_delete,
         "allow_hardlinked_files": appmain.CONFIG.allow_hardlinked_files,
         "token_scope": scope,
+        "writes_allowed": scope == "rw",
+        "token_scope_note": (
+            "rw: every tool works. ro: list_files, stat_file, read_file, "
+            "get_folder_info and upload_status work; every write tool is refused "
+            "with a 'read-only' error. With an ro token, don't attempt writes -- "
+            "tell the user this task needs a read-write token."
+        ),
         "mcp_inline_limit_chars": appmain.CONFIG.mcp_inline_limit_chars,
         "mcp_base64_limit_bytes": appmain.CONFIG.mcp_base64_limit_bytes,
         "mcp_base64_limit_note": (

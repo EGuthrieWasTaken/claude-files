@@ -240,6 +240,23 @@ def functional() -> None:
         else:
             R.bad("func", "read-only token", f"got {st}/{st2}/{st3}, wanted 200/403/403")
 
+        _st, _, raw = request("PUT", "/v1/content/ro.txt", body=b"x", token=RO_TOKEN)
+        msg = json.loads(raw).get("message", "")
+        if "read-only" in msg and "read-write token" in msg:
+            R.ok("func", "read-only refusal tells the caller what to do next")
+        else:
+            R.bad("func", "read-only refusal message", f"{msg!r}"[:200])
+
+        infos = {}
+        for label, tok in (("rw", TOKEN), ("ro", RO_TOKEN)):
+            st, _, raw = request("GET", "/v1/info", token=tok)
+            infos[label] = json.loads(raw) if st == 200 else {}
+        if infos["rw"].get("token_scope") == "rw" and infos["rw"].get("writes_allowed") is True \
+                and infos["ro"].get("token_scope") == "ro" and infos["ro"].get("writes_allowed") is False:
+            R.ok("func", "/v1/info reports token_scope and writes_allowed per token")
+        else:
+            R.bad("func", "/v1/info token scope", f"{infos!r}"[:200])
+
     # --- X-API-Key: the header the MCP connector dialog sends -------------
     # (docs/plan-mcp-connector.md, test 9)
     st, _, _ = request("GET", "/v1/list", token=None, api_key=TOKEN)

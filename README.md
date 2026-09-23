@@ -547,7 +547,15 @@ being refused at startup.
 > not the host**: `GET /health` reports `"version":"1.1.0"`, and `GET
 > /v1/info` reports `bridge_available:true`. If a claude.ai connector still
 > shows the old tool list, its tool cache needs refreshing — remove and
-> re-add the connector.
+> re-add the connector. `unraid/deploy.sh verify` runs exactly these checks
+> for you.
+
+`unraid/deploy.sh` scripts the redeploy-and-verify half of this section —
+`build` (the buildx command below), `pull` + recreate (via `docker compose`
+if that's how the container is managed, otherwise it tells you to hit
+unRAID's own "Force Update" instead of guessing at a template it can't see),
+and `verify` (the client-side checks above). Run it with no argument for
+`deploy` then `verify`, or `unraid/deploy.sh --help` for the full list.
 
 > **Pulling this image starts serving the [MCP connector](#mcp-connector)**
 > at `/mcp` by default (unRAID templates track `:latest`, so this happens

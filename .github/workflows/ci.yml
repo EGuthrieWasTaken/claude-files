@@ -29,7 +29,7 @@ jobs:
 
       - name: Shell syntax check
         run: |
-          for f in tests/*.sh autocommit/*.sh; do
+          for f in tests/*.sh autocommit/*.sh unraid/*.sh; do
             echo "checking $f"
             bash -n "$f"
           done

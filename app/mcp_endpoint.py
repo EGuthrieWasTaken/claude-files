@@ -373,6 +373,20 @@ def get_folder_info(ctx: Context) -> dict[str, Any]:
             "over mcp_base64_limit_bytes decoded."
         ),
         "mcp_upload_chunk_advisory_bytes": appmain.CONFIG.mcp_upload_chunk_advisory_bytes,
+        "bridge": {
+            "available": appmain._bridge_script_path() is not None,
+            "download_url": "/v1/bridge.py",
+            "note": (
+                "If you can run shell commands or launch a local MCP server, do NOT "
+                "base64 a binary file through write_file or write_chunk -- your own "
+                "output ceiling is the binding limit and it is well under 10 KB. "
+                "Fetch /v1/bridge.py with your read token and run "
+                "`python3 claude_files_bridge.py upload <local> <remote>`; it streams "
+                "the bytes straight from disk and verifies the sha256. "
+                "begin_write/write_chunk remain the answer only where no shell and no "
+                "local process are available."
+            ),
+        },
     }
 
 
@@ -547,7 +561,11 @@ def write_file(
             if len(data) > cap:
                 raise ValueError(
                     f"Decoded content is {len(data):,} bytes, over the {cap:,}-byte "
-                    f"single-shot base64 limit for this connector. Use "
+                    f"single-shot base64 limit for this connector. If you can run "
+                    f"shell commands or a local MCP server, fetch /v1/bridge.py with "
+                    f"your read token and run `python3 claude_files_bridge.py upload "
+                    f"<local> {path}` instead -- it streams the bytes straight from "
+                    f"disk, with no output ceiling. Otherwise use "
                     f"begin_write/write_chunk/commit_write for a file this size, or "
                     f"PUT /v1/content/{{path}} over REST."
                 )

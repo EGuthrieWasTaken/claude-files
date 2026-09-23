@@ -44,9 +44,14 @@ ENV PATH="/venv/bin:$PATH" \
 COPY --from=build /venv /venv
 WORKDIR /srv
 COPY app/ /srv/app/
+# The bridge (docs/feature-request-path-based-upload.md) is client-side code
+# that never runs in this image -- it's packaged here purely so GET
+# /v1/bridge.py can hand it out in one request. No bridge/requirements.txt
+# install here: this image never executes bridge/claude_files_bridge.py.
+COPY bridge/ /srv/bridge/
 
 # Compile at build time so a read-only rootfs never needs to write bytecode.
-RUN python -m compileall -q /srv/app
+RUN python -m compileall -q /srv/app /srv/bridge
 
 # The mount point exists but is empty in the image; the real folder is
 # bind-mounted over it at runtime.

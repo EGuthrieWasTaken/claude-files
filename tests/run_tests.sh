@@ -129,6 +129,12 @@ run_mode() {
     python3 tests/mcp_escape_suite.py || FAIL=1
 
   echo
+  echo "--- bridge: local upload/download client (docs/feature-request-path-based-upload.md) ---"
+  BASE_URL="127.0.0.1:$port" API_TOKEN="$TOKEN" API_TOKEN_READONLY="$RO_TOKEN" \
+  FIXTURE_REPO="$FIXTURE/repo" MODE="$mode" MAX_UPLOAD_BYTES=2097152 \
+    python3 tests/bridge_tests.py || FAIL=1
+
+  echo
   echo "--- server log: denials recorded ---"
   docker logs "$name" 2>&1 | grep -c "denied" | sed 's/^/  denied requests logged: /' || true
   # Regression test for docs/plan-mcp-connector.md's "security regression":

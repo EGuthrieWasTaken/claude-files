@@ -1,0 +1,9 @@
+# Only needed for `python3 claude_files_bridge.py serve` -- `upload`,
+# `download`, and `check` (and the `upload`/`download`/`check` CLI
+# subcommands) run on a bare python3 with nothing installed.
+#
+# Same pin as app/requirements-mcp.txt, for the same reason: 1.12.4 is the
+# newest mcp verified to work here. The bridge is a client-side MCP server,
+# so it shares no dependency graph with the app -- this pin just keeps one
+# SDK version in the project's head instead of two.
+mcp==1.12.4

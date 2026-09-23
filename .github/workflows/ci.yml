@@ -24,12 +24,12 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Byte-compile app and test modules
-        run: python -m py_compile app/*.py tests/*.py
+      - name: Byte-compile app, bridge, and test modules
+        run: python -m py_compile app/*.py bridge/*.py tests/*.py
 
       - name: Shell syntax check
         run: |
-          for f in tests/*.sh autocommit/*.sh; do
+          for f in tests/*.sh autocommit/*.sh unraid/*.sh; do
             echo "checking $f"
             bash -n "$f"
           done
@@ -49,6 +49,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      # For tests/bridge_tests.py's optional test 17 (a real stdio
+      # initialize + tools/list handshake against `serve` mode) -- every
+      # other bridge test imports the module directly and needs nothing
+      # installed. Installed on the runner, not in the image: the bridge is
+      # client-side code and never runs inside the container under test.
+      - name: Install bridge/requirements.txt (for the optional stdio test)
+        run: pip install -r bridge/requirements.txt
 
       - name: Run tests/run_tests.sh
         run: bash tests/run_tests.sh

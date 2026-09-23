@@ -556,6 +556,16 @@ report" beats "clean up" when the recovery path is unclear.
    or losing the `upload_id` mid-sequence is a question only live use answers.
    If it proves flaky, the fix is a better `note` in `begin_write`'s result, not
    a bigger chunk size.
+
+   Answered by a real incident, not favorably: a real connector did *not*
+   drive the chunked loop. It never saw these tools at all — the deployment
+   it was talking to was still `1.0.0`, predating this whole document
+   (`docs/feature-request-path-based-upload.md`, "Part 0") — and the agent
+   independently reached for a path-based upload primitive instead of
+   attempting the loop. The follow-on is `bridge/claude_files_bridge.py`:
+   chunking remains correct and is now deployed, but it's the fallback for a
+   surface with no shell and no local process, not the first thing a capable
+   agent reaches for.
 3. **Add `copy_file` as a follow-on?** It is ~30 lines and would have made the
    incident a non-event. Revisit once Option B is in and there is evidence about
    which case is actually common.

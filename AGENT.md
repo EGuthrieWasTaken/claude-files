@@ -53,8 +53,29 @@ different approach.
 | `POST` | `/v1/move` | Body: `{"src":"a.txt","dst":"b.txt","overwrite":false,"parents":false}` |
 | `POST` | `/v1/copy` | Body: `{"src":"a.txt","dst":"b.txt","overwrite":false,"parents":false}` — server-side copy, no size ceiling |
 | `GET` | `/v1/info` | Current limits and policy |
+| `GET` | `/v1/bridge.py` | Download the local upload/download bridge — see "Uploading a file you generated" |
 
 Full spec: `GET /openapi.json`.
+
+## Uploading a file you generated
+
+If you generated a file yourself (a PDF, an image, a build artifact) and can
+run shell commands or launch a local MCP server, **do not base64 it through
+`write_file` or a connector's `write_chunk`** — your own per-call output
+ceiling is the binding limit here, not anything this server enforces, and it
+is well under 10 KB. Instead:
+
+```bash
+curl -sf -H "Authorization: Bearer $CLAUDE_FILES_TOKEN" \
+  -o claude_files_bridge.py "$API/v1/bridge.py"
+python3 claude_files_bridge.py upload ./report.pdf reports/report.pdf
+```
+
+That streams the bytes straight from your own disk and verifies a sha256
+server-side — never through your context. Full reference: `bridge/README.md`.
+This only applies if you have a shell or can launch a local process; if you
+don't (a browser-only surface talking to the remote connector), the
+connector's `begin_write`/`write_chunk`/`commit_write` tools remain the way.
 
 ## Writing into a folder that doesn't exist yet
 
@@ -117,6 +138,7 @@ Every error is JSON: `{"code":"...","message":"..."}`.
 | `404` | File doesn't exist |
 | `409` | `no_parent` (retry with `?parents=true`), `POST` onto an existing file, or deleting a non-empty dir without `?recursive=true` |
 | `413` | Body exceeds the upload limit |
+| `422` | `integrity_mismatch` — you sent `X-Expect-Bytes`/`X-Expect-Sha256` and what arrived didn't match. Nothing was written; retry with the real content |
 | `429` | Rate limited — back off and retry |
 | `507` | Out of disk space or quota |
 

@@ -389,15 +389,18 @@ def escapes() -> None:
         else:
             R.bad("escape", label, f"status {st}, stolen={leaked(body2)}")
 
-    # deleting a symlink must remove the LINK, never the target
+    # deleting a symlink must remove the LINK, never the target. Uses its own
+    # dedicated symlinks (not link-to-secret/escape-dir) so this doesn't
+    # consume the read/write escape targets mcp_escape_suite.py runs against
+    # the same fixture right after this suite.
     before = sha(secrets)
-    st, _, _ = request("DELETE", "/v1/content/link-to-secret")
+    st, _, _ = request("DELETE", "/v1/content/link-to-secret-del")
     if secrets.exists() and sha(secrets) == before:
         R.ok("escape", "DELETE symlink spares its target", f"-> {st}")
     else:
         R.bad("escape", "DELETE symlink", "the target outside the folder was affected")
 
-    st, _, _ = request("DELETE", "/v1/content/escape-dir?recursive=true")
+    st, _, _ = request("DELETE", "/v1/content/escape-dir-del?recursive=true")
     still_there = (REPO / "secrets.env").exists() and (REPO / "src" / "app.py").exists()
     if still_there:
         R.ok("escape", "recursive DELETE through symlink spares the repo", f"-> {st}")

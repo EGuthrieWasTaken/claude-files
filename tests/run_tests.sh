@@ -33,8 +33,20 @@ TOKEN="test-token-$(openssl rand -hex 16)"
 RO_TOKEN="test-ro-token-$(openssl rand -hex 16)"
 # Deliberately small so tests/mcp_escape_suite.py's budget checks (truncation,
 # binary/base64 refusal) exercise real boundaries instead of never tripping.
+# Must stay comfortably above write_file's own hardcoded 1KB
+# require-verification threshold (app/mcp_endpoint.py) -- 1024 here would
+# make every "over 1KB, no expect_*" test collide with "over the single-shot
+# cap" instead, refused for the wrong reason. Matches the production default
+# (app/config.py) so the test boundary is the real one, not an arbitrary
+# smaller stand-in.
 MCP_INLINE_LIMIT_CHARS=2000
-MCP_BASE64_LIMIT_BYTES=1024
+MCP_BASE64_LIMIT_BYTES=8192
+# Deliberately short/small so tests/mcp_escape_suite.py's chunked-write
+# checks (TTL reap, concurrency cap) exercise real boundaries in seconds
+# instead of never tripping or requiring a 900s sleep.
+MCP_UPLOAD_SESSION_TTL_SECONDS=3
+MCP_MAX_CONCURRENT_UPLOADS=4
+MCP_UPLOAD_CHUNK_ADVISORY_BYTES=3072
 FAIL=0
 
 cleanup() {
@@ -65,6 +77,16 @@ wait_healthy() {
 common_flags=(
   --rm -d
   --read-only
+  # Match the container's uid:gid to whoever owns the fixture on disk
+  # (make_fixture.sh runs as this same user). The image's baked-in default
+  # is a fixed non-root uid (1000:1000, Dockerfile) -- fine on Docker
+  # Desktop's bind mounts, which don't enforce host-side Unix permissions,
+  # but on a native Linux host (GitHub Actions runners included) a bind
+  # mount keeps real host ownership, and 1000:1000 almost never matches the
+  # invoking user, so every write 403s with "Permission denied". Real
+  # deployments hit the same thing and solve it the same way --
+  # docker-compose.yml's `user: "99:100"` for unRAID is this exact override.
+  --user "$(id -u):$(id -g)"
   --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m
   --cap-drop ALL
   --security-opt no-new-privileges:true
@@ -77,6 +99,9 @@ common_flags=(
   -e ENABLE_MCP=true
   -e MCP_INLINE_LIMIT_CHARS="$MCP_INLINE_LIMIT_CHARS"
   -e MCP_BASE64_LIMIT_BYTES="$MCP_BASE64_LIMIT_BYTES"
+  -e MCP_UPLOAD_SESSION_TTL_SECONDS="$MCP_UPLOAD_SESSION_TTL_SECONDS"
+  -e MCP_MAX_CONCURRENT_UPLOADS="$MCP_MAX_CONCURRENT_UPLOADS"
+  -e MCP_UPLOAD_CHUNK_ADVISORY_BYTES="$MCP_UPLOAD_CHUNK_ADVISORY_BYTES"
 )
 
 run_mode() {
@@ -98,6 +123,9 @@ run_mode() {
   BASE_URL="127.0.0.1:$port" API_TOKEN="$TOKEN" API_TOKEN_READONLY="$RO_TOKEN" \
   FIXTURE_REPO="$FIXTURE/repo" MODE="$mode" \
   MCP_INLINE_LIMIT_CHARS="$MCP_INLINE_LIMIT_CHARS" MCP_BASE64_LIMIT_BYTES="$MCP_BASE64_LIMIT_BYTES" \
+  MAX_UPLOAD_BYTES=2097152 \
+  MCP_UPLOAD_SESSION_TTL_SECONDS="$MCP_UPLOAD_SESSION_TTL_SECONDS" \
+  MCP_MAX_CONCURRENT_UPLOADS="$MCP_MAX_CONCURRENT_UPLOADS" \
     python3 tests/mcp_escape_suite.py || FAIL=1
 
   echo
@@ -151,7 +179,7 @@ echo
 echo "==> Startup sweep: stale upload temp files"
 new_fixture
 touch "$FIXTURE/repo/shared/.upload-deadbeef.tmp" "$FIXTURE/repo/shared/nested/.upload-cafe.tmp"
-if docker run --rm -e API_TOKEN=aaaaaaaaaaaaaaaaaaaa -v "$FIXTURE/repo/shared:/data" \
+if docker run --rm --user "$(id -u):$(id -g)" -e API_TOKEN=aaaaaaaaaaaaaaaaaaaa -v "$FIXTURE/repo/shared:/data" \
      --entrypoint python "$IMAGE" -c "
 from app.safepath import Vault
 v = Vault('/data')
@@ -194,9 +222,24 @@ if [[ "$nomcp_status" == "404" && "$rest_status" == "200" ]]; then
 else
   echo "  FAIL  /mcp -> $nomcp_status (wanted 404), REST -> $rest_status (wanted 200)"; FAIL=1
 fi
-docker logs cf-test-nomcp 2>&1 | grep -q "mcp not installed" \
-  && echo "  PASS  log explains why /mcp is absent" \
-  || { echo "  FAIL  log does not explain the missing /mcp mount"; FAIL=1; }
+# The line is logged at import time, well before /health can respond, but
+# docker logs' own delivery to this CLI call can lag a beat behind the
+# container actually being healthy -- retry briefly rather than requiring
+# one immediate grep to win a race that isn't the thing under test.
+nomcp_log_ok=0
+for _ in $(seq 1 10); do
+  if docker logs cf-test-nomcp 2>&1 | grep -q "mcp not installed"; then
+    nomcp_log_ok=1; break
+  fi
+  sleep 0.3
+done
+if [[ "$nomcp_log_ok" == "1" ]]; then
+  echo "  PASS  log explains why /mcp is absent"
+else
+  echo "  FAIL  log does not explain the missing /mcp mount"
+  docker logs cf-test-nomcp 2>&1 | tail -20
+  FAIL=1
+fi
 docker rm -f cf-test-nomcp >/dev/null 2>&1 || true
 
 echo

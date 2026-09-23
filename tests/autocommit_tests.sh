@@ -20,13 +20,25 @@ bad() { FAIL=$((FAIL+1)); printf "  ${R}FAIL${N} %s -- %s\n" "$1" "$2"; }
 cleanup() { [[ "${KEEP_FIXTURE:-0}" == "1" ]] || rm -rf "$FIX"; }
 trap cleanup EXIT
 
+# Match the container's uid:gid to whoever owns $FIX on disk (reset_fixture
+# runs as this same user). The image's baked-in default is a fixed non-root
+# uid (1000:1000, autocommit/Dockerfile) -- fine on Docker Desktop's bind
+# mounts, which don't enforce host-side Unix permissions, but on a native
+# Linux host (GitHub Actions runners included) a bind mount keeps real host
+# ownership, and 1000:1000 almost never matches the invoking user, so every
+# `git add`/`commit`/`checkout` fails with a permission error underneath
+# git's own error text. Real deployments hit the same class of problem and
+# solve it the same way -- docker-compose.yml's `user: "99:100"` for unRAID
+# is this exact override, just for the main API image instead of this one.
+DOCKER_USER=(--user "$(id -u):$(id -g)")
+
 inc() {
-  docker run --rm -v "$FIX:/work" --entrypoint bash "$IMG" -c \
+  docker run --rm "${DOCKER_USER[@]}" -v "$FIX:/work" --entrypoint bash "$IMG" -c \
     "export HOME=/tmp; git config --global --add safe.directory '*' >/dev/null 2>&1; $1" 2>&1
 }
 
 sidecar() { # extra env as args
-  docker run --rm -v "$FIX:/work" \
+  docker run --rm "${DOCKER_USER[@]}" -v "$FIX:/work" \
     -e REPO_PATH=/work/repo -e SUBDIR=shared -e RUN_ONCE=true -e QUIET_PERIOD=0 \
     "$@" "$IMG" 2>&1
 }
@@ -63,6 +75,20 @@ reset_fixture() {
 remote_files() { inc 'git -C /work/remote.git ls-tree -r --name-only HEAD' | tr -d '\r'; }
 remote_log()   { inc 'git -C /work/remote.git log --oneline'; }
 local_log()    { inc 'git -C /work/repo log --oneline'; }
+
+# A query function (local_log, remote_files, ...) run via a fresh docker run
+# immediately after sidecar()'s own container has already exited has, in CI,
+# occasionally not seen that container's just-completed git state on the
+# first read -- not reproduced locally, cause not pinned down. Retry briefly
+# rather than call state "lost" on what may just be a slow-to-settle read.
+retry_grep() {
+  local pattern="$1" fn="$2"
+  for _ in 1 2 3 4 5; do
+    "$fn" | grep -q "$pattern" && return 0
+    sleep 0.3
+  done
+  return 1
+}
 
 # ===========================================================================
 echo -e "\n${Y}autocommit sidecar tests${N}"
@@ -206,10 +232,10 @@ if grep -q "not because the remote moved" <<<"$out" && ! grep -qi "conflict" <<<
 else
   bad "push error classification" "$(grep -E 'ERROR' <<<"$out" | head -2 | tr '\n' ' ')"
 fi
-if local_log | grep -q "agent: sync"; then
+if retry_grep "agent: sync" local_log; then
   ok "the commit is kept locally for the next retry"
 else
-  bad "commit retention" "commit was lost"
+  bad "commit retention" "commit was lost -- local_log=$(tr '\n' '|' <<<"$(local_log)")"
 fi
 
 # --- 8. runaway guard -------------------------------------------------------
@@ -228,7 +254,7 @@ reset_fixture
 allref=0
 for entry in "empty SUBDIR|" "repo root|." "absolute|/etc" "traversal|shared/../.."; do
   label="${entry%%|*}"; value="${entry#*|}"
-  out=$(docker run --rm -v "$FIX:/work" -e REPO_PATH=/work/repo \
+  out=$(docker run --rm "${DOCKER_USER[@]}" -v "$FIX:/work" -e REPO_PATH=/work/repo \
         -e SUBDIR="$value" -e RUN_ONCE=true "$IMG" 2>&1); rc=$?
   if [[ $rc -eq 0 ]]; then bad "validation: $label" "started anyway"; allref=1; fi
 done
@@ -246,11 +272,16 @@ fi
 # --- 10. PUSH=false and DRY_RUN --------------------------------------------
 reset_fixture
 echo "local only" > "$FIX/repo/shared/local.txt"
-sidecar -e PUSH=false >/dev/null
-if local_log | grep -q "agent: sync" && ! remote_files | grep -q "local.txt"; then
+push_false_out=$(sidecar -e PUSH=false)
+retry_grep "agent: sync" local_log; committed_ok=$?
+llog="$(local_log)"; rfiles="$(remote_files)"
+if [[ $committed_ok -eq 0 ]] && ! grep -q "local.txt" <<<"$rfiles"; then
   ok "PUSH=false commits locally without pushing"
 else
-  bad "PUSH=false" "pushed anyway"
+  # Diagnostic dump -- this check has failed intermittently in CI without an
+  # obvious cause from the pass/fail result alone; capture everything needed
+  # to root-cause it on the next occurrence instead of guessing blind again.
+  bad "PUSH=false" "local_log=$(tr '\n' '|' <<<"$llog") remote_files=$(tr '\n' '|' <<<"$rfiles") sidecar_out=$(tr '\n' '|' <<<"$push_false_out")"
 fi
 
 reset_fixture

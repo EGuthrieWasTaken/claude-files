@@ -46,7 +46,15 @@ class Config:
     enable_mcp: bool = True
     mcp_public_hostname: str = ""
     mcp_inline_limit_chars: int = 100_000
-    mcp_base64_limit_bytes: int = 1024 * 1024
+    # 8 KiB, not 1 MiB: this is a single-shot-call ceiling, bounded by what a
+    # model can actually emit in one tool call (observed ~5 KB of decoded
+    # bytes for a truncating surface -- docs/plan-mcp-large-writes.md, "The
+    # advertised budgets are wrong by roughly 200x"), not a context-cost
+    # budget. Above it, write_file refuses and names begin_write.
+    mcp_base64_limit_bytes: int = 8 * 1024
+    mcp_upload_session_ttl_seconds: int = 900
+    mcp_max_concurrent_uploads: int = 8
+    mcp_upload_chunk_advisory_bytes: int = 3072
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -80,5 +88,8 @@ class Config:
             enable_mcp=_env_bool("ENABLE_MCP", True),
             mcp_public_hostname=os.environ.get("MCP_PUBLIC_HOSTNAME", "").strip(),
             mcp_inline_limit_chars=_env_int("MCP_INLINE_LIMIT_CHARS", 100_000),
-            mcp_base64_limit_bytes=_env_int("MCP_BASE64_LIMIT_BYTES", 1024 * 1024),
+            mcp_base64_limit_bytes=_env_int("MCP_BASE64_LIMIT_BYTES", 8 * 1024),
+            mcp_upload_session_ttl_seconds=_env_int("MCP_UPLOAD_SESSION_TTL_SECONDS", 900),
+            mcp_max_concurrent_uploads=_env_int("MCP_MAX_CONCURRENT_UPLOADS", 8),
+            mcp_upload_chunk_advisory_bytes=_env_int("MCP_UPLOAD_CHUNK_ADVISORY_BYTES", 3072),
         )

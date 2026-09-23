@@ -1,12 +1,15 @@
 # claude-files
 
+[![CI](https://github.com/EGuthrieWasTaken/claude-files/actions/workflows/ci.yml/badge.svg)](https://github.com/EGuthrieWasTaken/claude-files/actions/workflows/ci.yml)
+
 A small REST API, in a hardened container, that gives an agent
 upload / download / replace / delete access to **exactly one folder** and
 nothing else. Built to hand Claude cloud processes a write target inside a
 git repository while the rest of the repository stays unreachable.
 
-56 checks pass in each of two container configurations, including every
-escape attempt in `tests/escape_suite.py`. See
+Every escape attempt in `tests/escape_suite.py` and `tests/mcp_escape_suite.py`
+passes in each of two container configurations, on every pull request (see the
+CI badge above, and `.github/workflows/ci.yml`). See
 [Security model](#security-model).
 
 ---
@@ -158,6 +161,7 @@ path is relative to the shared folder root.
 | `DELETE` | `/v1/content/{path}` | Delete a file or dir. `?recursive=true` for non-empty dirs. |
 | `POST` | `/v1/mkdir/{path}` | Create a directory. `?parents=true` by default. |
 | `POST` | `/v1/move` | `{"src":…, "dst":…, "overwrite":false, "parents":false}` |
+| `POST` | `/v1/copy` | `{"src":…, "dst":…, "overwrite":false, "parents":false}` — server-side copy, no size ceiling. |
 | `POST`/`GET`/`DELETE` | `/mcp` | Optional Streamable HTTP MCP connector — see [MCP connector](#mcp-connector). |
 
 Writes are atomic: content goes to a temp file in the destination directory
@@ -204,8 +208,61 @@ design brief: `docs/plan-mcp-connector.md`.
    refuses a file with a NUL byte or that fails to decode, naming the REST
    endpoint instead of returning mojibake. `encoding="base64"` opts in for a
    small binary file, capped far below the text budget
-   (`MCP_BASE64_LIMIT_BYTES`, default 1 MiB) — base64 inflates size by a third
+   (`MCP_BASE64_LIMIT_BYTES`, default **8 KiB** — a single-shot-call ceiling,
+   not a context-cost budget; see below) — base64 inflates size by a third
    and buys nothing since the model can't read it anyway.
+
+### Large and binary writes: the integrity floor, and chunked sessions
+
+An agent's own output is bounded by whatever it can emit in one tool call —
+observed well under 8 KiB of decoded bytes on at least one real surface. A
+`write_file` call that gets cut at that boundary can still be **valid
+base64** (a truncated base64 string decodes cleanly whenever its length is a
+multiple of 4), so a naive truncation guard never fires; the file is written
+short, silently. `docs/plan-mcp-large-writes.md` has the full incident and
+root-cause writeup. Two things fix it:
+
+1. **`write_file` and `read_file` carry integrity metadata.** `write_file`
+   accepts `expect_bytes` and/or `expect_sha256`, checked against the decoded
+   content **before** anything is written — a mismatch leaves nothing on
+   disk, rather than a short file to notice and clean up after. Required (at
+   least one) for a base64 write over 1 KB decoded. `read_file` returns
+   `bytes` and `sha256` on every successful result, so a copy can forward
+   them into `write_file` without computing anything itself. A base64
+   `write_file` over `MCP_BASE64_LIMIT_BYTES` decoded is refused outright,
+   naming `begin_write` as the next step.
+2. **`begin_write` / `write_chunk` / `commit_write` / `abort_write`** open a
+   chunked upload session for anything larger. `write_chunk` calls must
+   arrive in order (`seq` starting at 0, no gaps, no repeats — a retried
+   chunk after a failed call is the one case a real caller hits, and resending
+   the same `seq` is the correct fix). Base64 chunks are sliced only on
+   4-character boundaries so each decodes standalone without buffering the
+   whole file in memory. `commit_write` requires `expect_bytes` and/or
+   `expect_sha256` — stricter than `write_file`, deliberately: anything worth
+   chunking is worth verifying. A session left idle past
+   `MCP_UPLOAD_SESSION_TTL_SECONDS` is reaped lazily (no background task); an
+   `upload_id` is bound to the credential that opened it.
+
+   **This does not weaken the atomicity guarantee.** A chunked session holds
+   open the exact same write-temp-then-`rename` mechanism every other write in
+   this API uses — chunks land in one `.upload-*.tmp` file, and `commit_write`
+   performs the one `rename` that makes the destination exist. A reader never
+   sees a partial file, whether the write was one call or fifty. There is
+   **no REST equivalent** for the four chunked tools, deliberately: `PUT
+   /v1/content/{path}` already streams an arbitrarily large raw body with no
+   output-token ceiling, so REST has no version of this problem to solve.
+
+`get_folder_info` reports all of the above (`mcp_base64_limit_bytes` and a
+note that it's advisory, plus `mcp_upload_chunk_advisory_bytes`) so a caller
+never has to guess.
+
+### Copying within the folder
+
+`copy_file` (MCP) and `POST /v1/copy` (REST, body `{"src":…, "dst":…,
+"overwrite":false, "parents":false}`) copy a file server-side — the bytes
+never pass through the tool call or a model's context, so there's no size
+ceiling. Useful for re-archiving or duplicating a file that's already in the
+folder, which is cheaper than reading it out and writing it back in.
 
 ### Adding it as a connector
 
@@ -275,11 +332,22 @@ validation the REST routes use, and a rejected path is still logged, just
 tagged `denied MCP …` instead of `denied POST …` so the two surfaces stay
 distinguishable in `docker logs`.
 
+A chunked `begin_write` session validates the path once, the same way, and
+holds the resulting directory file descriptor open for the session's whole
+lifetime — `write_chunk` and `commit_write` never re-resolve the path. A
+descriptor can't be swapped for a symlink after the fact, so this extends the
+same TOCTOU-proof guarantee across a multi-call session instead of narrowing
+it to a single request.
+
 ### Verifying it yourself
 
 ```bash
 bash tests/run_tests.sh
 ```
+
+CI runs exactly this on every pull request (`.github/workflows/ci.yml`), plus
+`tests/autocommit_tests.sh` against the sidecar image — there is no separate
+CI-only test list to keep in sync.
 
 This builds the image and runs the suite against two configurations:
 
@@ -466,4 +534,7 @@ reproducible, and `:latest` there would silently change what runs on the next
 | `ENABLE_MCP` | `true` | Mount the [MCP connector](#mcp-connector) at `/mcp`. `false` disables it without rebuilding. |
 | `MCP_PUBLIC_HOSTNAME` | — | This service's public hostname, for the MCP SDK's DNS-rebinding guard. Unset disables that guard rather than 421ing real requests. |
 | `MCP_INLINE_LIMIT_CHARS` | `100000` | `read_file`'s inline text budget, in characters. |
-| `MCP_BASE64_LIMIT_BYTES` | `1048576` | `read_file`/`write_file`'s cap on source bytes when `encoding="base64"`. |
+| `MCP_BASE64_LIMIT_BYTES` | `8192` | `read_file`/`write_file`'s single-shot cap on source bytes when `encoding="base64"`. Advisory in practice — the real ceiling is what a caller can emit in one tool call. Over it, `write_file` refuses and names `begin_write`. |
+| `MCP_UPLOAD_SESSION_TTL_SECONDS` | `900` | Idle timeout for a `begin_write` session, reaped lazily. |
+| `MCP_MAX_CONCURRENT_UPLOADS` | `8` | Cap on open chunked-upload sessions at once. |
+| `MCP_UPLOAD_CHUNK_ADVISORY_BYTES` | `3072` | Suggested chunk size, reported by `begin_write`/`get_folder_info`. Advisory, not enforced. |

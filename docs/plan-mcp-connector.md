@@ -119,6 +119,21 @@ context to buy nothing.
   text budget (proposed **1 MiB** of source bytes, `MCP_BASE64_LIMIT_BYTES`).
   This exists for the real case of a small PNG or PDF an agent genuinely needs
   to hand over, and the cap is what keeps it from becoming the default path.
+
+  **Correction (`docs/plan-mcp-large-writes.md`): this 1 MiB figure was wrong,**
+  and wrong for a specific reason worth naming so it isn't repeated. It was
+  picked as a *context-cost* budget — how much base64 is tolerable to spend
+  on one read — without asking the separate question of what a caller can
+  actually *emit* in a single `write_file` call. Those are different
+  ceilings. The real single-shot write ceiling, measured against a live
+  incident, was roughly **5 KB of decoded bytes** — about 200× smaller — and
+  it varies by model and surface, so it can't be hardcoded as a fixed
+  constant at all. The shipped default is now 8 KiB, treated as advisory
+  rather than authoritative, with `begin_write`/`write_chunk`/`commit_write`
+  as the path for anything larger and `write_file`/`read_file` carrying
+  `expect_bytes`/`expect_sha256`/`sha256` so a truncated call is caught
+  instead of silently written short. See that document for the full
+  incident and root-cause writeup.
 - `write_file` takes `encoding: "utf-8" | "base64"` under the same two caps.
 
 ---

@@ -164,6 +164,9 @@ path is relative to the shared folder root.
 | `POST` | `/v1/copy` | `{"src":…, "dst":…, "overwrite":false, "parents":false}` — server-side copy, no size ceiling. |
 | `GET` | `/v1/bridge.py` | Download the local upload/download bridge — see [Uploading binary files: the local bridge](#uploading-binary-files-the-local-bridge). |
 | `POST`/`GET`/`DELETE` | `/mcp` | Optional Streamable HTTP MCP connector — see [MCP connector](#mcp-connector). |
+| `POST` | `/v1/uploads` | Create a one-time upload ticket. Needs the rw token. |
+| `PUT`/`POST` | `/v1/uploads/{id}/{secret}` | Upload the bytes for a ticket. No bearer token — the secret in the URL is the authorization. |
+| `GET` | `/v1/uploads/{id}` | Ticket status: `pending`/`receiving`/`complete`/`failed`/`expired`, bytes received, size, sha256. |
 
 Writes are atomic: content goes to a temp file in the destination directory
 and is `rename()`d into place, so a reader never sees a half-written file.
@@ -193,6 +196,34 @@ Pass `?parents=true` to create the chain in the same call, like `mkdir -p`.
 
 Errors are JSON: `{"code": "traversal", "message": "..."}`. Every rejection is
 logged at `WARNING`, so escape attempts show up in `docker logs`.
+
+### Uploading an existing local file
+
+`PUT /v1/content/{path}` works, but it means holding the bearer token and
+sending the whole body in one request. For an agent that can't easily do
+that -- or that shouldn't be trusted with the long-lived token -- ask for a
+one-time upload ticket instead:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" -X POST "$API/v1/uploads" \
+     -H "Content-Type: application/json" \
+     -d '{"path": "reports/q3/data.parquet"}'
+# -> {"upload_id": "u_3f9c…",
+#     "upload_url": "https://.../v1/uploads/u_3f9c…/<secret>",
+#     "curl_command": "curl -sS --fail -T <LOCAL_FILE> '.../v1/uploads/u_3f9c…/<secret>'",
+#     "expires_at": ..., "max_bytes": ...}
+
+curl -sS --fail -T ./data.parquet "https://.../v1/uploads/u_3f9c…/<secret>"
+# -> {"ok": true, "upload_id": "u_3f9c…", "path": "reports/q3/data.parquet",
+#     "size": ..., "sha256": "..."}
+```
+
+The `PUT` to `/v1/uploads/{id}/{secret}` needs **no bearer token** -- the
+secret in the URL is single-use authorization for exactly that one path. The
+ticket expires after `UPLOAD_TICKET_TTL_SECONDS` if never used, and can be
+polled with `GET /v1/uploads/{id}` while it's in flight. See
+[`docs/upload-urls.md`](docs/upload-urls.md) for the full design and
+`AGENT.md` for the agent-facing walkthrough.
 
 `AGENT.md` in this repo is a paste-ready brief for handing to an agent.
 
@@ -405,6 +436,15 @@ descriptor can't be swapped for a symlink after the fact, so this extends the
 same TOCTOU-proof guarantee across a multi-call session instead of narrowing
 it to a single request.
 
+**Upload tickets are the one deliberate exception to "every write needs the
+bearer token."** `PUT /v1/uploads/{id}/{secret}` accepts no `Authorization`
+header at all -- the 256-bit secret in the URL is scoped to a single path, is
+single-use, expires, and is compared with `hmac.compare_digest`. Creating a
+ticket still requires the rw token and re-validates the path the same way
+every other write does, and a symlink planted at the target after the ticket
+was issued is still caught at upload time. The secret is redacted from
+`uvicorn`'s access log before it's written anywhere.
+
 ### Verifying it yourself
 
 ```bash
@@ -616,6 +656,9 @@ reproducible, and `:latest` there would silently change what runs on the next
 | `REQUIRE_MOUNT` | `true` | Refuse to start if `DATA_ROOT` isn't a mount point. |
 | `ENABLE_DOCS` | `true` | Serve `/docs` and `/openapi.json`. |
 | `RATE_LIMIT_PER_MINUTE` | `600` | `0` disables. Shared between REST and `/mcp`. |
+| `UPLOAD_TICKET_TTL_SECONDS` | `900` | How long an unused upload ticket stays valid. |
+| `UPLOAD_TICKETS_MAX` | `100` | Cap on live upload tickets, so they can't use unbounded memory. |
+| `PUBLIC_BASE_URL` | *(unset)* | Base URL used to build `upload_url`. If unset, derived from `X-Forwarded-Proto`/`X-Forwarded-Host` (or `Host`). |
 | `LOG_LEVEL` | `INFO` | |
 | `ENABLE_MCP` | `true` | Mount the [MCP connector](#mcp-connector) at `/mcp`. `false` disables it without rebuilding. |
 | `MCP_PUBLIC_HOSTNAME` | — | This service's public hostname, for the MCP SDK's DNS-rebinding guard. Unset disables that guard rather than 421ing real requests. |

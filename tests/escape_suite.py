@@ -24,8 +24,10 @@ import http.client
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 BASE = os.environ.get("BASE_URL", "127.0.0.1:18080")
 TOKEN = os.environ["API_TOKEN"]
@@ -265,6 +267,180 @@ def functional() -> None:
 
 
 # ==========================================================================
+# UPLOAD TICKETS -- one-time upload URLs (docs/upload-urls.md)
+# ==========================================================================
+
+# Every ticket secret this run hands out, so main() can print them for
+# run_tests.sh to confirm none of them ever reach a container log line.
+_SEEN_SECRETS: list[str] = []
+
+
+def _create_ticket(body: dict, *, token: str | None = TOKEN) -> tuple[int, dict, bytes]:
+    st, headers, resp_body = request(
+        "POST", "/v1/uploads", body=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"}, token=token,
+    )
+    if st == 201:
+        secret = urlsplit(json.loads(resp_body)["upload_url"]).path.rsplit("/", 1)[-1]
+        _SEEN_SECRETS.append(secret)
+    return st, headers, resp_body
+
+
+def upload_tickets() -> None:
+    print(f"\n{YELLOW}UPLOAD TICKETS -- one-time upload URLs{RESET}")
+
+    # -- the whole flow works end to end -------------------------------
+    payload = os.urandom(50_000)
+    want_sha = hashlib.sha256(payload).hexdigest()
+    st, _, body = _create_ticket({"path": "uploads/ticket-test.bin"})
+    ticket = json.loads(body) if st == 201 else {}
+    if st != 201 or "upload_url" not in ticket:
+        R.bad("upload", "create ticket", f"status {st} body {body[:200]!r}")
+        return  # nothing below can run without a working ticket
+
+    R.ok("upload", "create ticket")
+    put_path = urlsplit(ticket["upload_url"]).path
+
+    st, _, body = request("PUT", put_path, body=payload, token=None)
+    result = json.loads(body) if st == 200 else {}
+    if st == 200 and result.get("sha256") == want_sha and result.get("size") == len(payload):
+        R.ok("upload", "PUT with no bearer token uploads the bytes")
+    else:
+        R.bad("upload", "PUT bytes", f"status {st} body {body[:200]!r}")
+
+    st, _, body = request("GET", f"/v1/uploads/{ticket['upload_id']}")
+    status = json.loads(body) if st == 200 else {}
+    if st == 200 and status.get("state") == "complete" and status.get("sha256") == want_sha:
+        R.ok("upload", "status shows complete with matching sha256")
+    else:
+        R.bad("upload", "status", f"status {st} body {body[:200]!r}")
+
+    st, _, body = request("GET", "/v1/content/uploads/ticket-test.bin")
+    if st == 200 and body == payload:
+        R.ok("upload", "uploaded bytes round-trip through the normal read path")
+    else:
+        R.bad("upload", "round-trip", f"status {st}, {len(body)} bytes")
+
+    # -- single use -----------------------------------------------------
+    st, _, _ = request("PUT", put_path, body=b"again", token=None)
+    R.ok("upload", "reusing a completed ticket -> 409") if st == 409 \
+        else R.bad("upload", "reuse", f"status {st}, wanted 409")
+
+    # -- a bad secret and a bad id are indistinguishable -----------------
+    bad_secret_path = put_path.rsplit("/", 1)[0] + "/wrong-secret-0123456789abcdef0123456789"
+    st, _, _ = request("PUT", bad_secret_path, body=b"x", token=None)
+    R.ok("upload", "wrong secret -> 404") if st == 404 \
+        else R.bad("upload", "wrong secret", f"status {st}, wanted 404")
+
+    st, _, _ = request("PUT", "/v1/uploads/u_doesnotexist/anysecret0123456789abcdef",
+                        body=b"x", token=None)
+    R.ok("upload", "unknown upload_id -> 404") if st == 404 \
+        else R.bad("upload", "unknown id", f"status {st}, wanted 404")
+
+    # -- read-only tokens can't create tickets ---------------------------
+    if RO_TOKEN:
+        st, _, _ = _create_ticket({"path": "uploads/ro-should-fail.bin"}, token=RO_TOKEN)
+        R.ok("upload", "read-only token cannot create a ticket -> 403") if st == 403 \
+            else R.bad("upload", "ro create ticket", f"status {st}, wanted 403")
+
+    # -- overwrite=false onto an existing file -> 409 at creation --------
+    st, _, _ = _create_ticket({"path": "uploads/ticket-test.bin", "overwrite": False})
+    R.ok("upload", "overwrite=false onto existing file -> 409 at creation") if st == 409 \
+        else R.bad("upload", "overwrite=false", f"status {st}, wanted 409")
+
+    # -- expect_sha256 mismatch: nothing lands, no tmp file, ticket failed
+    st, _, body = _create_ticket({"path": "uploads/badhash.bin", "expect_sha256": "0" * 64})
+    if st == 201:
+        ticket2 = json.loads(body)
+        put_path2 = urlsplit(ticket2["upload_url"]).path
+        st2, _, _ = request("PUT", put_path2, body=b"not the right bytes", token=None)
+        st3, _, _ = request("GET", "/v1/content/uploads/badhash.bin")
+        st4, _, body4 = request("GET", f"/v1/uploads/{ticket2['upload_id']}")
+        status4 = json.loads(body4) if st4 == 200 else {}
+        no_tmp_left = not any(
+            p.name.startswith(".upload-") and p.name.endswith(".tmp")
+            for p in (REPO / "shared" / "uploads").glob("*")
+        ) if (REPO / "shared" / "uploads").is_dir() else True
+        if (st2 not in (200,) and st3 == 404 and status4.get("state") == "failed"
+                and status4.get("error", {}).get("code") == "sha_mismatch" and no_tmp_left):
+            R.ok("upload", "expect_sha256 mismatch leaves nothing behind")
+        else:
+            R.bad("upload", "sha mismatch",
+                  f"put={st2} content={st3} ticket={status4} tmp_left={not no_tmp_left}")
+    else:
+        R.bad("upload", "sha mismatch ticket create", f"status {st}")
+
+    # -- scope: a ticket outside the folder is refused at creation -------
+    for label, path in [
+        ("traversal", "../outside.txt"),
+        ("absolute", "/etc/x"),
+        ("denied name", ".git/config"),
+    ]:
+        st, _, body = _create_ticket({"path": path})
+        R.ok("upload", f"ticket for {label} path refused at creation -> {st}") if st in (400, 403) \
+            else R.bad("upload", f"ticket scope ({label})", f"status {st} body {body[:200]!r}")
+
+    st, _, body = _create_ticket({"path": "escape-dir/planted.txt"})
+    R.ok("upload", "ticket through a symlinked parent refused at creation") if st in (400, 403) \
+        else R.bad("upload", "ticket via symlinked parent", f"status {st} body {body[:200]!r}")
+
+    # -- a symlink planted AFTER the ticket is issued is still refused ---
+    secrets_outside = REPO / "secrets.env"
+    before = sha(secrets_outside)
+    st, _, body = _create_ticket({"path": "evil-link"})
+    if st == 201:
+        ticket3 = json.loads(body)
+        link_path = REPO / "shared" / "evil-link"
+        try:
+            os.symlink("../secrets.env", link_path)
+            put_path3 = urlsplit(ticket3["upload_url"]).path
+            st2, _, body2 = request("PUT", put_path3, body=b"PWNED_BY_TEST", token=None)
+            after = sha(secrets_outside)
+            hit = leaked(body2)
+            if st2 != 200 and after == before and not hit:
+                R.ok("upload", "symlink planted after ticket issued still refused")
+            else:
+                R.bad("upload", "post-issue symlink",
+                      f"status {st2}, unchanged={after == before}, leaked={hit}")
+        finally:
+            try:
+                link_path.unlink()
+            except OSError:
+                pass
+    else:
+        R.bad("upload", "post-issue symlink ticket create", f"status {st}")
+
+    # -- size cap enforced on the ticket route too -----------------------
+    st, _, body = _create_ticket({"path": "uploads/toobig.bin"})
+    if st == 201:
+        ticket4 = json.loads(body)
+        put_path4 = urlsplit(ticket4["upload_url"]).path
+        big = b"x" * (ticket4["max_bytes"] + 1)
+        st2, _, _ = request("PUT", put_path4, body=big, token=None)
+        R.ok("upload", "oversize ticket upload -> 413") if st2 == 413 \
+            else R.bad("upload", "ticket size limit", f"status {st2}, wanted 413")
+    else:
+        R.bad("upload", "size cap ticket create", f"status {st}")
+
+    # -- expiry: a ticket left unused expires ----------------------------
+    ttl = float(os.environ.get("UPLOAD_TICKET_TTL_SECONDS", "900"))
+    if ttl <= 5:
+        st, _, body = _create_ticket({"path": "uploads/never-used.bin"})
+        if st == 201:
+            ticket5 = json.loads(body)
+            time.sleep(ttl + 0.5)
+            put_path5 = urlsplit(ticket5["upload_url"]).path
+            st2, _, _ = request("PUT", put_path5, body=b"too late", token=None)
+            R.ok("upload", f"unused ticket expires after {ttl:.0f}s -> 410") if st2 == 410 \
+                else R.bad("upload", "expiry", f"status {st2}, wanted 410")
+        else:
+            R.bad("upload", "expiry ticket create", f"status {st}")
+    else:
+        print(f"  {DIM}skip{RESET} [upload] expiry check "
+              f"(UPLOAD_TICKET_TTL_SECONDS={ttl:.0f}s, too slow to wait out here)")
+
+
+# ==========================================================================
 # ESCAPE
 # ==========================================================================
 
@@ -413,6 +589,7 @@ def main() -> int:
 
     before = snapshot()
     functional()
+    upload_tickets()
     escapes()
     after = snapshot()
 
@@ -422,6 +599,12 @@ def main() -> int:
     else:
         changed = {k for k in set(before) | set(after) if before.get(k) != after.get(k)}
         R.bad("integrity", "files outside shared/ changed", f"{sorted(changed)}")
+
+    # Printed on their own marked lines (not logged anywhere else) so
+    # run_tests.sh can grep the container's own logs and confirm none of
+    # these one-time secrets ever appear in them.
+    for secret in _SEEN_SECRETS:
+        print(f"UPLOAD_SECRET_USED:{secret}")
 
     print(f"\n{'='*68}")
     if R.failed:

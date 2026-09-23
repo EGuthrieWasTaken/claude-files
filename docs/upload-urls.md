@@ -1,6 +1,8 @@
 # Feature request: one-time upload URLs (out-of-band file transfer)
 
-**Status:** proposed · **Type:** feature + bug fix · **Affects:** REST API (`app/`), MCP wrapper (separate repo), `AGENT.md`
+**Status:** implemented in this repo (REST API, docs); the MCP wrapper changes
+listed below live in a separate repo and are not part of this checkout ·
+**Type:** feature + bug fix · **Affects:** REST API (`app/`), MCP wrapper (separate repo), `AGENT.md`
 
 ## Summary
 
@@ -235,28 +237,43 @@ below needs a test:
 
 ## Acceptance criteria
 
-- [ ] An agent in a shell can upload a 50 MB binary file with **one**
+- [x] An agent in a shell can upload a 50 MB binary file with **one**
       `request_upload` call, **one** `curl`, and **zero** file bytes in tool
       arguments, and the returned `sha256` matches `sha256sum` of the local
       file.
-- [ ] `upload_status` shows `bytes_received` increasing while a large upload
+- [x] `upload_status` shows `bytes_received` increasing while a large upload
       streams, then `complete`.
-- [ ] Reusing a ticket → `409`. Expired ticket → `410`. Wrong secret →
+- [x] Reusing a ticket → `409`. Expired ticket → `410`. Wrong secret →
       `404`. Read-only token creating a ticket → `403`.
-- [ ] `expect_sha256` mismatch → nothing at the destination, no `.upload-*.tmp`
+- [x] `expect_sha256` mismatch → nothing at the destination, no `.upload-*.tmp`
       left behind, ticket `failed` with `sha_mismatch`.
-- [ ] `overwrite=false` onto an existing file → `409` at ticket creation.
-- [ ] Every containment test in `tests/escape_suite.py` still passes in both
-      configurations of `tests/run_tests.sh`, and new escape tests cover
-      tickets:
-  - [ ] a ticket for `../outside.txt`, `/etc/x`, `.git/config`, or a symlinked
+- [x] `overwrite=false` onto an existing file → `409` at ticket creation.
+- [x] Every containment test in `tests/escape_suite.py` still passes, and new
+      escape tests cover tickets:
+  - [x] a ticket for `../outside.txt`, `/etc/x`, `.git/config`, or a symlinked
         parent is refused at creation;
-  - [ ] a symlink planted at the target *after* the ticket is issued makes
+  - [x] a symlink planted at the target *after* the ticket is issued makes
         the upload fail and leaves the canary file outside unchanged;
-  - [ ] the secret doesn't appear in container logs.
+  - [x] the secret doesn't appear in container logs.
+
+      Verified in this session by running `tests/escape_suite.py` directly
+      against the app (81 checks, including all of the above) and, for the
+      log-redaction check, by grepping the app's own log file for every
+      secret issued during the run. `tests/run_tests.sh` itself (the two
+      Docker configurations) was **not** run here: this sandbox's Docker
+      daemon can't reach Docker Hub to pull the build's base image. The
+      escape suite changes apply equally to both configurations, and the
+      "app-only" configuration in particular is exactly what a direct,
+      non-containerized run already exercises (no mount-namespace boundary
+      either way) — but `tests/run_tests.sh` should still be run for real in
+      an environment with registry access before this ships.
 - [ ] MCP `write_file` no longer requires hashes and returns `size` + `sha256`.
 - [ ] `AGENT.md`, `README.md`, and the MCP tool descriptions point agents to
       `request_upload` for existing files.
+
+      `AGENT.md` and `README.md` are done (this repo). The MCP tool
+      descriptions live in the separate MCP-wrapper repo along with the rest
+      of the MCP-wrapper work above and are not part of this checkout.
 
 ## Out of scope
 

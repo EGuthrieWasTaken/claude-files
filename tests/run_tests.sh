@@ -95,6 +95,7 @@ common_flags=(
   -e API_TOKEN="$TOKEN"
   -e API_TOKEN_READONLY="$RO_TOKEN"
   -e MAX_UPLOAD_BYTES=2097152
+  -e UPLOAD_TICKET_TTL_SECONDS=3
   -e LOG_LEVEL=INFO
   -e ENABLE_MCP=true
   -e MCP_INLINE_LIMIT_CHARS="$MCP_INLINE_LIMIT_CHARS"
@@ -114,9 +115,12 @@ run_mode() {
   docker run "${common_flags[@]}" --name "$name" -p "127.0.0.1:$port:8080" "$@" "$IMAGE" >/dev/null
   wait_healthy "$name" "$port"
 
-  BASE_URL="127.0.0.1:$port" API_TOKEN="$TOKEN" API_TOKEN_READONLY="$RO_TOKEN" \
-  FIXTURE_REPO="$FIXTURE/repo" MODE="$mode" \
-    python3 tests/escape_suite.py || FAIL=1
+  local test_out="$FIXTURE/test_output_$name.log"
+  if ! ( BASE_URL="127.0.0.1:$port" API_TOKEN="$TOKEN" API_TOKEN_READONLY="$RO_TOKEN" \
+         FIXTURE_REPO="$FIXTURE/repo" MODE="$mode" UPLOAD_TICKET_TTL_SECONDS=3 \
+           python3 tests/escape_suite.py 2>&1 | tee "$test_out" ); then
+    FAIL=1
+  fi
 
   echo
   echo "--- MCP connector: same containment suite via /mcp tools/call ---"
@@ -147,6 +151,24 @@ run_mode() {
   else
     echo "  FAIL  no 'denied MCP ...' lines in the log -- MCP rejections are invisible"; FAIL=1
   fi
+
+  echo
+  echo "--- server log: upload-ticket secrets must never appear ---"
+  local leaked=0 line secret
+  while IFS= read -r line; do
+    secret="${line#UPLOAD_SECRET_USED:}"
+    [[ -z "$secret" ]] && continue
+    if docker logs "$name" 2>&1 | grep -qF -- "$secret"; then
+      echo "  FAIL  a ticket secret appeared in the container log"
+      leaked=1
+    fi
+  done < <(grep '^UPLOAD_SECRET_USED:' "$test_out" || true)
+  if [[ $leaked -eq 0 ]]; then
+    echo "  PASS  no upload-ticket secret appeared in container logs"
+  else
+    FAIL=1
+  fi
+
   docker rm -f "$name" >/dev/null 2>&1 || true
 }
 

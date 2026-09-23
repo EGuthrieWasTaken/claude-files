@@ -24,12 +24,39 @@ from pydantic import BaseModel, Field
 
 from .config import Config
 from .safepath import Entry, PathError, Vault
+from .uploads import (
+    TicketExpired,
+    TicketLimitReached,
+    TicketNotFound,
+    TicketNotPending,
+    UploadTicket,
+    UploadTickets,
+)
 
 log = logging.getLogger("claude-files")
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
+
+# The upload-ticket URL is `/v1/uploads/{id}/{secret}` -- the secret in the
+# path is the sole authorization for that route (see docs/upload-urls.md), so
+# it must never reach a log. Redact it from uvicorn's access log, which
+# otherwise prints the raw request path verbatim.
+_TICKET_SECRET_IN_PATH = re.compile(r"(/v1/uploads/[^/\s\"?]+)/[^/\s\"?]+")
+
+
+class _RedactUploadSecrets(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                _TICKET_SECRET_IN_PATH.sub(r"\1/<redacted>", a) if isinstance(a, str) else a
+                for a in record.args
+            )
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_RedactUploadSecrets())
 
 CONFIG = Config.from_env()
 
@@ -47,6 +74,11 @@ VAULT = Vault(
     CONFIG.root,
     denied_names=CONFIG.denied_names,
     allow_hardlinked_files=CONFIG.allow_hardlinked_files,
+)
+
+TICKETS = UploadTickets(
+    ttl_seconds=CONFIG.upload_ticket_ttl_seconds,
+    max_tickets=CONFIG.upload_tickets_max,
 )
 
 DESCRIPTION = """
@@ -150,6 +182,54 @@ class OkResponse(BaseModel):
     size: int | None = None
     created: bool | None = None
     sha256: str | None = None
+
+
+class UploadCreateRequest(BaseModel):
+    path: str = Field(description="Destination path, relative to the shared folder")
+    overwrite: bool = Field(default=True, description="If false, 409 now when the file already exists")
+    parents: bool = Field(default=True, description="Create missing parent directories at upload time")
+    max_bytes: int | None = Field(
+        default=None, description="Optional per-ticket cap; clamped to MAX_UPLOAD_BYTES"
+    )
+    expect_sha256: str | None = Field(
+        default=None,
+        description="Optional. If set, the upload is rejected and nothing is written unless it matches.",
+    )
+
+
+class UploadCreateResponse(BaseModel):
+    upload_id: str
+    upload_url: str
+    method: str = "PUT"
+    expires_at: float
+    max_bytes: int
+    curl_command: str
+
+
+class UploadErrorModel(BaseModel):
+    code: str
+    message: str
+
+
+class UploadStatusResponse(BaseModel):
+    upload_id: str
+    path: str
+    state: str = Field(description="pending | receiving | complete | failed | expired")
+    bytes_received: int
+    size: int | None = None
+    sha256: str | None = None
+    error: UploadErrorModel | None = None
+    created_at: float
+    expires_at: float
+    completed_at: float | None = None
+
+
+class UploadResultResponse(BaseModel):
+    ok: bool = True
+    upload_id: str
+    path: str
+    size: int
+    sha256: str
 
 
 def _to_model(e: Entry) -> EntryModel:
@@ -298,6 +378,8 @@ def info(_: ReadAuth) -> dict[str, Any]:
         "allow_hardlinked_files": CONFIG.allow_hardlinked_files,
         "mcp_enabled": _mcp_endpoint is not None,
         "bridge_available": _bridge_script_path() is not None,
+        "upload_ticket_ttl_seconds": CONFIG.upload_ticket_ttl_seconds,
+        "upload_tickets_max": CONFIG.upload_tickets_max,
     }
 
 
@@ -601,6 +683,203 @@ def move(req: MoveRequest, _: WriteAuth) -> OkResponse:
     VAULT.move(src, dst, overwrite=req.overwrite, create_parents=req.parents)
     log.info("moved %s -> %s", "/".join(src), "/".join(dst))
     return OkResponse(path="/".join(dst))
+
+
+def _public_base_url(request: Request) -> str:
+    if CONFIG.public_base_url:
+        return CONFIG.public_base_url.rstrip("/")
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    return f"{proto}://{host}"
+
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+@app.post("/v1/uploads", response_model=UploadCreateResponse, status_code=201, tags=["write"],
+          summary="Create a one-time upload ticket")
+def create_upload(req: UploadCreateRequest, request: Request, _: WriteAuth) -> UploadCreateResponse:
+    parts = VAULT.components(req.path)
+    if not parts:
+        raise PathError(403, "is_root", "Cannot upload to the root itself")
+    VAULT.precheck_new_path(parts)
+
+    if not req.overwrite:
+        try:
+            VAULT.stat(parts)
+        except PathError as exc:
+            if exc.code != "not_found":
+                raise
+        else:
+            raise HTTPException(409, detail={"code": "conflict", "message": "File already exists"})
+
+    expect_sha256 = None
+    if req.expect_sha256 is not None:
+        expect_sha256 = req.expect_sha256.strip().lower()
+        if not _SHA256_RE.match(expect_sha256):
+            raise HTTPException(
+                400,
+                detail={
+                    "code": "bad_request",
+                    "message": "expect_sha256 must be 64 lowercase hex characters",
+                },
+            )
+
+    max_bytes = CONFIG.max_upload_bytes
+    if req.max_bytes is not None:
+        if req.max_bytes <= 0:
+            raise HTTPException(
+                400, detail={"code": "bad_request", "message": "max_bytes must be positive"}
+            )
+        max_bytes = min(req.max_bytes, CONFIG.max_upload_bytes)
+
+    try:
+        ticket = TICKETS.create(
+            parts=parts,
+            overwrite=req.overwrite,
+            parents=req.parents,
+            max_bytes=max_bytes,
+            expect_sha256=expect_sha256,
+        )
+    except TicketLimitReached:
+        raise HTTPException(
+            503,
+            detail={
+                "code": "too_many_uploads",
+                "message": "Too many pending uploads; try again shortly",
+            },
+        ) from None
+
+    upload_url = f"{_public_base_url(request)}/v1/uploads/{ticket.upload_id}/{ticket.secret}"
+    log.info("upload ticket %s created for %s", ticket.upload_id, ticket.path)
+    return UploadCreateResponse(
+        upload_id=ticket.upload_id,
+        upload_url=upload_url,
+        expires_at=ticket.expires_at,
+        max_bytes=ticket.max_bytes,
+        curl_command=f"curl -sS --fail -T <LOCAL_FILE> '{upload_url}'",
+    )
+
+
+@app.get("/v1/uploads/{upload_id}", response_model=UploadStatusResponse, tags=["read"],
+         summary="Check an upload ticket's status")
+def upload_status(_: ReadAuth, upload_id: str) -> UploadStatusResponse:
+    ticket = TICKETS.get(upload_id)
+    if ticket is None:
+        raise HTTPException(404, detail={"code": "not_found", "message": "No such upload"})
+    return UploadStatusResponse(
+        upload_id=ticket.upload_id,
+        path=ticket.path,
+        state=ticket.effective_state(),
+        bytes_received=ticket.bytes_received,
+        size=ticket.size,
+        sha256=ticket.sha256,
+        error=UploadErrorModel(**ticket.error) if ticket.error else None,
+        created_at=ticket.created_at,
+        expires_at=ticket.expires_at,
+        completed_at=ticket.completed_at,
+    )
+
+
+async def _stream_ticket_upload(request: Request, ticket: UploadTicket) -> tuple[int, str]:
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            if int(declared) > ticket.max_bytes:
+                raise HTTPException(
+                    413,
+                    detail={
+                        "code": "too_large",
+                        "message": f"Body exceeds the ticket's max_bytes ({ticket.max_bytes})",
+                    },
+                )
+        except ValueError:
+            raise HTTPException(
+                400, detail={"code": "bad_request", "message": "Invalid Content-Length"}
+            ) from None
+
+    hasher = hashlib.sha256()
+    written = 0
+    with VAULT.atomic_write(
+        ticket.parts, overwrite=ticket.overwrite, create_parents=ticket.parents
+    ) as (fd, committer):
+        async for chunk in request.stream():
+            if not chunk:
+                continue
+            written += len(chunk)
+            if written > ticket.max_bytes:
+                raise HTTPException(
+                    413,
+                    detail={
+                        "code": "too_large",
+                        "message": f"Body exceeds the ticket's max_bytes ({ticket.max_bytes})",
+                    },
+                )
+            hasher.update(chunk)
+            os.write(fd, chunk)
+            TICKETS.update_progress(ticket.upload_id, written)
+
+        digest = hasher.hexdigest()
+        if ticket.expect_sha256 and not hmac.compare_digest(digest, ticket.expect_sha256):
+            # Raising here, before committer.commit(fd), leaves the temp file
+            # to be cleaned up by atomic_write's `finally` and the target
+            # untouched.
+            raise HTTPException(
+                422,
+                detail={
+                    "code": "sha_mismatch",
+                    "message": f"Uploaded bytes hash to {digest}, expected {ticket.expect_sha256}",
+                },
+            )
+        committer.commit(fd)
+    return written, digest
+
+
+@app.put("/v1/uploads/{upload_id}/{secret}", response_model=UploadResultResponse, tags=["write"],
+         summary="Upload the bytes for a ticket (no bearer token; the secret is the authorization)")
+@app.post("/v1/uploads/{upload_id}/{secret}", response_model=UploadResultResponse, tags=["write"],
+          summary="Upload the bytes for a ticket (alias for clients that can't send PUT)")
+async def upload_bytes(request: Request, upload_id: str, secret: str) -> UploadResultResponse:
+    _rate_limit()
+    try:
+        ticket = TICKETS.begin_receive(upload_id, secret)
+    except TicketNotFound:
+        log.warning("denied %s /v1/uploads/%s/<secret> -> not_found", request.method, upload_id)
+        raise HTTPException(404, detail={"code": "not_found", "message": "No such upload"}) from None
+    except TicketExpired:
+        raise HTTPException(
+            410, detail={"code": "expired", "message": "Upload ticket has expired"}
+        ) from None
+    except TicketNotPending as exc:
+        raise HTTPException(
+            409,
+            detail={"code": "conflict", "message": f"Upload ticket already {exc.state}"},
+        ) from None
+
+    try:
+        size, digest = await _stream_ticket_upload(request, ticket)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {"code": "error", "message": str(exc.detail)}
+        TICKETS.mark_failed(ticket.upload_id, code=detail.get("code", "error"), message=detail.get("message", ""))
+        log.warning("upload %s failed: %s", ticket.upload_id, detail.get("code"))
+        raise
+    except PathError as exc:
+        # Translated to HTTPException (rather than re-raised) so this never
+        # reaches the PathError handler, which logs request.url.path -- and
+        # this route's path contains the ticket's one-time secret.
+        TICKETS.mark_failed(ticket.upload_id, code=exc.code, message=exc.message)
+        log.warning("upload %s failed: %s (%s)", ticket.upload_id, exc.code, exc.message)
+        raise HTTPException(exc.status, detail={"code": exc.code, "message": exc.message}) from exc
+    except Exception as exc:
+        TICKETS.mark_failed(ticket.upload_id, code="io_error", message=str(exc))
+        log.exception("upload %s failed unexpectedly", ticket.upload_id)
+        raise HTTPException(
+            500, detail={"code": "io_error", "message": "Internal error while receiving the upload"}
+        ) from exc
+
+    TICKETS.mark_complete(ticket.upload_id, size=size, sha256=digest)
+    log.info("upload %s complete: %s (%d bytes)", ticket.upload_id, ticket.path, size)
+    return UploadResultResponse(upload_id=ticket.upload_id, path=ticket.path, size=size, sha256=digest)
 
 
 @app.post("/v1/copy", response_model=OkResponse, tags=["write"],

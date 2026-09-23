@@ -210,10 +210,10 @@ curl -H "Authorization: Bearer $TOKEN" -X POST "$API/v1/uploads" \
      -d '{"path": "reports/q3/data.parquet"}'
 # -> {"upload_id": "u_3f9c…",
 #     "upload_url": "https://.../v1/uploads/u_3f9c…/<secret>",
-#     "curl_command": "curl -sS --fail -T <LOCAL_FILE> '.../v1/uploads/u_3f9c…/<secret>'",
+#     "curl_command": "curl -sS --fail-with-body -T <LOCAL_FILE> '.../v1/uploads/u_3f9c…/<secret>'",
 #     "expires_at": ..., "max_bytes": ...}
 
-curl -sS --fail -T ./data.parquet "https://.../v1/uploads/u_3f9c…/<secret>"
+curl -sS --fail-with-body -T ./data.parquet "https://.../v1/uploads/u_3f9c…/<secret>"
 # -> {"ok": true, "upload_id": "u_3f9c…", "path": "reports/q3/data.parquet",
 #     "size": ..., "sha256": "..."}
 ```
@@ -296,6 +296,25 @@ root-cause writeup. Two things fix it:
 `get_folder_info` reports all of the above (`mcp_base64_limit_bytes` and a
 note that it's advisory, plus `mcp_upload_chunk_advisory_bytes`) so a caller
 never has to guess.
+
+### Uploading existing files: `request_upload`
+
+The preferred way for a connector caller to upload a file that already
+exists on its machine. `request_upload(path)` mints the same one-time ticket
+as `POST /v1/uploads` (see [Uploading an existing local
+file](#uploading-an-existing-local-file)) and returns its `upload_url` and a
+ready-made `curl_command`; the agent runs that from its shell, and the bytes
+go straight over HTTP instead of through its own output. `upload_status`
+reports progress and the server-computed `sha256`, which the agent compares
+against its local `sha256sum`. Unlike the bridge below, the agent's shell
+never needs the long-lived token -- only `curl` and outbound access to this
+server. `write_file` now also returns the `sha256` it wrote.
+
+The `upload_url`'s host comes from `PUBLIC_BASE_URL`, else
+`MCP_PUBLIC_HOSTNAME` (as `https://`), else the request's forwarded host.
+Set one of the first two in production. If Cloudflare Access fronts the
+hostname, `/v1/uploads/*/*` needs a bypass rule, since `curl` in an agent's
+sandbox has no Access session.
 
 ### Uploading binary files: the local bridge
 
@@ -658,7 +677,7 @@ reproducible, and `:latest` there would silently change what runs on the next
 | `RATE_LIMIT_PER_MINUTE` | `600` | `0` disables. Shared between REST and `/mcp`. |
 | `UPLOAD_TICKET_TTL_SECONDS` | `900` | How long an unused upload ticket stays valid. |
 | `UPLOAD_TICKETS_MAX` | `100` | Cap on live upload tickets, so they can't use unbounded memory. |
-| `PUBLIC_BASE_URL` | *(unset)* | Base URL used to build `upload_url`. If unset, derived from `X-Forwarded-Proto`/`X-Forwarded-Host` (or `Host`). |
+| `PUBLIC_BASE_URL` | *(unset)* | Base URL used to build `upload_url`. If unset, `https://$MCP_PUBLIC_HOSTNAME`, else derived from `X-Forwarded-Proto`/`X-Forwarded-Host` (or `Host`). |
 | `LOG_LEVEL` | `INFO` | |
 | `ENABLE_MCP` | `true` | Mount the [MCP connector](#mcp-connector) at `/mcp`. `false` disables it without rebuilding. |
 | `MCP_PUBLIC_HOSTNAME` | — | This service's public hostname, for the MCP SDK's DNS-rebinding guard. Unset disables that guard rather than 421ing real requests. |

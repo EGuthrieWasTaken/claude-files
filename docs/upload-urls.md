@@ -1,8 +1,21 @@
 # Feature request: one-time upload URLs (out-of-band file transfer)
 
-**Status:** implemented in this repo (REST API, docs); the MCP wrapper changes
-listed below live in a separate repo and are not part of this checkout ·
-**Type:** feature + bug fix · **Affects:** REST API (`app/`), MCP wrapper (separate repo), `AGENT.md`
+**Status:** implemented (REST API, MCP tools, docs, tests) · **Type:** feature + bug fix ·
+**Affects:** `app/main.py`, `app/uploads.py`, `app/mcp_endpoint.py`, `AGENT.md`, `README.md`
+
+> **History.** This spec was first written against a stale checkout that
+> predated the MCP connector (`app/mcp_endpoint.py`, PR #3) and the local
+> bridge (`bridge/`, PR #4), which is why earlier drafts called the MCP
+> wrapper "a separate repo". It isn't. The branch was rebased onto `main`
+> and the MCP half implemented in-repo; see "Implementation notes" at the
+> end for what differs from the text below.
+>
+> **Relation to the bridge.** The bridge (`docs/feature-request-path-based-upload.md`)
+> already streams files from disk, but it needs the long-lived rw token in
+> the agent's environment. Upload URLs need only `curl` and a one-time,
+> single-path secret handed out by the connector, so they work in sandboxes
+> you wouldn't trust with the token. The two coexist; `request_upload` is
+> what the connector now points agents at first.
 
 ## Summary
 
@@ -173,11 +186,9 @@ report progress.
 
 Report the TTL and the ticket cap in `GET /v1/info`.
 
-### MCP wrapper (separate repo, not in this checkout)
+### MCP connector (`app/mcp_endpoint.py`)
 
-The MCP server that provides `get_folder_info`, `write_file`, `begin_write`,
-`write_chunk`, `commit_write`, and so on isn't in this repository. The
-implementer needs its source. Changes there:
+Changes:
 
 1. **Add `request_upload(path, overwrite=true, parents=true, expect_sha256=null)`.**
    It calls `POST /v1/uploads` and returns the ticket, including a ready-made
@@ -256,24 +267,14 @@ below needs a test:
         the upload fail and leaves the canary file outside unchanged;
   - [x] the secret doesn't appear in container logs.
 
-      Verified in this session by running `tests/escape_suite.py` directly
-      against the app (81 checks, including all of the above) and, for the
-      log-redaction check, by grepping the app's own log file for every
-      secret issued during the run. `tests/run_tests.sh` itself (the two
-      Docker configurations) was **not** run here: this sandbox's Docker
-      daemon can't reach Docker Hub to pull the build's base image. The
-      escape suite changes apply equally to both configurations, and the
-      "app-only" configuration in particular is exactly what a direct,
-      non-containerized run already exercises (no mount-namespace boundary
-      either way) — but `tests/run_tests.sh` should still be run for real in
-      an environment with registry access before this ships.
-- [ ] MCP `write_file` no longer requires hashes and returns `size` + `sha256`.
-- [ ] `AGENT.md`, `README.md`, and the MCP tool descriptions point agents to
+      Verified with `tests/run_tests.sh` in both Docker configurations
+      after rebasing onto `main`.
+- [~] MCP `write_file` returns `size` + `sha256`. **Hashes are still
+      required for base64 writes over 1 KB** — see Implementation notes.
+- [x] `AGENT.md`, `README.md`, and the MCP tool descriptions point agents to
       `request_upload` for existing files.
-
-      `AGENT.md` and `README.md` are done (this repo). The MCP tool
-      descriptions live in the separate MCP-wrapper repo along with the rest
-      of the MCP-wrapper work above and are not part of this checkout.
+- [x] `tests/run_tests.sh` passes in both Docker configurations, including
+      the new `UPLOAD URLS` section of `tests/mcp_escape_suite.py`.
 
 ## Out of scope
 
@@ -283,8 +284,8 @@ below needs a test:
   enough here. Revisit only if uploads start failing mid-transfer through
   cloudflared.
 - Agents with no shell or no outbound network access. They can't use this
-  flow at all. For them, the fix is item 4 in the MCP list: stop requiring
-  hashes they can't compute.
+  flow at all. They keep `write_file` (for content they compose) and the
+  chunked tools.
 
 ## Open question for whoever implements this
 
@@ -297,3 +298,26 @@ Check that the environments agents actually run in can reach
 - If Cloudflare Access sits in front of the hostname, the one-time upload
   URL route needs a bypass rule (or a service token), because `curl` from
   the sandbox won't have an Access session.
+
+## Implementation notes
+
+- **Shared helpers.** `issue_upload_ticket()` and `upload_ticket_status()` in
+  `app/main.py` back both `POST`/`GET /v1/uploads` and the MCP
+  `request_upload`/`upload_status` tools, so validation is identical. Their
+  refusals are `PathError`s, which each front end already logs (`denied …` /
+  `denied MCP …`).
+- **Base URL.** `upload_url` uses `PUBLIC_BASE_URL`, then
+  `https://$MCP_PUBLIC_HOSTNAME`, then the forwarded request host. Set one of
+  the first two in production.
+- **`curl_command`** uses `--fail-with-body` rather than `--fail`, so a
+  refused upload still prints the server's JSON error.
+- **Deviation: `write_file` still requires `expect_bytes`/`expect_sha256` for
+  base64 over 1 KB.** That rule came from PR #3 and is what turns a
+  truncated call into a clean refusal instead of a short file. Callers
+  who'd hit it are copying an existing file, which is exactly what
+  `request_upload` is for, and the refusal message now names it. Every
+  successful `write_file` now returns the server-computed `sha256`.
+- **`begin_write`** is described as a last resort for callers with no shell;
+  it isn't removed, because it's still the only path on surfaces with no
+  shell or network.
+

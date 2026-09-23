@@ -9,11 +9,13 @@ files too large or too binary for a tool result (the connector's tools say so
 explicitly when that happens, and name the REST endpoint below to use
 instead).
 
-If the connector's `write_file` refuses a file as too large (or your own
-output would clearly overrun a few KB in one call), use its
-`begin_write`/`write_chunk`/`commit_write`/`abort_write` tools instead of
-forcing it through one inline call — `commit_write` needs the byte count or a
-sha256 hash to verify against. Copying a file that's already in the folder?
+**Uploading a file that already exists on your machine? Use the connector's
+`request_upload` tool** and run the `curl` command it returns — see
+"Uploading an existing file" below. Never paste a file's contents into
+`write_file` or `write_chunk`; that's what makes large uploads slow and
+corrupts them. `write_file` is for short text you're composing in the call.
+`begin_write`/`write_chunk`/`commit_write` are a last resort for surfaces
+with no shell at all. Copying a file that's already in the folder?
 Use `copy_file` (or `POST /v1/copy` below) instead of reading it out and
 writing it back in — the bytes never pass through your context either way.
 
@@ -37,14 +39,17 @@ text or base64 drops or corrupts characters. Use this three-step flow
 instead — the bytes go straight from your shell to the server and never pass
 through you:
 
-1. **Request a ticket** (needs the bearer token):
+1. **Request a ticket.** With the MCP connector, call
+   `request_upload(path="reports/q3/data.parquet")` — it returns the same
+   fields as the REST call below, and your shell never needs the bearer
+   token. Over REST (needs the bearer token):
 
    ```
    POST /v1/uploads
    {"path": "reports/q3/data.parquet"}
    -> {"upload_id": "u_3f9c…",
        "upload_url": "https://.../v1/uploads/u_3f9c…/<secret>",
-       "curl_command": "curl -sS --fail -T <LOCAL_FILE> 'https://.../v1/uploads/u_3f9c…/<secret>'",
+       "curl_command": "curl -sS --fail-with-body -T <LOCAL_FILE> 'https://.../v1/uploads/u_3f9c…/<secret>'",
        "expires_at": 1790000000.0, "max_bytes": 268435456}
    ```
 
@@ -53,14 +58,14 @@ through you:
    one-time authorization for that upload, and it's good for one file, once.
 
    ```
-   curl -sS --fail -T ./data.parquet 'https://.../v1/uploads/u_3f9c…/<secret>'
+   curl -sS --fail-with-body -T ./data.parquet 'https://.../v1/uploads/u_3f9c…/<secret>'
    -> {"ok": true, "upload_id": "u_3f9c…", "path": "reports/q3/data.parquet",
        "size": 52428800, "sha256": "..."}
    ```
 
 3. **Verify.** Compare `sha256sum ./data.parquet` against the `sha256` in
-   that response, or poll `GET /v1/uploads/{upload_id}` (bearer token
-   required) if you want to check progress on a large upload first —
+   that response, or call the connector's `upload_status(upload_id)` /
+   poll `GET /v1/uploads/{upload_id}` (bearer token required) if you want to check progress on a large upload first —
    `bytes_received` climbs while it streams, then `state` becomes `complete`.
 
 If you have a shell and the bearer token but no local `curl_command` handy,

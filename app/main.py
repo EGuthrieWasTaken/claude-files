@@ -685,9 +685,18 @@ def move(req: MoveRequest, _: WriteAuth) -> OkResponse:
     return OkResponse(path="/".join(dst))
 
 
-def _public_base_url(request: Request) -> str:
+def _public_base_url(request: Request | None) -> str:
+    """Base URL for a ticket's upload_url: PUBLIC_BASE_URL, else
+    MCP_PUBLIC_HOSTNAME, else whatever the (proxied) request says."""
     if CONFIG.public_base_url:
         return CONFIG.public_base_url.rstrip("/")
+    if CONFIG.mcp_public_hostname:
+        return f"https://{CONFIG.mcp_public_hostname}"
+    if request is None:
+        raise PathError(
+            500, "no_base_url",
+            "Cannot build an upload URL: set PUBLIC_BASE_URL on the server",
+        )
     proto = request.headers.get("x-forwarded-proto", request.url.scheme)
     host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
     return f"{proto}://{host}"
@@ -696,77 +705,76 @@ def _public_base_url(request: Request) -> str:
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
-@app.post("/v1/uploads", response_model=UploadCreateResponse, status_code=201, tags=["write"],
-          summary="Create a one-time upload ticket")
-def create_upload(req: UploadCreateRequest, request: Request, _: WriteAuth) -> UploadCreateResponse:
-    parts = VAULT.components(req.path)
+def issue_upload_ticket(
+    path: str,
+    *,
+    overwrite: bool,
+    parents: bool,
+    max_bytes: int | None,
+    expect_sha256: str | None,
+    request: Request | None,
+) -> UploadCreateResponse:
+    """Validate the destination and mint a one-time upload ticket.
+
+    Shared by POST /v1/uploads and the MCP request_upload tool, so both
+    front ends apply identical checks. Every refusal is a PathError, which
+    each front end already logs and translates.
+    """
+    parts = VAULT.components(path)
     if not parts:
         raise PathError(403, "is_root", "Cannot upload to the root itself")
     VAULT.precheck_new_path(parts)
 
-    if not req.overwrite:
+    if not overwrite:
         try:
             VAULT.stat(parts)
         except PathError as exc:
             if exc.code != "not_found":
                 raise
         else:
-            raise HTTPException(409, detail={"code": "conflict", "message": "File already exists"})
+            raise PathError(409, "conflict", "File already exists")
 
-    expect_sha256 = None
-    if req.expect_sha256 is not None:
-        expect_sha256 = req.expect_sha256.strip().lower()
-        if not _SHA256_RE.match(expect_sha256):
-            raise HTTPException(
-                400,
-                detail={
-                    "code": "bad_request",
-                    "message": "expect_sha256 must be 64 lowercase hex characters",
-                },
-            )
+    digest = None
+    if expect_sha256 is not None:
+        digest = expect_sha256.strip().lower()
+        if not _SHA256_RE.match(digest):
+            raise PathError(400, "bad_request", "expect_sha256 must be 64 hex characters")
 
-    max_bytes = CONFIG.max_upload_bytes
-    if req.max_bytes is not None:
-        if req.max_bytes <= 0:
-            raise HTTPException(
-                400, detail={"code": "bad_request", "message": "max_bytes must be positive"}
-            )
-        max_bytes = min(req.max_bytes, CONFIG.max_upload_bytes)
+    cap = CONFIG.max_upload_bytes
+    if max_bytes is not None:
+        if max_bytes <= 0:
+            raise PathError(400, "bad_request", "max_bytes must be positive")
+        cap = min(max_bytes, CONFIG.max_upload_bytes)
 
+    base_url = _public_base_url(request)
     try:
         ticket = TICKETS.create(
             parts=parts,
-            overwrite=req.overwrite,
-            parents=req.parents,
-            max_bytes=max_bytes,
-            expect_sha256=expect_sha256,
+            overwrite=overwrite,
+            parents=parents,
+            max_bytes=cap,
+            expect_sha256=digest,
         )
     except TicketLimitReached:
-        raise HTTPException(
-            503,
-            detail={
-                "code": "too_many_uploads",
-                "message": "Too many pending uploads; try again shortly",
-            },
+        raise PathError(
+            503, "too_many_uploads", "Too many pending uploads; try again shortly"
         ) from None
 
-    upload_url = f"{_public_base_url(request)}/v1/uploads/{ticket.upload_id}/{ticket.secret}"
+    upload_url = f"{base_url}/v1/uploads/{ticket.upload_id}/{ticket.secret}"
     log.info("upload ticket %s created for %s", ticket.upload_id, ticket.path)
     return UploadCreateResponse(
         upload_id=ticket.upload_id,
         upload_url=upload_url,
         expires_at=ticket.expires_at,
         max_bytes=ticket.max_bytes,
-        curl_command=f"curl -sS --fail -T <LOCAL_FILE> '{upload_url}'",
+        curl_command=f"curl -sS --fail-with-body -T <LOCAL_FILE> '{upload_url}'",
     )
 
 
-@app.get("/v1/uploads/{upload_id}", response_model=UploadStatusResponse, tags=["read"],
-         summary="Check an upload ticket's status")
-def upload_status(_: ReadAuth, upload_id: str) -> UploadStatusResponse:
+def upload_ticket_status(upload_id: str) -> UploadStatusResponse:
     ticket = TICKETS.get(upload_id)
     if ticket is None:
-        raise HTTPException(404, detail={"code": "not_found", "message": "No such upload"})
+        raise PathError(404, "not_found", "No such upload")
     return UploadStatusResponse(
         upload_id=ticket.upload_id,
         path=ticket.path,
@@ -779,6 +787,25 @@ def upload_status(_: ReadAuth, upload_id: str) -> UploadStatusResponse:
         expires_at=ticket.expires_at,
         completed_at=ticket.completed_at,
     )
+
+
+@app.post("/v1/uploads", response_model=UploadCreateResponse, status_code=201, tags=["write"],
+          summary="Create a one-time upload ticket")
+def create_upload(req: UploadCreateRequest, request: Request, _: WriteAuth) -> UploadCreateResponse:
+    return issue_upload_ticket(
+        req.path,
+        overwrite=req.overwrite,
+        parents=req.parents,
+        max_bytes=req.max_bytes,
+        expect_sha256=req.expect_sha256,
+        request=request,
+    )
+
+
+@app.get("/v1/uploads/{upload_id}", response_model=UploadStatusResponse, tags=["read"],
+         summary="Check an upload ticket's status")
+def upload_status(_: ReadAuth, upload_id: str) -> UploadStatusResponse:
+    return upload_ticket_status(upload_id)
 
 
 async def _stream_ticket_upload(request: Request, ticket: UploadTicket) -> tuple[int, str]:

@@ -113,6 +113,11 @@ credentials, tokens, keys, or personal data. There is no append or partial
 edit, only whole-file replace: assemble a file completely, then write it
 once, rather than using the folder as scratch space.
 
+To upload a file that already exists on your machine, use request_upload
+and run the curl command it returns -- never paste a file's contents into
+write_file or write_chunk. write_file is for short text you are composing
+now.
+
 Call get_folder_info first -- it reports this token's scope (rw/ro), the
 server's limits, and the inline size budgets read_file/write_file operate
 under. A file too large or too binary for a tool result is refused with an
@@ -373,10 +378,21 @@ def get_folder_info(ctx: Context) -> dict[str, Any]:
             "over mcp_base64_limit_bytes decoded."
         ),
         "mcp_upload_chunk_advisory_bytes": appmain.CONFIG.mcp_upload_chunk_advisory_bytes,
+        "upload_urls": {
+            "ticket_ttl_seconds": appmain.CONFIG.upload_ticket_ttl_seconds,
+            "note": (
+                "PREFERRED for any file that already exists on your machine: call "
+                "request_upload(path), run the curl_command it returns with your "
+                "local path filled in, and compare the sha256 curl prints with "
+                "sha256sum of your file. The bytes never pass through a tool call, "
+                "and you need no token in your shell."
+            ),
+        },
         "bridge": {
             "available": appmain._bridge_script_path() is not None,
             "download_url": "/v1/bridge.py",
             "note": (
+                "Prefer upload_urls (above) when you have a shell. "
                 "If you can run shell commands or launch a local MCP server, do NOT "
                 "base64 a binary file through write_file or write_chunk -- your own "
                 "output ceiling is the binding limit and it is well under 10 KB. "
@@ -528,7 +544,12 @@ def write_file(
     expect_bytes: int | None = None,
     expect_sha256: str | None = None,
 ) -> dict[str, Any]:
-    """Create or replace a file. `parents` defaults to true here (unlike the
+    """Create or replace a file from content you are composing in this call
+    -- a short report, generated text. If the content already exists as a
+    local file, use request_upload instead: it sends the bytes over HTTP
+    rather than through your own output, which is faster and doesn't corrupt
+    large files. The result carries the server-computed `size` and `sha256`.
+    `parents` defaults to true here (unlike the
     REST API): a model that has just been told a path doesn't exist isn't
     helped by a 409, so the missing parent chain is created automatically.
     `overwrite=false` refuses if the file already exists. `encoding="utf-8"`
@@ -561,8 +582,9 @@ def write_file(
             if len(data) > cap:
                 raise ValueError(
                     f"Decoded content is {len(data):,} bytes, over the {cap:,}-byte "
-                    f"single-shot base64 limit for this connector. If you can run "
-                    f"shell commands or a local MCP server, fetch /v1/bridge.py with "
+                    f"single-shot base64 limit for this connector. If you have a "
+                    f"shell, call request_upload('{path}') and run the curl command it "
+                    f"returns. Or, if you can run a local MCP server, fetch /v1/bridge.py with "
                     f"your read token and run `python3 claude_files_bridge.py upload "
                     f"<local> {path}` instead -- it streams the bytes straight from "
                     f"disk, with no output ceiling. Otherwise use "
@@ -607,7 +629,10 @@ def write_file(
             os.write(fd, data)
             committer.commit(fd)
         appmain.log.info("wrote %s (%d bytes) via MCP", "/".join(parts), len(data))
-        return {"ok": True, "path": "/".join(parts), "size": len(data), "created": True}
+        return {
+            "ok": True, "path": "/".join(parts), "size": len(data), "created": True,
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
 
     return _guard("write_file", _do)
 
@@ -620,7 +645,10 @@ def begin_write(
     overwrite: bool = True,
     parents: bool = True,
 ) -> dict[str, Any]:
-    """Start a chunked write session for a file too large for write_file's
+    """LAST RESORT -- only for callers with no shell. If you have a shell,
+    use request_upload instead: this path routes every byte through your own
+    output, which is slow and error-prone for anything over a few KB.
+    Start a chunked write session for a file too large for write_file's
     single-shot base64 cap (or just too large to comfortably emit in one
     tool call as text). Returns an `upload_id`; follow with write_chunk
     calls (seq=0, 1, 2, ... with no gaps) and finish with commit_write,
@@ -1006,3 +1034,67 @@ def copy_file(
         return {"ok": True, "path": "/".join(dst_parts), "size": size, "created": True}
 
     return _guard("copy_file", _do)
+
+
+# =============================================================================
+# One-time upload URLs -- docs/upload-urls.md
+# =============================================================================
+
+
+@mcp.tool()
+def request_upload(
+    path: str,
+    ctx: Context,
+    overwrite: bool = True,
+    parents: bool = True,
+    expect_sha256: str | None = None,
+) -> dict[str, Any]:
+    """PREFERRED way to upload any file that already exists on your machine,
+    of any size or type. Do NOT paste its contents into write_file or
+    write_chunk: that routes every byte through your own output, which is
+    slow and corrupts large files. Instead, this returns a single-use
+    `upload_url` scoped to `path`; run the returned `curl_command` from your
+    shell with <LOCAL_FILE> replaced by your local file's path. The bytes go
+    straight over HTTP, and curl prints the server's `size` and `sha256` for
+    them -- compare that with `sha256sum <LOCAL_FILE>` (or `shasum -a 256`).
+    `upload_status(upload_id)` reports the same result, or progress while a
+    large upload is still streaming. The URL expires if unused (see
+    `expires_at`) and works exactly once; request a new one to retry. No
+    bearer token is needed for the curl -- the URL itself is the
+    authorization, so don't paste it anywhere else. `expect_sha256` is
+    optional; if given, the upload is rejected and nothing is written unless
+    the bytes match. Requires a read-write token and a shell with outbound
+    network access to this server."""
+    from . import main as appmain
+
+    _require_write(ctx)
+
+    def _do():  # type: ignore[no-untyped-def]
+        resp = appmain.issue_upload_ticket(
+            path,
+            overwrite=overwrite,
+            parents=parents,
+            max_bytes=None,
+            expect_sha256=expect_sha256,
+            request=ctx.request_context.request,
+        )
+        out = resp.model_dump()
+        out["next_steps"] = (
+            "1) Run curl_command with <LOCAL_FILE> replaced by your local path. "
+            "2) Compare the sha256 in curl's output with sha256sum of your local file. "
+            "If curl's output was lost, call upload_status with this upload_id."
+        )
+        return out
+
+    return _guard("request_upload", _do)
+
+
+@mcp.tool()
+def upload_status(upload_id: str) -> dict[str, Any]:
+    """Status of a request_upload ticket: `state` is pending (not used yet),
+    receiving (bytes still streaming; see bytes_received), complete (see
+    `size` and `sha256` -- compare with your local sha256sum), failed (see
+    `error`; request a new upload), or expired (request a new upload)."""
+    from . import main as appmain
+
+    return _guard("upload_status", lambda: appmain.upload_ticket_status(upload_id).model_dump())

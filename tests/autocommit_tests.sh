@@ -76,6 +76,20 @@ remote_files() { inc 'git -C /work/remote.git ls-tree -r --name-only HEAD' | tr 
 remote_log()   { inc 'git -C /work/remote.git log --oneline'; }
 local_log()    { inc 'git -C /work/repo log --oneline'; }
 
+# A query function (local_log, remote_files, ...) run via a fresh docker run
+# immediately after sidecar()'s own container has already exited has, in CI,
+# occasionally not seen that container's just-completed git state on the
+# first read -- not reproduced locally, cause not pinned down. Retry briefly
+# rather than call state "lost" on what may just be a slow-to-settle read.
+retry_grep() {
+  local pattern="$1" fn="$2"
+  for _ in 1 2 3 4 5; do
+    "$fn" | grep -q "$pattern" && return 0
+    sleep 0.3
+  done
+  return 1
+}
+
 # ===========================================================================
 echo -e "\n${Y}autocommit sidecar tests${N}"
 
@@ -218,10 +232,10 @@ if grep -q "not because the remote moved" <<<"$out" && ! grep -qi "conflict" <<<
 else
   bad "push error classification" "$(grep -E 'ERROR' <<<"$out" | head -2 | tr '\n' ' ')"
 fi
-if local_log | grep -q "agent: sync"; then
+if retry_grep "agent: sync" local_log; then
   ok "the commit is kept locally for the next retry"
 else
-  bad "commit retention" "commit was lost"
+  bad "commit retention" "commit was lost -- local_log=$(tr '\n' '|' <<<"$(local_log)")"
 fi
 
 # --- 8. runaway guard -------------------------------------------------------
@@ -259,8 +273,9 @@ fi
 reset_fixture
 echo "local only" > "$FIX/repo/shared/local.txt"
 push_false_out=$(sidecar -e PUSH=false)
+retry_grep "agent: sync" local_log; committed_ok=$?
 llog="$(local_log)"; rfiles="$(remote_files)"
-if grep -q "agent: sync" <<<"$llog" && ! grep -q "local.txt" <<<"$rfiles"; then
+if [[ $committed_ok -eq 0 ]] && ! grep -q "local.txt" <<<"$rfiles"; then
   ok "PUSH=false commits locally without pushing"
 else
   # Diagnostic dump -- this check has failed intermittently in CI without an

@@ -187,14 +187,16 @@ def functional() -> None:
         "get_folder_info", "list_files", "stat_file", "read_file",
         "write_file", "delete_file", "make_directory", "move_file",
         "copy_file", "begin_write", "write_chunk", "commit_write", "abort_write",
+        "request_upload", "upload_status",
     }
     if expected <= tools:
-        R.ok("func", "all eight tools are registered", f"({sorted(tools)})")
+        R.ok("func", "all expected tools are registered", f"({sorted(tools)})")
     else:
         R.bad("func", "tool registration", f"got {sorted(tools)}, missing {expected - tools}")
 
     status, is_err, info = call_tool("get_folder_info", {})
-    if status == 200 and not is_err and info.get("token_scope") == "rw":
+    if status == 200 and not is_err and info.get("token_scope") == "rw" \
+            and info.get("writes_allowed") is True:
         R.ok("func", "get_folder_info reports rw scope for the full token")
     else:
         R.bad("func", "get_folder_info", f"status {status} is_err {is_err} -> {info!r}"[:200])
@@ -283,6 +285,19 @@ def functional() -> None:
                 R.bad("func", f"read-only token refuses {tool}", f"is_err {is_err} -> {payload!r}"[:200])
         if all_refused:
             R.ok("func", "read-only token refuses every write tool, same message as REST")
+
+        _s, _e, payload = call_tool("write_file", {"path": "ro-should-fail.txt", "content": "x"},
+                                    token=RO_TOKEN)
+        if "read-write token" in str(payload) and "get_folder_info" in str(payload):
+            R.ok("func", "read-only refusal tells the agent what to do next")
+        else:
+            R.bad("func", "read-only refusal message", f"{payload!r}"[:200])
+
+        _s, is_err, info = call_tool("get_folder_info", {}, token=RO_TOKEN)
+        if not is_err and info.get("token_scope") == "ro" and info.get("writes_allowed") is False:
+            R.ok("func", "get_folder_info reports ro scope and writes_allowed=false")
+        else:
+            R.bad("func", "get_folder_info ro scope", f"{info!r}"[:200])
 
         status, is_err, out = call_tool("list_files", {}, token=RO_TOKEN)
         if not is_err:
@@ -967,6 +982,105 @@ def escapes() -> None:
         R.bad("mcp-escape", "recursive delete_file through symlink", "DESTROYED FILES OUTSIDE THE FOLDER")
 
 
+# ==========================================================================
+# UPLOAD URLS -- request_upload / upload_status (docs/upload-urls.md)
+# ==========================================================================
+
+def _put_url(url: str, body: bytes) -> tuple[int, Any]:
+    """PUT to a ticket's upload_url with no Authorization header, as curl would."""
+    from urllib.parse import urlsplit
+    u = urlsplit(url)
+    conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=30)
+    try:
+        conn.request("PUT", u.path, body=body, headers={"Content-Type": "application/octet-stream"})
+        resp = conn.getresponse()
+        raw = resp.read()
+        try:
+            return resp.status, json.loads(raw)
+        except json.JSONDecodeError:
+            return resp.status, raw
+    finally:
+        conn.close()
+
+
+def upload_url_tests() -> None:
+    print(f"\n{YELLOW}UPLOAD URLS -- request_upload / upload_status{RESET}")
+
+    payload = os.urandom(300_000)
+    digest = hashlib.sha256(payload).hexdigest()
+    _s, is_err, t = call_tool("request_upload", {"path": "mcp-ticket/deep/file.bin"})
+    if is_err or not isinstance(t, dict) or "upload_url" not in t:
+        R.bad("upload", "request_upload issues a ticket", f"{t!r}"[:200])
+        return
+    R.ok("upload", "request_upload issues a ticket with upload_url and curl_command") \
+        if "<LOCAL_FILE>" in t.get("curl_command", "") \
+        else R.bad("upload", "curl_command", f"{t.get('curl_command')!r}")
+
+    _s, is_err, st = call_tool("upload_status", {"upload_id": t["upload_id"]})
+    R.ok("upload", "upload_status reports pending before the PUT") \
+        if not is_err and st.get("state") == "pending" \
+        else R.bad("upload", "pending status", f"{st!r}"[:200])
+
+    status, body = _put_url(t["upload_url"], payload)
+    on_disk = REPO / "shared" / "mcp-ticket" / "deep" / "file.bin"
+    if status == 200 and isinstance(body, dict) and body.get("sha256") == digest \
+            and on_disk.read_bytes() == payload:
+        R.ok("upload", "300 KB binary via upload_url lands byte-identical, sha256 returned")
+    else:
+        R.bad("upload", "PUT to upload_url", f"status {status} -> {str(body)[:200]!r}")
+
+    _s, is_err, st = call_tool("upload_status", {"upload_id": t["upload_id"]})
+    R.ok("upload", "upload_status reports complete with matching sha256") \
+        if not is_err and st.get("state") == "complete" and st.get("sha256") == digest \
+        and st.get("size") == len(payload) \
+        else R.bad("upload", "complete status", f"{st!r}"[:200])
+
+    status, _b = _put_url(t["upload_url"], b"again")
+    R.ok("upload", "reusing the upload_url -> 409") if status == 409 \
+        else R.bad("upload", "reuse", f"status {status}")
+
+    _s, is_err, t2 = call_tool("request_upload", {
+        "path": "mcp-ticket/checked.txt", "expect_sha256": "0" * 64,
+    })
+    if not is_err:
+        status, _b = _put_url(t2["upload_url"], b"not matching")
+        exists = (REPO / "shared" / "mcp-ticket" / "checked.txt").exists()
+        R.ok("upload", "expect_sha256 mismatch -> 422, nothing written") \
+            if status == 422 and not exists \
+            else R.bad("upload", "expect_sha256 mismatch", f"status {status} exists {exists}")
+    else:
+        R.bad("upload", "request_upload with expect_sha256", f"{t2!r}"[:200])
+
+    _s, is_err, out = call_tool("request_upload", {
+        "path": "mcp-ticket/deep/file.bin", "overwrite": False,
+    })
+    R.ok("upload", "overwrite=false onto an existing file refused at request time") \
+        if is_err and "exists" in str(out) \
+        else R.bad("upload", "overwrite=false", f"{out!r}"[:200])
+
+    _s, is_err, out = call_tool("upload_status", {"upload_id": "u_nope"})
+    R.ok("upload", "upload_status on an unknown id is an error") if is_err \
+        else R.bad("upload", "unknown id", f"{out!r}"[:200])
+
+    if RO_TOKEN:
+        _s, is_err, out = call_tool("request_upload", {"path": "mcp-ticket/ro.bin"}, token=RO_TOKEN)
+        R.ok("upload", "read-only token refuses request_upload") \
+            if is_err and "read-only" in str(out) \
+            else R.bad("upload", "ro request_upload", f"{out!r}"[:200])
+
+    for label, path in [
+        ("traversal", "../outside.txt"),
+        ("absolute", "/etc/passwd"),
+        (".git component", ".git/config"),
+        ("symlinked parent", "escape-dir/escape.txt"),
+    ]:
+        _s, is_err, out = call_tool("request_upload", {"path": path})
+        if is_err and not leaked(out):
+            R.ok("mcp-escape", f"request_upload refuses {label} path")
+        else:
+            R.bad("mcp-escape", f"request_upload {label}", f"{out!r}"[:200])
+
+
 def main() -> int:
     print(f"{YELLOW}claude-files MCP connector containment suite{RESET}  mode={MODE}  target={BASE}")
 
@@ -975,6 +1089,7 @@ def main() -> int:
     integrity_floor()
     chunked_writes()
     copy_tests()
+    upload_url_tests()
     escapes()
     after = snapshot()
 

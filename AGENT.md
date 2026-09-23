@@ -9,11 +9,13 @@ files too large or too binary for a tool result (the connector's tools say so
 explicitly when that happens, and name the REST endpoint below to use
 instead).
 
-If the connector's `write_file` refuses a file as too large (or your own
-output would clearly overrun a few KB in one call), use its
-`begin_write`/`write_chunk`/`commit_write`/`abort_write` tools instead of
-forcing it through one inline call — `commit_write` needs the byte count or a
-sha256 hash to verify against. Copying a file that's already in the folder?
+**Uploading a file that already exists on your machine? Use the connector's
+`request_upload` tool** and run the `curl` command it returns — see
+"Uploading an existing file" below. Never paste a file's contents into
+`write_file` or `write_chunk`; that's what makes large uploads slow and
+corrupts them. `write_file` is for short text you're composing in the call.
+`begin_write`/`write_chunk`/`commit_write` are a last resort for surfaces
+with no shell at all. Copying a file that's already in the folder?
 Use `copy_file` (or `POST /v1/copy` below) instead of reading it out and
 writing it back in — the bytes never pass through your context either way.
 
@@ -25,8 +27,60 @@ into the conversation: reports, generated data, build artifacts, logs.
 (or `X-API-Key: $CLAUDE_FILES_TOKEN` — the header the MCP connector dialog uses;
 `Authorization` is the documented primary and wins if both are sent).
 
+**Check whether your token can write before you try.** Call the
+connector's `get_folder_info` (or `GET /v1/info`): `writes_allowed: false`
+means a read-only token. Reads still work, but every write is refused with a
+`readonly` error, and retrying won't change that. Tell the user the task needs
+a read-write token.
+
 The token is a credential. Never write it into a file you upload, never put
 it in a URL or query string, and never echo it into output that gets saved.
+
+## Uploading an existing file
+
+If the file already exists on disk (you didn't just generate its content),
+**don't paste its bytes into a tool call.** For anything over a few KB that's
+slow and error-prone: every byte costs output tokens, and re-typing dense
+text or base64 drops or corrupts characters. Use this three-step flow
+instead — the bytes go straight from your shell to the server and never pass
+through you:
+
+1. **Request a ticket.** With the MCP connector, call
+   `request_upload(path="reports/q3/data.parquet")` — it returns the same
+   fields as the REST call below, and your shell never needs the bearer
+   token. Over REST (needs the bearer token):
+
+   ```
+   POST /v1/uploads
+   {"path": "reports/q3/data.parquet"}
+   -> {"upload_id": "u_3f9c…",
+       "upload_url": "https://.../v1/uploads/u_3f9c…/<secret>",
+       "curl_command": "curl -sS --fail-with-body -T <LOCAL_FILE> 'https://.../v1/uploads/u_3f9c…/<secret>'",
+       "expires_at": 1790000000.0, "max_bytes": 268435456}
+   ```
+
+2. **Run the `curl_command` from your shell**, with the local path filled in.
+   No `Authorization` header, no bearer token — the secret in the URL is the
+   one-time authorization for that upload, and it's good for one file, once.
+
+   ```
+   curl -sS --fail-with-body -T ./data.parquet 'https://.../v1/uploads/u_3f9c…/<secret>'
+   -> {"ok": true, "upload_id": "u_3f9c…", "path": "reports/q3/data.parquet",
+       "size": 52428800, "sha256": "..."}
+   ```
+
+3. **Verify.** Compare `sha256sum ./data.parquet` against the `sha256` in
+   that response, or call the connector's `upload_status(upload_id)` /
+   poll `GET /v1/uploads/{upload_id}` (bearer token required) if you want to check progress on a large upload first —
+   `bytes_received` climbs while it streams, then `state` becomes `complete`.
+
+If you have a shell and the bearer token but no local `curl_command` handy,
+the equivalent is `curl -H "Authorization: Bearer $CLAUDE_FILES_TOKEN" --data-binary @file -X PUT "$API/v1/content/<path>?parents=true"` —
+same idea, just authenticated with the long-lived token instead of a
+one-time ticket.
+
+A ticket is for one path, once: it expires if you never use it, and a second
+upload against the same ticket is rejected.
 
 ## Paths
 
@@ -52,7 +106,10 @@ different approach.
 | `POST` | `/v1/mkdir/{path}` | Create a directory (parents created by default) |
 | `POST` | `/v1/move` | Body: `{"src":"a.txt","dst":"b.txt","overwrite":false,"parents":false}` |
 | `POST` | `/v1/copy` | Body: `{"src":"a.txt","dst":"b.txt","overwrite":false,"parents":false}` — server-side copy, no size ceiling |
-| `GET` | `/v1/info` | Current limits and policy |
+| `POST` | `/v1/uploads` | Create a one-time upload ticket for an existing local file |
+| `PUT`/`POST` | `/v1/uploads/{id}/{secret}` | Upload the bytes for a ticket. **No bearer token.** |
+| `GET` | `/v1/uploads/{id}` | Ticket status and progress |
+| `GET` | `/v1/info` | Current limits and policy, plus this token's `token_scope` (`rw`/`ro`) and `writes_allowed` |
 | `GET` | `/v1/bridge.py` | Download the local upload/download bridge — see "Uploading a file you generated" |
 
 Full spec: `GET /openapi.json`.
@@ -135,10 +192,11 @@ Every error is JSON: `{"code":"...","message":"..."}`.
 |---|---|
 | `401` | Missing or wrong token |
 | `403` | Path rejected (`traversal`, `absolute_path`, `symlink`, `denied_name`) or token is read-only |
-| `404` | File doesn't exist |
-| `409` | `no_parent` (retry with `?parents=true`), `POST` onto an existing file, or deleting a non-empty dir without `?recursive=true` |
+| `404` | File doesn't exist, or (on `/v1/uploads/{id}/{secret}`) a bad ticket id or secret |
+| `409` | `no_parent` (retry with `?parents=true`), `POST` onto an existing file, deleting a non-empty dir without `?recursive=true`, or reusing an upload ticket that isn't `pending` |
+| `410` | An upload ticket expired before it was used — request a new one |
 | `413` | Body exceeds the upload limit |
-| `422` | `integrity_mismatch` — you sent `X-Expect-Bytes`/`X-Expect-Sha256` and what arrived didn't match. Nothing was written; retry with the real content |
+| `422` | `integrity_mismatch` — you sent `X-Expect-Bytes`/`X-Expect-Sha256` and what arrived didn't match; or `sha_mismatch` — an upload ticket's bytes didn't match its `expect_sha256`. Nothing was written either way |
 | `429` | Rate limited — back off and retry |
 | `507` | Out of disk space or quota |
 
@@ -151,6 +209,9 @@ path hoping to get through; fix the path or stop.
 - Rate limit **600 requests/minute** shared across all clients.
 - `.git`, `.gitmodules`, and `.ssh` are refused as path components anywhere.
 - Filenames matching `.upload-*.tmp` are reserved; don't create them.
+- An upload ticket is good for one path, once, and expires 15 minutes after
+  creation if never used (`/v1/info` reports the live TTL and how many
+  tickets can be outstanding at once).
 
 ## This folder is a git repository
 

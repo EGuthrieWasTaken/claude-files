@@ -210,6 +210,48 @@ class Vault:
     def components(self, raw: str) -> list[str]:
         return split_components(raw, denied_names=self.denied_names)
 
+    def precheck_new_path(self, parts: list[str]) -> None:
+        """Walk whatever ancestors of ``parts`` already exist and reject a
+        symlink among them, without requiring the full path to exist.
+
+        ``components()`` only validates the string syntactically -- it can't
+        see that e.g. a middle directory is actually a symlink, since that
+        takes a syscall. This does that walk, but treats "this ancestor
+        doesn't exist yet" as fine rather than an error, since a write with
+        ``parents=true`` will create it later. Used by upload-ticket creation
+        to reject a symlinked ancestor as early as possible, before an agent
+        is told to upload anything.
+        """
+        if not parts:
+            return
+        fd = os.dup(self._root_fd)
+        try:
+            for depth, part in enumerate(parts[:-1]):
+                try:
+                    nxt = os.open(part, _O_DIR, dir_fd=fd)
+                except OSError as exc:
+                    if exc.errno == errno.ENOENT:
+                        return
+                    where = join_components(parts[: depth + 1])
+                    if exc.errno == errno.ENOTDIR:
+                        try:
+                            st = os.stat(part, dir_fd=fd, follow_symlinks=False)
+                            if stat.S_ISLNK(st.st_mode):
+                                raise Denied(
+                                    "symlink", f"Refusing to follow a symlink in '{where}'"
+                                ) from exc
+                        except OSError:
+                            pass
+                    raise _translate_oserror(exc, f"'{where}'") from exc
+                os.close(fd)
+                fd = nxt
+                self._assert_same_device(fd, join_components(parts[: depth + 1]))
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
     @contextmanager
     def _dir_fd(self, parts: list[str]) -> Iterator[int]:
         """Open the directory named by ``parts``, walking one component at a

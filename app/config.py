@@ -55,6 +55,9 @@ class Config:
     mcp_upload_session_ttl_seconds: int = 900
     mcp_max_concurrent_uploads: int = 8
     mcp_upload_chunk_advisory_bytes: int = 3072
+    upload_ticket_ttl_seconds: int = 900
+    upload_tickets_max: int = 100
+    public_base_url: str = ""
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -92,4 +95,7 @@ class Config:
             mcp_upload_session_ttl_seconds=_env_int("MCP_UPLOAD_SESSION_TTL_SECONDS", 900),
             mcp_max_concurrent_uploads=_env_int("MCP_MAX_CONCURRENT_UPLOADS", 8),
             mcp_upload_chunk_advisory_bytes=_env_int("MCP_UPLOAD_CHUNK_ADVISORY_BYTES", 3072),
+            upload_ticket_ttl_seconds=_env_int("UPLOAD_TICKET_TTL_SECONDS", 900),
+            upload_tickets_max=_env_int("UPLOAD_TICKETS_MAX", 100),
+            public_base_url=os.environ.get("PUBLIC_BASE_URL", "").strip(),
         )

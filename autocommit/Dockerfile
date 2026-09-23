@@ -3,7 +3,7 @@
 FROM alpine:3.21
 
 LABEL org.opencontainers.image.title="claude-files-autocommit" \
-      org.opencontainers.image.description="Polls a subfolder of a git repo and commits/pushes changes" \
+      org.opencontainers.image.description="Polls a git repo (or one subfolder of it) and commits/pushes changes" \
       org.opencontainers.image.source="https://hub.docker.com/r/eguthriewastaken2/claude-files"
 
 # findutils for GNU find (-newermt); busybox find lacks it.

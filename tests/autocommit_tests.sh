@@ -252,13 +252,13 @@ fi
 # --- 9. startup validation --------------------------------------------------
 reset_fixture
 allref=0
-for entry in "empty SUBDIR|" "repo root|." "absolute|/etc" "traversal|shared/../.."; do
+for entry in "empty SUBDIR|" "absolute|/etc" "traversal|shared/../.."; do
   label="${entry%%|*}"; value="${entry#*|}"
   out=$(docker run --rm "${DOCKER_USER[@]}" -v "$FIX:/work" -e REPO_PATH=/work/repo \
         -e SUBDIR="$value" -e RUN_ONCE=true "$IMG" 2>&1); rc=$?
   if [[ $rc -eq 0 ]]; then bad "validation: $label" "started anyway"; allref=1; fi
 done
-[[ $allref -eq 0 ]] && ok "refuses every unsafe SUBDIR (empty, '.', absolute, '..')"
+[[ $allref -eq 0 ]] && ok "refuses every unsafe SUBDIR (empty, absolute, '..')"
 
 reset_fixture
 out=$(inc 'cd /work/repo && git checkout -q --detach HEAD' 2>&1)
@@ -291,6 +291,56 @@ if ! local_log | grep -q "agent: sync"; then
   ok "DRY_RUN makes no commit"
 else
   bad "DRY_RUN" "committed anyway"
+fi
+
+# --- 11. SUBDIR=. commits the whole repository -----------------------------
+reset_fixture
+echo "TAMPERED"   > "$FIX/repo/src/app.py"
+echo "top level"  > "$FIX/repo/new.txt"
+echo "*.log"      > "$FIX/repo/.gitignore"
+echo "noise"      > "$FIX/repo/app.log"
+echo "partial"    > "$FIX/repo/.upload-top.tmp"
+echo "partial"    > "$FIX/repo/src/.upload-deep.tmp"
+out=$(sidecar -e SUBDIR=.)
+rf="$(remote_files)"
+if grep -q "whole repository" <<<"$out" \
+   && grep -q "^new.txt$" <<<"$rf" && grep -q "^.gitignore$" <<<"$rf" \
+   && [[ "$(inc 'git -C /work/remote.git show HEAD:src/app.py')" == "TAMPERED" ]]; then
+  ok "SUBDIR=. commits changes anywhere in the repository"
+else
+  bad "whole-repo mode" "remote=$(tr '\n' ' ' <<<"$rf") out=$(tr '\n' '|' <<<"$out")"
+fi
+if grep -q "^new.txt$" <<<"$rf" && ! grep -q "app.log" <<<"$rf" && ! grep -q "upload-" <<<"$rf"; then
+  ok "SUBDIR=. honours .gitignore and excludes .upload-*.tmp at every depth"
+else
+  bad "whole-repo exclusions" "remote=$(tr '\n' ' ' <<<"$rf")"
+fi
+
+# An ignored file that is always being written (a log, a database) must not
+# hold the quiet period open forever: only files git would commit count.
+reset_fixture
+echo "*.log"   > "$FIX/repo/.gitignore"
+echo "settled" > "$FIX/repo/settled.txt"
+touch -d '-5 minutes' "$FIX/repo/.gitignore" "$FIX/repo/settled.txt"
+echo "churn"   > "$FIX/repo/app.log"
+out=$(sidecar -e SUBDIR=. -e QUIET_PERIOD=60)
+if remote_files | grep -q "^settled.txt$"; then
+  ok "a freshly written ignored file does not defer the commit"
+else
+  bad "quiet period vs ignored files" "out=$(tr '\n' '|' <<<"$out")"
+fi
+
+# Same in subfolder mode, which walked the folder before and had this bug too.
+reset_fixture
+echo "*.log"   > "$FIX/repo/shared/.gitignore"
+echo "settled" > "$FIX/repo/shared/settled.txt"
+touch -d '-5 minutes' "$FIX/repo/shared/.gitignore" "$FIX/repo/shared/settled.txt"
+echo "churn"   > "$FIX/repo/shared/app.log"
+out=$(sidecar -e QUIET_PERIOD=60)
+if remote_files | grep -q "^shared/settled.txt$"; then
+  ok "...nor in subfolder mode"
+else
+  bad "quiet period vs ignored files (subfolder)" "out=$(tr '\n' '|' <<<"$out")"
 fi
 
 # ===========================================================================

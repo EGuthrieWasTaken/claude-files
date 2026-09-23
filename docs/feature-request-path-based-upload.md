@@ -1,10 +1,16 @@
 # Feature request: path-based upload (a local bridge), so binary files never pass through a model's output
 
-**Status: proposed.** Nothing here is built yet. This document is written to be
-implemented without further design work — every file, signature, header, error
-string, and test is named. Where a decision could reasonably go either way, the
-decision is made here and the losing option is recorded at the end rather than
-left open.
+**Status: implemented, except the Part 0 deploy step itself.** Part 1 (the
+bridge), Part 2 (the server-side integrity/delivery/discoverability surface),
+and Part 3 (documentation) are all shipped — `bridge/claude_files_bridge.py`,
+`app/main.py`, `app/mcp_endpoint.py`, `tests/bridge_tests.py`, the
+`Dockerfile`/CI/`docker-compose.yml` wiring, and every doc this brief named.
+**Part 0's code changes (the version bump) are in; the actual `docker buildx
+build --push` and unRAID redeploy are operator actions this repository
+cannot perform on its own** — see "Implementation notes" at the end for
+exactly what that leaves outstanding. What differed from the brief below,
+and why, is also recorded there — read that before assuming the text above
+still describes the code exactly.
 
 Follows [`docs/plan-mcp-connector.md`](plan-mcp-connector.md) (shipped) and
 [`docs/plan-mcp-large-writes.md`](plan-mcp-large-writes.md) (shipped in commit
@@ -793,3 +799,86 @@ Say these plainly in `bridge/README.md` rather than letting them be discovered.
    that the recipe needs a header, which is one more thing for an agent to get
    right. If real use shows agents fumbling it, unauthenticated is defensible —
    the file is public source — but change it deliberately, not by accident.
+
+---
+
+## Implementation notes
+
+Recorded after building Parts 1-3, so the reasoning that survives isn't just
+what was planned but what actually shipped, what differs, and what is
+deliberately left for a human to do outside this repository.
+
+- **Part 0's code changes shipped; the deploy did not, and cannot from
+  here.** `app/main.py`'s `version` is `"1.1.0"`, and `docker-compose.yml`'s
+  image pin follows it. Building and pushing the multi-arch image
+  (`docker buildx build --platform linux/amd64,linux/arm64 ... --push`,
+  README.md "Publishing a new version") requires Docker Hub credentials,
+  and redeploying to the unRAID host requires access to that host — neither
+  is available to whatever built this change. **Whoever merges this must
+  still run those two steps and then verify from a client** exactly as Part
+  0 specifies: `GET /health` reports `"version":"1.1.0"`, `GET /v1/info`
+  reports `bridge_available:true`, and a claude.ai connector's tool cache is
+  refreshed (remove and re-add it) if it still shows the old tool list.
+  Until that happens, the live server is still whatever it was before this
+  change, and Part 1's bridge is fully functional against it regardless
+  (it degrades gracefully — see the next point) but not verified
+  end-to-end.
+- **Every exception type maps to exactly one CLI exit code**, via a single
+  `exit_code` class attribute on a `BridgeError` base (`UsageError=1`,
+  `LocalFileError=2`, `ServerRefusal=3`, `TransportError=4`,
+  `IntegrityError=5`) rather than a lookup table the CLI dispatcher and the
+  raising code could drift apart on.
+- **`from __future__ import annotations` was dropped from the bridge
+  module**, contradicting this brief's own Part 1 text ("Python 3.9+
+  (`from __future__ import annotations` ...)"). Building `_serve()` with it
+  present reproduces, in the bridge itself, the exact `mcp==1.12.4`
+  tool-registration crash `app/mcp_endpoint.py`'s module docstring already
+  documents: `Tool.from_function()` calls `issubclass(param.annotation,
+  Context)` on a bare string once annotations are deferred, and that raises
+  `TypeError` for every parameter, not just `Context`-typed ones — verified
+  by actually running `serve` against the pinned SDK version, which crashed
+  on import before this fix and runs clean after. Python 3.9 compatibility
+  is unaffected: every annotation in the module already used `Optional[X]`
+  (never `X | Y`) and `dict[...]`/`tuple[...]` (PEP 585, runtime-valid since
+  3.9 independent of PEP 563), so removing the future import needed no
+  other change.
+- **Remote-path validation runs before any network call, including the
+  `GET /v1/info` size-cap fetch** — not just before the upload request
+  itself. The brief's ordering (stat, hash, size-cap check via `/v1/info`,
+  *then* quote/validate the path) would spend a round trip discovering a
+  `..`/NUL segment that's rejectable with zero network access; validating
+  the path immediately after hashing avoids that.
+- **`remote_path` values that merely *look* hostile but contain no literal
+  `.`/`..` segment or NUL byte are not client-side-refused, by design, and
+  this is not a gap.** `/etc/cron.d/x` and `..%2Fescape.txt` (a *literal*,
+  un-decoded string — the bridge never URL-decodes its own argument) both
+  split into ordinary path segments once run through "Remote path
+  handling", and land as ordinary files *inside* the vault
+  (`shared/etc/cron.d/x`, `shared/..%2Fescape.txt`) — verified against a
+  running server. `remote_path` being "always relative to the shared
+  folder root" means there is no argument shape that reaches outside it;
+  containment is the server's job (`app/safepath.py`) exactly as this
+  document already says, and duplicating a check for inputs that are
+  provably inert would be exactly the "two copies disagree" risk this
+  document warns against elsewhere.
+- **Testing `X-Expect-Bytes` failing independently of the
+  Content-Length-vs-X-Expect-Bytes pre-check needs a body sent without a
+  `Content-Length` header at all** (`tests/bridge_tests.py`'s
+  `rest_put_chunked`, using `Transfer-Encoding: chunked`) — any client that
+  *does* declare `Content-Length` necessarily declares the true length of
+  what it sends, so a mismatched `X-Expect-Bytes` is always caught by the
+  earlier, cheaper header comparison first. The post-stream check exists
+  for exactly the case a well-behaved test client can't easily fake: a
+  declared length that goes unmet because the connection dropped partway
+  through.
+- **Verified end-to-end against a real running server** (not just
+  `py_compile`): the full REST integrity flow (`PUT` with correct and
+  incorrect `X-Expect-Bytes`/`X-Expect-Sha256`, the malformed-header 400,
+  `sha256` in `OkResponse`), `GET /v1/bridge.py` (200 with auth, 401
+  without, and `GET /v1/content/bridge.py` staying a normal 404 — proving
+  the script is served from the image, never the vault), the `bridge`
+  block in `get_folder_info` and `bridge_available` in `/v1/info`,
+  `write_file`'s updated refusal text, and the bridge's own `upload`/
+  `download`/`check`/CLI/`serve` paths against that server — plus that
+  `tests/escape_suite.py` and `tests/mcp_escape_suite.py` still pass
+  unchanged against the modified `app/main.py`/`app/mcp_endpoint.py`.

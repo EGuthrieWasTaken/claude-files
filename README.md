@@ -156,16 +156,26 @@ path is relative to the shared folder root.
 | `GET` | `/v1/stat/{path}` | Type, size, mtime for one path. |
 | `GET` | `/v1/content/{path}` | Download a file. |
 | `HEAD` | `/v1/content/{path}` | Size and mtime as headers. |
-| `PUT` | `/v1/content/{path}` | Create **or replace**. Raw body. `?parents=true` to create missing parents. |
-| `POST` | `/v1/content/{path}` | Create only; `409` if it exists. `?parents=true`. |
+| `PUT` | `/v1/content/{path}` | Create **or replace**. Raw body. `?parents=true` to create missing parents. Optional `X-Expect-Bytes` / `X-Expect-Sha256` headers, verified before the rename — see below. |
+| `POST` | `/v1/content/{path}` | Create only; `409` if it exists. `?parents=true`. Same optional `X-Expect-Bytes` / `X-Expect-Sha256`. |
 | `DELETE` | `/v1/content/{path}` | Delete a file or dir. `?recursive=true` for non-empty dirs. |
 | `POST` | `/v1/mkdir/{path}` | Create a directory. `?parents=true` by default. |
 | `POST` | `/v1/move` | `{"src":…, "dst":…, "overwrite":false, "parents":false}` |
 | `POST` | `/v1/copy` | `{"src":…, "dst":…, "overwrite":false, "parents":false}` — server-side copy, no size ceiling. |
+| `GET` | `/v1/bridge.py` | Download the local upload/download bridge — see [Uploading binary files: the local bridge](#uploading-binary-files-the-local-bridge). |
 | `POST`/`GET`/`DELETE` | `/mcp` | Optional Streamable HTTP MCP connector — see [MCP connector](#mcp-connector). |
 
 Writes are atomic: content goes to a temp file in the destination directory
 and is `rename()`d into place, so a reader never sees a half-written file.
+
+Optionally send `X-Expect-Bytes: <n>` and/or `X-Expect-Sha256: <64 hex
+chars>` on a `PUT`/`POST` — verified against what was actually streamed,
+*before* the rename, so a request that arrives complete but wrong (a
+truncated proxy response, a file mutated mid-upload) is a clean `422
+integrity_mismatch` refusal instead of a silently short or wrong file.
+Every successful write's `OkResponse` carries `sha256` regardless of
+whether you sent either header, so a caller can confirm what actually
+landed without computing anything itself.
 
 ```bash
 TOKEN=your-token-here
@@ -255,6 +265,62 @@ root-cause writeup. Two things fix it:
 `get_folder_info` reports all of the above (`mcp_base64_limit_bytes` and a
 note that it's advisory, plus `mcp_upload_chunk_advisory_bytes`) so a caller
 never has to guess.
+
+### Uploading binary files: the local bridge
+
+The constraint above ("Tool results are JSON in a model's context window")
+means every MCP write is generated as base64 by the calling model, and the
+binding limit on that is the model's own per-call **output** ceiling —
+observed well under 10 KB — not any setting on this server.
+`MCP_BASE64_LIMIT_BYTES` and `begin_write`/`write_chunk`/`commit_write` are
+about *this server's* budgets; they cannot raise a ceiling that lives on the
+other side of the connection. Full design brief:
+[`docs/feature-request-path-based-upload.md`](docs/feature-request-path-based-upload.md).
+
+`bridge/claude_files_bridge.py` is a small, stdlib-only client that runs in
+the *agent's own environment* — a cloud workspace, a laptop, anything with a
+filesystem — and streams bytes straight to `PUT`/`GET /v1/content/{path}`,
+never through the model's output. Get it with one authenticated `curl` and
+run it:
+
+```bash
+curl -sf -H "Authorization: Bearer $CLAUDE_FILES_TOKEN" \
+  -o claude_files_bridge.py "$API/v1/bridge.py"
+python3 claude_files_bridge.py upload ./brief.pdf briefs/2026/brief.pdf
+python3 claude_files_bridge.py download briefs/2026/brief.pdf ./brief.pdf
+```
+
+As a local MCP server (Claude Code desktop, cloud sessions, IDE) it exposes
+three tools instead — `upload_file`, `download_file`, and `bridge_status`
+(call this one first if an upload fails; it diagnoses the URL, token, proxy,
+CA bundle, and server limits in one call):
+
+```json
+{
+  "mcpServers": {
+    "claude-files-bridge": {
+      "command": "python3",
+      "args": ["/absolute/path/to/claude_files_bridge.py", "serve"],
+      "env": {
+        "CLAUDE_FILES_URL": "https://files.example.com",
+        "CLAUDE_FILES_TOKEN_FILE": "/absolute/path/to/claude-files.token"
+      }
+    }
+  }
+}
+```
+
+Full install/config/exit-code reference: `bridge/README.md`. **The bridge
+runs on the agent's machine and holds the token there** — only configure it
+somewhere that token already belongs. It does not replace
+`begin_write`/`write_chunk`/`commit_write`, which remain the only path on a
+surface with no shell and no local process at all (e.g. the claude.ai web
+app talking only to the remote connector) — the bridge *supplements* the
+chunked path, it doesn't retire it.
+
+`GET /v1/bridge.py` (read auth) hands out the script itself, and `GET
+/v1/info` reports `bridge_available` so a deployment can be confirmed to
+serve it without probing further.
 
 ### Copying within the folder
 
@@ -471,25 +537,37 @@ being refused at startup.
 
 ## Publishing a new version
 
-> **This version's release notes should say:** pulling this image starts
-> serving the [MCP connector](#mcp-connector) at `/mcp` by default (unRAID
-> templates track `:latest`, so this happens without anyone asking for it).
-> It's defensible — `/mcp` is gated by the same `API_TOKEN` as every other
-> route — but say it plainly rather than let it be discovered. Set
-> `ENABLE_MCP=false` to opt out, or build with `--build-arg WITH_MCP=0` for
-> an image that doesn't have the `mcp` package at all.
+> **1.1.0's release notes should say:** the integrity floor
+> (`X-Expect-Bytes`/`X-Expect-Sha256`, `sha256` in every write response) and
+> `GET /v1/bridge.py` (see [the local bridge](#uploading-binary-files-the-local-bridge))
+> are both new in this version — a deployment still running `1.0.0` reports
+> neither, which is exactly the gap
+> [`docs/feature-request-path-based-upload.md`](docs/feature-request-path-based-upload.md)
+> (Part 0) was written against. After redeploying, **verify from a client,
+> not the host**: `GET /health` reports `"version":"1.1.0"`, and `GET
+> /v1/info` reports `bridge_available:true`. If a claude.ai connector still
+> shows the old tool list, its tool cache needs refreshing — remove and
+> re-add the connector.
+
+> **Pulling this image starts serving the [MCP connector](#mcp-connector)**
+> at `/mcp` by default (unRAID templates track `:latest`, so this happens
+> without anyone asking for it). It's defensible — `/mcp` is gated by the
+> same `API_TOKEN` as every other route — but say it plainly rather than let
+> it be discovered. Set `ENABLE_MCP=false` to opt out, or build with
+> `--build-arg WITH_MCP=0` for an image that doesn't have the `mcp` package
+> at all.
 
 The image is multi-arch (`linux/amd64` for unRAID, `linux/arm64` for local
 work on Apple silicon). Build both in one shot and push a single manifest:
 
 ```bash
-docker buildx build --platform linux/amd64,linux/arm64 --tag eguthriewastaken2/claude-files:1.0.0 --tag eguthriewastaken2/claude-files:latest --push .
+docker buildx build --platform linux/amd64,linux/arm64 --tag eguthriewastaken2/claude-files:1.1.0 --tag eguthriewastaken2/claude-files:latest --push .
 ```
 
 Confirm both architectures landed under one tag:
 
 ```bash
-docker buildx imagetools inspect eguthriewastaken2/claude-files:1.0.0
+docker buildx imagetools inspect eguthriewastaken2/claude-files:1.1.0
 ```
 
 The sidecar is a separate image, built the same way:
@@ -503,13 +581,13 @@ a multi-arch image -- the second push replaces the first. If you build
 natively on each host, push arch-suffixed tags and merge them:
 
 ```bash
-docker buildx imagetools create --tag eguthriewastaken2/claude-files:1.0.0 eguthriewastaken2/claude-files:1.0.0-arm64 eguthriewastaken2/claude-files:1.0.0-amd64
+docker buildx imagetools create --tag eguthriewastaken2/claude-files:1.1.0 eguthriewastaken2/claude-files:1.1.0-arm64 eguthriewastaken2/claude-files:1.1.0-amd64
 ```
 
 On Arch Linux, `docker buildx` is a separate package: `sudo pacman -S docker-buildx`.
 
 The unRAID templates pull `:latest`, so always push both tags. `docker-compose.yml`
-stays pinned to `:1.0.0` on purpose — compose deployments should be
+stays pinned to `:1.1.0` on purpose — compose deployments should be
 reproducible, and `:latest` there would silently change what runs on the next
 `up`.
 
@@ -538,3 +616,8 @@ reproducible, and `:latest` there would silently change what runs on the next
 | `MCP_UPLOAD_SESSION_TTL_SECONDS` | `900` | Idle timeout for a `begin_write` session, reaped lazily. |
 | `MCP_MAX_CONCURRENT_UPLOADS` | `8` | Cap on open chunked-upload sessions at once. |
 | `MCP_UPLOAD_CHUNK_ADVISORY_BYTES` | `3072` | Suggested chunk size, reported by `begin_write`/`get_folder_info`. Advisory, not enforced. |
+
+The [local bridge](#uploading-binary-files-the-local-bridge)'s own settings
+(`CLAUDE_FILES_URL`, `CLAUDE_FILES_TOKEN`, etc.) are deliberately not in this
+table — they're *client-side* environment, read by `bridge/claude_files_bridge.py`
+wherever an agent runs it, never by this server. See `bridge/README.md`.

@@ -7,12 +7,15 @@ container bind-mounts one subfolder, and every request is confined to it by
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import logging
 import os
+import re
 import time
 from collections import deque
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated, Any, Iterator
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
@@ -96,7 +99,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="claude-files",
     description=DESCRIPTION,
-    version="1.0.0",
+    version="1.1.0",
     docs_url="/docs" if CONFIG.enable_docs else None,
     redoc_url=None,
     openapi_url="/openapi.json" if CONFIG.enable_docs else None,
@@ -146,6 +149,7 @@ class OkResponse(BaseModel):
     path: str = ""
     size: int | None = None
     created: bool | None = None
+    sha256: str | None = None
 
 
 def _to_model(e: Entry) -> EntryModel:
@@ -271,6 +275,19 @@ def health() -> dict[str, Any]:
     return {"ok": True, "service": "claude-files", "version": app.version}
 
 
+def _bridge_script_path() -> str | None:
+    """Where bridge/claude_files_bridge.py lives, in the image or a source
+    checkout. Fixed paths only -- no request input ever reaches this lookup.
+    See GET /v1/bridge.py, below."""
+    for candidate in (
+        "/srv/bridge/claude_files_bridge.py",
+        str(Path(__file__).resolve().parents[1] / "bridge" / "claude_files_bridge.py"),
+    ):
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
 @app.get("/v1/info", tags=["meta"], summary="Server limits and policy")
 def info(_: ReadAuth) -> dict[str, Any]:
     return {
@@ -280,7 +297,34 @@ def info(_: ReadAuth) -> dict[str, Any]:
         "allow_delete": CONFIG.allow_delete,
         "allow_hardlinked_files": CONFIG.allow_hardlinked_files,
         "mcp_enabled": _mcp_endpoint is not None,
+        "bridge_available": _bridge_script_path() is not None,
     }
+
+
+@app.get("/v1/bridge.py", tags=["meta"], summary="Download the local upload bridge")
+def bridge_script(_: ReadAuth) -> Response:
+    """docs/feature-request-path-based-upload.md, Part 2b: hand out
+    bridge/claude_files_bridge.py so an agent's own environment can stream
+    bytes to PUT /v1/content/{path} directly, never through its own output.
+    Read auth, same as every other route -- the content is open-source
+    client code, but an unauthenticated route is a new unauthenticated
+    surface, and /health is deliberately the only one."""
+    path = _bridge_script_path()
+    if path is None:
+        raise HTTPException(
+            503,
+            detail={
+                "code": "bridge_unavailable",
+                "message": "bridge/claude_files_bridge.py is not packaged in this image",
+            },
+        )
+    with open(path, "rb") as f:
+        data = f.read()
+    return Response(
+        content=data,
+        media_type="text/x-python",
+        headers={"Content-Disposition": 'attachment; filename="claude_files_bridge.py"'},
+    )
 
 
 @app.get("/v1/list", response_model=ListResponse, tags=["read"], summary="List the root")
@@ -351,26 +395,85 @@ def head_content(_: ReadAuth, path: str) -> Response:
     )
 
 
+_SHA256_HEX_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def _parse_expect_bytes(raw: str | None) -> int | None:
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+        if value < 0:
+            raise ValueError
+    except ValueError:
+        raise HTTPException(
+            400, detail={"code": "bad_request", "message": "Invalid X-Expect-Bytes header"}
+        ) from None
+    return value
+
+
+def _parse_expect_sha256(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    if not _SHA256_HEX_RE.match(raw):
+        raise HTTPException(
+            400,
+            detail={
+                "code": "bad_request",
+                "message": "Invalid X-Expect-Sha256 header (expected 64 hex characters)",
+            },
+        )
+    return raw.lower()
+
+
 async def _write_body(
     request: Request, parts: list[str], *, overwrite: bool, create_parents: bool
-) -> int:
+) -> tuple[int, str]:
+    """Stream the request body into place. Returns (bytes written, sha256 hex).
+
+    docs/feature-request-path-based-upload.md, Part 2a: optional
+    X-Expect-Bytes / X-Expect-Sha256 headers are verified against what was
+    actually streamed, AFTER the stream and BEFORE committer.commit(fd) --
+    on a mismatch nothing is renamed into place, so a truncated-then-closed
+    proxy response or a caller sending the wrong file becomes a clean 422
+    refusal instead of a silently wrong file. The sha256 is computed
+    unconditionally (it costs microseconds per MB) so every successful
+    caller gets one back in OkResponse, not just verifying ones.
+    """
     declared = request.headers.get("content-length")
+    declared_int: int | None = None
     if declared is not None:
         try:
-            if int(declared) > CONFIG.max_upload_bytes:
-                raise HTTPException(
-                    413,
-                    detail={
-                        "code": "too_large",
-                        "message": f"Body exceeds MAX_UPLOAD_BYTES ({CONFIG.max_upload_bytes})",
-                    },
-                )
+            declared_int = int(declared)
         except ValueError:
             raise HTTPException(
                 400, detail={"code": "bad_request", "message": "Invalid Content-Length"}
             ) from None
+        if declared_int > CONFIG.max_upload_bytes:
+            raise HTTPException(
+                413,
+                detail={
+                    "code": "too_large",
+                    "message": f"Body exceeds MAX_UPLOAD_BYTES ({CONFIG.max_upload_bytes})",
+                },
+            )
+
+    expect_bytes = _parse_expect_bytes(request.headers.get("x-expect-bytes"))
+    expect_sha256 = _parse_expect_sha256(request.headers.get("x-expect-sha256"))
+    if expect_bytes is not None and declared_int is not None and expect_bytes != declared_int:
+        raise HTTPException(
+            400,
+            detail={
+                "code": "bad_request",
+                "message": (
+                    f"X-Expect-Bytes ({expect_bytes}) does not match Content-Length "
+                    f"({declared_int})"
+                ),
+            },
+        )
 
     written = 0
+    hasher = hashlib.sha256()
     with VAULT.atomic_write(
         parts, overwrite=overwrite, create_parents=create_parents
     ) as (fd, committer):
@@ -386,9 +489,31 @@ async def _write_body(
                         "message": f"Body exceeds MAX_UPLOAD_BYTES ({CONFIG.max_upload_bytes})",
                     },
                 )
+            hasher.update(chunk)
             os.write(fd, chunk)
+        digest = hasher.hexdigest()
+        if expect_bytes is not None and expect_bytes != written:
+            raise HTTPException(
+                422,
+                detail={
+                    "code": "integrity_mismatch",
+                    "message": (
+                        f"Received {written} bytes but X-Expect-Bytes said {expect_bytes}"
+                    ),
+                },
+            )
+        if expect_sha256 is not None and expect_sha256 != digest:
+            raise HTTPException(
+                422,
+                detail={
+                    "code": "integrity_mismatch",
+                    "message": (
+                        f"Computed sha256 {digest} does not match X-Expect-Sha256 {expect_sha256}"
+                    ),
+                },
+            )
         committer.commit(fd)
-    return written
+    return written, digest
 
 
 @app.put("/v1/content/{path:path}", response_model=OkResponse, tags=["write"],
@@ -409,9 +534,9 @@ async def put_content(
     parts = VAULT.components(path)
     if not parts:
         raise PathError(403, "is_root", "Cannot write to the root itself")
-    size = await _write_body(request, parts, overwrite=True, create_parents=parents)
+    size, digest = await _write_body(request, parts, overwrite=True, create_parents=parents)
     log.info("wrote %s (%d bytes)", "/".join(parts), size)
-    return OkResponse(path="/".join(parts), size=size, created=True)
+    return OkResponse(path="/".join(parts), size=size, created=True, sha256=digest)
 
 
 @app.post("/v1/content/{path:path}", response_model=OkResponse, tags=["write"],
@@ -432,9 +557,9 @@ async def post_content(
     parts = VAULT.components(path)
     if not parts:
         raise PathError(403, "is_root", "Cannot write to the root itself")
-    size = await _write_body(request, parts, overwrite=False, create_parents=parents)
+    size, digest = await _write_body(request, parts, overwrite=False, create_parents=parents)
     log.info("created %s (%d bytes)", "/".join(parts), size)
-    return OkResponse(path="/".join(parts), size=size, created=True)
+    return OkResponse(path="/".join(parts), size=size, created=True, sha256=digest)
 
 
 @app.delete("/v1/content/{path:path}", response_model=OkResponse, tags=["write"],

@@ -1,6 +1,6 @@
 services:
   claude-files:
-    image: eguthriewastaken2/claude-files:1.0.0
+    image: eguthriewastaken2/claude-files:1.1.0
     # Uncomment to build from source instead of pulling:
     # build: .
     container_name: claude-files

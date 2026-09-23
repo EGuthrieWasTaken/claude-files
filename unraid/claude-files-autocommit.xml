@@ -20,8 +20,12 @@
     Anything else in the working tree is left alone.
 
     Set Commit Subfolder to the SAME folder that claude-files exposes. The
-    container refuses to start if it is empty, ".", absolute, or contains
-    "..", since any of those would silently widen it to the whole repository.
+    container refuses to start if it is empty, absolute, or contains "..",
+    since any of those would silently widen it to the whole repository.
+
+    It also works as a general autocommit for any git repository on the
+    server: set Commit Subfolder to "." and it commits everything in the
+    repository that .gitignore does not exclude.
 
     It polls rather than using inotify on purpose: unRAID's /mnt/user is a
     FUSE layer and inotify through it silently drops events, which would mean
@@ -44,7 +48,7 @@
           Type="Path" Display="always" Required="true" Mask="false"></Config>
 
   <Config Name="Commit Subfolder" Target="SUBDIR" Default="shared" Mode=""
-          Description="Folder to commit, RELATIVE to the repository root. Must match the folder claude-files exposes. Every git add is scoped to this path. The container refuses to start if this is empty, '.', absolute, or contains '..'."
+          Description="Folder to commit, RELATIVE to the repository root. Must match the folder claude-files exposes. Every git add is scoped to this path. Set to '.' to commit the whole repository (anything .gitignore does not exclude). The container refuses to start if this is empty, absolute, or contains '..'."
           Type="Variable" Display="always" Required="true" Mask="false">shared</Config>
 
   <Config Name="Poll Interval (seconds)" Target="INTERVAL" Default="120" Mode=""
@@ -52,7 +56,7 @@
           Type="Variable" Display="always" Required="false" Mask="false">120</Config>
 
   <Config Name="Quiet Period (seconds)" Target="QUIET_PERIOD" Default="30" Mode=""
-          Description="Skip the commit if any file changed this recently, so a burst of uploads becomes one commit instead of catching a half-finished batch. 0 disables."
+          Description="Skip the commit if any file to be committed changed this recently, so a burst of uploads becomes one commit instead of catching a half-finished batch. Files ignored by .gitignore do not count. 0 disables."
           Type="Variable" Display="always" Required="false" Mask="false">30</Config>
 
   <Config Name="Git Branch" Target="GIT_BRANCH" Default="main" Mode=""

@@ -81,7 +81,7 @@ services:
   # folder the API can write. Anything else in the working tree is left alone.
   # ------------------------------------------------------------------------
   autocommit:
-    image: eguthriewastaken2/claude-files-autocommit:1.0.0
+    image: eguthriewastaken2/claude-files-autocommit:1.1.0
     # build: ./autocommit
     container_name: claude-files-autocommit
     restart: unless-stopped
@@ -98,6 +98,7 @@ services:
     environment:
       REPO_PATH: "/repo"
       # Must match the folder claude-files exposes, relative to the repo root.
+      # "." commits the whole repository (general-purpose autocommit mode).
       SUBDIR: "shared"
       INTERVAL: "120"
       QUIET_PERIOD: "30"

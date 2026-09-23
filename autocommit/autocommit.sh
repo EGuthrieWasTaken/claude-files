@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 #
-# Poll a subfolder of a git repository and commit + push whatever appears.
+# Poll a git repository (or one subfolder of it) and commit + push whatever
+# appears.
 #
 # Pairs with claude-files: point both at the same folder and anything an
-# agent uploads lands in git on its own.
+# agent uploads lands in git on its own. With SUBDIR=. it commits the whole
+# working tree instead, as a general-purpose autocommit for any repo.
 #
 # Polls rather than watching with inotify, deliberately. unRAID's /mnt/user
 # is a FUSE layer and inotify through it silently drops events; a missed
@@ -49,16 +51,16 @@ trap 'running=false; log INFO "shutting down"; exit 0' TERM INT
 validate() {
   [[ -d "$REPO_PATH" ]] || die "REPO_PATH does not exist: $REPO_PATH"
 
-  # SUBDIR is the whole point: it is what keeps this sidecar's blast radius
-  # equal to the API's. An empty or root-ish value would silently widen it to
-  # the entire repository, so refuse rather than guess.
-  [[ -n "$SUBDIR" ]] || die "SUBDIR is required (the folder to commit, relative to the repo root)"
+  # SUBDIR is what keeps this sidecar's blast radius equal to the API's. An
+  # unset or empty value must never mean "everything", so it is refused;
+  # committing the whole repository takes an explicit SUBDIR=. instead.
+  [[ -n "$SUBDIR" ]] || die "SUBDIR is required (the folder to commit, relative to the repo root, or . for the whole repository)"
   case "$SUBDIR" in
-    /*)      die "SUBDIR must be relative to the repo root, not absolute: $SUBDIR" ;;
-    .|./|"") die "SUBDIR must name a subfolder, not the repository root" ;;
-    *..*)    die "SUBDIR must not contain '..': $SUBDIR" ;;
+    /*)   die "SUBDIR must be relative to the repo root, not absolute: $SUBDIR" ;;
+    *..*) die "SUBDIR must not contain '..': $SUBDIR" ;;
+    .|./) SUBDIR="." ;;
+    *)    SUBDIR="${SUBDIR%/}" ;;
   esac
-  SUBDIR="${SUBDIR%/}"
 
   [[ -d "$REPO_PATH/$SUBDIR" ]] || die "SUBDIR does not exist in the repo: $REPO_PATH/$SUBDIR"
 
@@ -85,6 +87,11 @@ validate() {
   if [[ "$PUSH" == "true" ]]; then
     git -C "$REPO_PATH" remote get-url "$GIT_REMOTE" >/dev/null 2>&1 \
       || die "remote '$GIT_REMOTE' is not configured in $REPO_PATH"
+  fi
+
+  if [[ "$SUBDIR" == "." ]]; then
+    log WARN "SUBDIR=. -- committing the WHOLE repository, not one folder."
+    log WARN "Anything not covered by .gitignore will be committed and pushed."
   fi
 
   setup_credentials
@@ -145,6 +152,11 @@ setup_credentials() {
 # pathspec rather than by editing the repo's .gitignore, so the sidecar
 # leaves no trace in the working tree.
 pathspec() {
+  if [[ "$SUBDIR" == "." ]]; then
+    # A leading **/ also matches the top level, so one pattern covers it.
+    printf '%s\n' "." ":(exclude,glob)**/.upload-*.tmp"
+    return
+  fi
   printf '%s\n' \
     "$SUBDIR" \
     ":(exclude,glob)$SUBDIR/**/.upload-*.tmp" \
@@ -160,9 +172,18 @@ changed_files() {
 recently_touched() {
   # Any file written in the last QUIET_PERIOD seconds means a burst may still
   # be in flight; wait for it to settle rather than commit half of it.
+  #
+  # Only files git would commit count: modified or untracked, not ignored.
+  # Walking the folder instead would see .git/ and every ignored file, and
+  # anything that is always being written (a log, a database) would defer
+  # the commit forever -- most visibly with SUBDIR=. on an appdata folder.
+  # Deleted files are listed too but no longer exist; find skips them.
   [[ "$QUIET_PERIOD" -le 0 ]] && return 1
+  local -a spec
+  mapfile -t spec < <(pathspec)
   local hit
-  hit="$(find "$REPO_PATH/$SUBDIR" -type f -newermt "-${QUIET_PERIOD} seconds" -print -quit 2>/dev/null)"
+  hit="$(git -C "$REPO_PATH" ls-files -z --modified --others --exclude-standard -- "${spec[@]}" 2>/dev/null \
+    | (cd "$REPO_PATH" && find -files0-from - -maxdepth 0 -type f -newermt "-${QUIET_PERIOD} seconds" -print -quit 2>/dev/null))"
   [[ -n "$hit" ]]
 }
 
@@ -273,7 +294,11 @@ sync_once() {
 
 validate
 
-log INFO "watching $REPO_PATH/$SUBDIR on branch $GIT_BRANCH"
+if [[ "$SUBDIR" == "." ]]; then
+  log INFO "watching $REPO_PATH (whole repository) on branch $GIT_BRANCH"
+else
+  log INFO "watching $REPO_PATH/$SUBDIR on branch $GIT_BRANCH"
+fi
 log INFO "interval=${INTERVAL}s quiet=${QUIET_PERIOD}s push=$PUSH dry_run=$DRY_RUN max_files=$MAX_CHANGED_FILES"
 
 if [[ "$RUN_ONCE" == "true" ]]; then

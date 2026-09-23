@@ -530,6 +530,10 @@ their defaults. If you declare an SSH key path but don't mount a key, the
 container refuses to start and says so in the log rather than running without
 push access.
 
+It isn't tied to `claude-files`, either. Set Commit Subfolder to `.` and it
+commits the whole repository instead — a general-purpose autocommit for any
+git working tree on the server (see [whole-repository mode](#whole-repository-mode)).
+
 **It polls rather than watching with inotify, deliberately.** unRAID's
 `/mnt/user` is a FUSE layer, and inotify through it silently drops events —
 and a missed event is a file that never gets committed, with nothing to tell
@@ -542,8 +546,26 @@ The sidecar mounts the **repo root**, because `.git` is what it needs to make
 a commit. That's a wider mount than the API gets, so its containment is a
 different mechanism: `SUBDIR` scopes every `git add`, so the sidecar can only
 ever commit the same folder the API can write to. It refuses to start if
-`SUBDIR` is empty, `.`, absolute, or contains `..` — a misconfiguration there
+`SUBDIR` is empty, absolute, or contains `..` — a misconfiguration there
 would silently widen it to the whole repository, so it fails loudly instead.
+Widening it on purpose takes an explicit `SUBDIR=.` (below).
+
+### Whole-repository mode
+
+`SUBDIR=.` commits everything in the working tree that `.gitignore` doesn't
+exclude, anywhere in the repo. It's for using the sidecar as a plain
+autocommit for any repo — a config folder, notes, an appdata directory —
+rather than as a `claude-files` companion. The container logs a warning at
+startup so the wider scope is never a surprise.
+
+In this mode the scope is whatever `.gitignore` says, so write it first:
+anything a container keeps rewriting (logs, databases, caches) belongs in
+it. Those files also don't hold the quiet period open — only files git
+would actually commit count toward it. The folder must already be a git
+repository with a branch checked out and a remote configured; the sidecar
+doesn't create either. On a folder with a lot of existing uncommitted
+files, the first poll will trip `MAX_CHANGED_FILES`, so make that first
+commit by hand.
 
 Also handled:
 
@@ -564,9 +586,9 @@ Also handled:
 | Variable | Default | Meaning |
 |---|---|---|
 | `REPO_PATH` | `/repo` | Repo working tree. Must contain `.git`. |
-| `SUBDIR` | *required* | Folder to commit, relative to the repo root. |
+| `SUBDIR` | *required* | Folder to commit, relative to the repo root. `.` commits the whole repository. |
 | `INTERVAL` | `120` | Seconds between polls. |
-| `QUIET_PERIOD` | `30` | Skip if a file changed this recently. `0` disables. |
+| `QUIET_PERIOD` | `30` | Skip if a file to be committed changed this recently. Ignored files don't count. `0` disables. |
 | `GIT_BRANCH` | current branch | Must match what's checked out. |
 | `GIT_REMOTE` | `origin` | Which remote to push to. Use a second SSH remote here to leave `origin` on HTTPS for host-side use. |
 | `MAX_CHANGED_FILES` | `1000` | Runaway guard. `0` disables. |
@@ -586,11 +608,13 @@ daemon running. Same logic, no loop.
 bash tests/autocommit_tests.sh
 ```
 
-15 checks against a real bare-repo remote: scoping, deletions, the quiet
+21 checks against a real bare-repo remote: scoping, deletions, the quiet
 period, temp-file exclusion, a diverged remote, a diverged remote *with*
 unrelated dirty files (verifying the stashed edits come back and don't get
-committed), the runaway guard, and every unsafe `SUBDIR` plus detached HEAD
-being refused at startup.
+committed), the runaway guard, every unsafe `SUBDIR` plus detached HEAD
+being refused at startup, whole-repository mode (`.gitignore` and temp-file
+exclusion at every depth), and ignored files not holding the quiet period
+open.
 
 ---
 
@@ -640,7 +664,7 @@ docker buildx imagetools inspect eguthriewastaken2/claude-files:1.1.0
 The sidecar is a separate image, built the same way:
 
 ```bash
-docker buildx build --platform linux/amd64,linux/arm64 --tag eguthriewastaken2/claude-files-autocommit:1.0.0 --tag eguthriewastaken2/claude-files-autocommit:latest --push ./autocommit
+docker buildx build --platform linux/amd64,linux/arm64 --tag eguthriewastaken2/claude-files-autocommit:1.1.0 --tag eguthriewastaken2/claude-files-autocommit:latest --push ./autocommit
 ```
 
 Building on separate machines and pushing to the same tag does **not** produce

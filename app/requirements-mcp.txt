@@ -16,3 +16,9 @@
 # docs/plan-mcp-connector.md, "Option A only holds if it resolves in one pip
 # install".
 mcp==1.12.4
+
+# PDF text extraction for read_file(pages=...). Pure Python, no native
+# dependencies, so it adds nothing to the image beyond itself. Only the
+# optional /mcp endpoint imports it (lazily, inside read_file), so a
+# WITH_MCP=0 image is unaffected.
+pypdf==5.1.0

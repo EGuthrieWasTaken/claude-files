@@ -458,6 +458,121 @@ def upload_tickets() -> None:
 
 
 # ==========================================================================
+# DOWNLOAD TICKETS -- one-time download URLs (docs/download-urls.md)
+# ==========================================================================
+
+def _create_download(path: str, *, token: str | None = TOKEN) -> tuple[int, dict, bytes]:
+    st, headers, resp_body = request(
+        "POST", "/v1/downloads", body=json.dumps({"path": path}).encode(),
+        headers={"Content-Type": "application/json"}, token=token,
+    )
+    if st == 201:
+        secret = urlsplit(json.loads(resp_body)["download_url"]).path.rsplit("/", 1)[-1]
+        _SEEN_SECRETS.append(secret)
+    return st, headers, resp_body
+
+
+def download_tickets() -> None:
+    print(f"\n{YELLOW}DOWNLOAD TICKETS -- one-time download URLs{RESET}")
+
+    payload = b"%PDF-1.7\x00" + os.urandom(50_000)
+    want_sha = hashlib.sha256(payload).hexdigest()
+    (REPO / "shared" / "dl-ticket-test.pdf").write_bytes(payload)
+
+    st, _, body = _create_download("dl-ticket-test.pdf")
+    ticket = json.loads(body) if st == 201 else {}
+    if st != 201 or "download_url" not in ticket:
+        R.bad("download", "create ticket", f"status {st} body {body[:200]!r}")
+        return
+    if ticket.get("sha256") == want_sha and ticket.get("size") == len(payload):
+        R.ok("download", "create ticket returns size and sha256")
+    else:
+        R.bad("download", "ticket size/sha256", f"{ticket!r}"[:200])
+    get_path = urlsplit(ticket["download_url"]).path
+
+    st, hdrs, body = request("GET", get_path, token=None)
+    if st == 200 and body == payload and "attachment" in {k.lower(): v for k, v in hdrs.items()}.get("content-disposition", ""):
+        R.ok("download", "GET with no bearer token returns the exact bytes as an attachment")
+    else:
+        R.bad("download", "GET bytes", f"status {st} len {len(body)}")
+
+    st, _, body = request("GET", f"/v1/downloads/{ticket['download_id']}")
+    status = json.loads(body) if st == 200 else {}
+    if status.get("state") == "complete" and status.get("bytes_sent") == len(payload):
+        R.ok("download", "status endpoint reports complete")
+    else:
+        R.bad("download", "status", f"status {st} body {body[:200]!r}")
+
+    st, _, _ = request("GET", get_path, token=None)
+    R.ok("download", "reusing a completed ticket -> 409") if st == 409 \
+        else R.bad("download", "reuse", f"status {st}, wanted 409")
+
+    st, _, _ = request("GET", get_path.rsplit("/", 1)[0] + "/not-the-secret", token=None)
+    R.ok("download", "wrong secret -> 404") if st == 404 \
+        else R.bad("download", "wrong secret", f"status {st}, wanted 404")
+
+    st, _, _ = request("GET", "/v1/downloads/" + ticket["download_id"], token=None)
+    R.ok("download", "status endpoint needs a bearer token") if st == 401 \
+        else R.bad("download", "status without token", f"status {st}, wanted 401")
+
+    if RO_TOKEN:
+        st, _, body = _create_download("dl-ticket-test.pdf", token=RO_TOKEN)
+        if st == 201:
+            ro_path = urlsplit(json.loads(body)["download_url"]).path
+            st2, _, body2 = request("GET", ro_path, token=None)
+            R.ok("download", "read-only token can create a ticket and download") \
+                if st2 == 200 and body2 == payload \
+                else R.bad("download", "ro download", f"status {st2}")
+        else:
+            R.bad("download", "ro create ticket", f"status {st}, wanted 201")
+
+    st, _, _ = _create_download("no-such-file.pdf")
+    R.ok("download", "ticket for a missing file refused at creation -> 404") if st == 404 \
+        else R.bad("download", "missing file", f"status {st}, wanted 404")
+
+    for label, path in [
+        ("traversal", "../secrets.env"),
+        ("absolute", "/etc/passwd"),
+        (".git component", ".git/config"),
+        ("symlink to outside", "link-to-secret"),
+        ("symlinked parent", "escape-dir/secrets.env"),
+        ("hard link to outside", "hardlink-to-secret"),
+    ]:
+        st, _, body = _create_download(path)
+        R.ok("download", f"ticket for {label} path refused at creation -> {st}") \
+            if st in (400, 403, 404) and not leaked(body) \
+            else R.bad("download", f"ticket scope ({label})", f"status {st} body {body[:200]!r}")
+
+    swap = REPO / "shared" / "dl-swap.txt"
+    swap.write_bytes(b"harmless")
+    st, _, body = _create_download("dl-swap.txt")
+    if st == 201:
+        swap.unlink()
+        swap.symlink_to("../secrets.env")
+        st2, _, body2 = request("GET", urlsplit(json.loads(body)["download_url"]).path, token=None)
+        R.ok("download", "symlink planted after ticket issued is not followed") \
+            if st2 != 200 and not leaked(body2) \
+            else R.bad("download", "post-issue symlink", f"status {st2} body {body2[:100]!r}")
+        swap.unlink()
+    else:
+        R.bad("download", "swap ticket create", f"status {st}")
+
+    ttl = float(os.environ.get("DOWNLOAD_TICKET_TTL_SECONDS", "900"))
+    if ttl <= 5:
+        st, _, body = _create_download("dl-ticket-test.pdf")
+        if st == 201:
+            time.sleep(ttl + 0.5)
+            st2, _, _ = request("GET", urlsplit(json.loads(body)["download_url"]).path, token=None)
+            R.ok("download", f"unused ticket expires after {ttl:.0f}s -> 410") if st2 == 410 \
+                else R.bad("download", "expiry", f"status {st2}, wanted 410")
+        else:
+            R.bad("download", "expiry ticket create", f"status {st}")
+    else:
+        print(f"  {DIM}skip{RESET} [download] expiry check "
+              f"(DOWNLOAD_TICKET_TTL_SECONDS={ttl:.0f}s, too slow to wait out here)")
+
+
+# ==========================================================================
 # ESCAPE
 # ==========================================================================
 
@@ -607,6 +722,7 @@ def main() -> int:
     before = snapshot()
     functional()
     upload_tickets()
+    download_tickets()
     escapes()
     after = snapshot()
 

@@ -19,6 +19,10 @@ with no shell at all. Copying a file that's already in the folder?
 Use `copy_file` (or `POST /v1/copy` below) instead of reading it out and
 writing it back in — the bytes never pass through your context either way.
 
+**Need to read a PDF, image, or large file that `read_file` can't return?**
+Use `request_download` and run the `curl` command it returns — see "Reading a
+file you can't read inline" below.
+
 Use it whenever you need to hand back a file rather than paste content
 into the conversation: reports, generated data, build artifacts, logs.
 
@@ -82,6 +86,33 @@ one-time ticket.
 A ticket is for one path, once: it expires if you never use it, and a second
 upload against the same ticket is rejected.
 
+## Reading a file you can't read inline
+
+`read_file` returns text only, up to a size cap. A PDF, image, other binary
+file, or large text file can't come back that way (the call is refused, or
+you get a truncated preview). **Download it to your shell instead** — the
+bytes never pass through you, and a read-only token is enough:
+
+1. **Request a ticket.** MCP: `request_download(path="stat519/syllabus.pdf")`.
+   REST: `POST /v1/downloads {"path": "..."}`. You get
+   `download_url`, `curl_command` (with `<OUTPUT_FILE>`), `size`, `sha256`,
+   and `expires_at`.
+2. **Run the `curl_command`** with an output path filled in. No
+   `Authorization` header; the URL's secret is the one-time authorization.
+3. **Verify** that `sha256sum <OUTPUT_FILE>` equals the returned `sha256`,
+   then open the file locally (`pdftotext`, an image viewer, etc.).
+
+For a **short** read you can skip the download: `read_file(path, pages="1-3")`
+returns a PDF's extracted text (pass back `next_pages` to continue; scanned
+pages come back in `pages_without_text`), and `read_file(path, offset=N,
+length=M)` reads a big text file in character ranges (resume at `next_offset`).
+Use `request_download` for whole PDFs, scans, images and anything else binary.
+
+A download ticket is for one file, once, and expires if unused. If curl fails
+partway, or the file changed after the ticket was issued (`409
+file_changed`), request a new ticket. `download_status(download_id)` /
+`GET /v1/downloads/{id}` (bearer token) reports progress.
+
 ## Paths
 
 Every path is **relative to the shared folder root**, with no leading slash.
@@ -109,6 +140,9 @@ different approach.
 | `POST` | `/v1/uploads` | Create a one-time upload ticket for an existing local file |
 | `PUT`/`POST` | `/v1/uploads/{id}/{secret}` | Upload the bytes for a ticket. **No bearer token.** |
 | `GET` | `/v1/uploads/{id}` | Ticket status and progress |
+| `POST` | `/v1/downloads` | Create a one-time download ticket for any file (read-only tokens allowed) |
+| `GET` | `/v1/downloads/{id}/{secret}` | Download the bytes for a ticket. **No bearer token.** |
+| `GET` | `/v1/downloads/{id}` | Download ticket status and progress |
 | `GET` | `/v1/info` | Current limits and policy, plus this token's `token_scope` (`rw`/`ro`) and `writes_allowed` |
 | `GET` | `/v1/bridge.py` | Download the local upload/download bridge — see "Uploading a file you generated" |
 
@@ -192,9 +226,9 @@ Every error is JSON: `{"code":"...","message":"..."}`.
 |---|---|
 | `401` | Missing or wrong token |
 | `403` | Path rejected (`traversal`, `absolute_path`, `symlink`, `denied_name`) or token is read-only |
-| `404` | File doesn't exist, or (on `/v1/uploads/{id}/{secret}`) a bad ticket id or secret |
-| `409` | `no_parent` (retry with `?parents=true`), `POST` onto an existing file, deleting a non-empty dir without `?recursive=true`, or reusing an upload ticket that isn't `pending` |
-| `410` | An upload ticket expired before it was used — request a new one |
+| `404` | File doesn't exist, or (on `/v1/uploads|downloads/{id}/{secret}`) a bad ticket id or secret |
+| `409` | `no_parent` (retry with `?parents=true`), `POST` onto an existing file, deleting a non-empty dir without `?recursive=true`, reusing an upload or download ticket that isn't `pending`, or `file_changed` (the file was replaced after a download ticket was issued) |
+| `410` | An upload or download ticket expired before it was used — request a new one |
 | `413` | Body exceeds the upload limit |
 | `422` | `integrity_mismatch` — you sent `X-Expect-Bytes`/`X-Expect-Sha256` and what arrived didn't match; or `sha_mismatch` — an upload ticket's bytes didn't match its `expect_sha256`. Nothing was written either way |
 | `429` | Rate limited — back off and retry |
@@ -209,7 +243,7 @@ path hoping to get through; fix the path or stop.
 - Rate limit **600 requests/minute** shared across all clients.
 - `.git`, `.gitmodules`, and `.ssh` are refused as path components anywhere.
 - Filenames matching `.upload-*.tmp` are reserved; don't create them.
-- An upload ticket is good for one path, once, and expires 15 minutes after
+- An upload or download ticket is good for one path, once, and expires 15 minutes after
   creation if never used (`/v1/info` reports the live TTL and how many
   tickets can be outstanding at once).
 

@@ -167,6 +167,9 @@ path is relative to the shared folder root.
 | `POST` | `/v1/uploads` | Create a one-time upload ticket. Needs the rw token. |
 | `PUT`/`POST` | `/v1/uploads/{id}/{secret}` | Upload the bytes for a ticket. No bearer token — the secret in the URL is the authorization. |
 | `GET` | `/v1/uploads/{id}` | Ticket status: `pending`/`receiving`/`complete`/`failed`/`expired`, bytes received, size, sha256. |
+| `POST` | `/v1/downloads` | Create a one-time download ticket. Any token, including read-only. |
+| `GET` | `/v1/downloads/{id}/{secret}` | Download the bytes for a ticket. No bearer token — the secret in the URL is the authorization. |
+| `GET` | `/v1/downloads/{id}` | Ticket status: `pending`/`streaming`/`complete`/`failed`/`expired`, bytes sent, size, sha256. |
 
 Writes are atomic: content goes to a temp file in the destination directory
 and is `rename()`d into place, so a reader never sees a half-written file.
@@ -224,6 +227,33 @@ ticket expires after `UPLOAD_TICKET_TTL_SECONDS` if never used, and can be
 polled with `GET /v1/uploads/{id}` while it's in flight. See
 [`docs/upload-urls.md`](docs/upload-urls.md) for the full design and
 `AGENT.md` for the agent-facing walkthrough.
+
+### Downloading a file to a local shell
+
+The mirror image of the above, for files `read_file` can't return: PDFs and
+other binaries, and text over the inline budget. Ask for a one-time download
+ticket (any token works, read-only included):
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" -X POST "$API/v1/downloads" \
+     -H "Content-Type: application/json" \
+     -d '{"path": "stat519/syllabus.pdf"}'
+# -> {"download_id": "d_3f9c…",
+#     "download_url": "https://.../v1/downloads/d_3f9c…/<secret>",
+#     "curl_command": "curl -sS --fail-with-body -o <OUTPUT_FILE> '.../v1/downloads/d_3f9c…/<secret>'",
+#     "path": "stat519/syllabus.pdf", "size": ..., "sha256": "...", "expires_at": ...}
+
+curl -sS --fail-with-body -o syllabus.pdf "https://.../v1/downloads/d_3f9c…/<secret>"
+sha256sum syllabus.pdf        # must equal the sha256 returned with the ticket
+```
+
+The `GET` needs **no bearer token**; the secret is single-use authorization
+for that one file and expires after `DOWNLOAD_TICKET_TTL_SECONDS` if unused.
+The ticket records the file's size and mtime when it is issued, and the
+download is refused with `409 file_changed` if the file was replaced in
+between, so the returned `sha256` always describes the bytes you receive.
+Poll `GET /v1/downloads/{id}` for progress. See
+[`docs/download-urls.md`](docs/download-urls.md).
 
 `AGENT.md` in this repo is a paste-ready brief for handing to an agent.
 
@@ -315,6 +345,22 @@ The `upload_url`'s host comes from `PUBLIC_BASE_URL`, else
 Set one of the first two in production. If Cloudflare Access fronts the
 hostname, `/v1/uploads/*/*` needs a bypass rule, since `curl` in an agent's
 sandbox has no Access session.
+
+### Reading binary or large files: `request_download`
+
+The way for a connector caller to read a file `read_file` can't return --
+a PDF, an image, anything with NUL bytes, or text over the inline budget.
+`request_download(path)` mints the same one-time ticket as `POST
+/v1/downloads` (see [Downloading a file to a local
+shell](#downloading-a-file-to-a-local-shell)) and returns `download_url`,
+`size`, `sha256` and a `curl_command` with an `<OUTPUT_FILE>` placeholder.
+`download_status` reports progress. For short reads there are two lighter
+options: `read_file(path, pages="1-3")` returns a PDF's extracted text, and
+`read_file(path, offset=…, length=…)` reads a big text file in pieces
+(`next_offset` tells you where to resume). It works with a read-only token, and the
+agent's shell needs no token at all. `read_file`'s refusals name this tool.
+URL host and Cloudflare Access notes are the same as for `request_upload`
+(bypass `/v1/downloads/*/*` too).
 
 ### Uploading binary files: the local bridge
 
@@ -454,6 +500,13 @@ lifetime — `write_chunk` and `commit_write` never re-resolve the path. A
 descriptor can't be swapped for a symlink after the fact, so this extends the
 same TOCTOU-proof guarantee across a multi-call session instead of narrowing
 it to a single request.
+
+**Download tickets are the one deliberate exception to "every read needs the
+bearer token,"** and upload tickets (below) the one for writes. `GET
+/v1/downloads/{id}/{secret}` is read-only and scoped to one file; it applies the
+same containment as every other read (symlinks, hard links, denied names
+are refused when the ticket is issued *and* again when it is used), and
+its secret is redacted from the access log exactly like an upload secret.
 
 **Upload tickets are the one deliberate exception to "every write needs the
 bearer token."** `PUT /v1/uploads/{id}/{secret}` accepts no `Authorization`
@@ -701,7 +754,10 @@ reproducible, and `:latest` there would silently change what runs on the next
 | `RATE_LIMIT_PER_MINUTE` | `600` | `0` disables. Shared between REST and `/mcp`. |
 | `UPLOAD_TICKET_TTL_SECONDS` | `900` | How long an unused upload ticket stays valid. |
 | `UPLOAD_TICKETS_MAX` | `100` | Cap on live upload tickets, so they can't use unbounded memory. |
-| `PUBLIC_BASE_URL` | *(unset)* | Base URL used to build `upload_url`. If unset, `https://$MCP_PUBLIC_HOSTNAME`, else derived from `X-Forwarded-Proto`/`X-Forwarded-Host` (or `Host`). |
+| `MCP_PDF_MAX_BYTES` | `33554432` | Largest PDF `read_file(pages=…)` will parse (32 MiB). Larger ones: use `request_download`. |
+| `DOWNLOAD_TICKET_TTL_SECONDS` | `900` | How long an unused download ticket stays valid. |
+| `DOWNLOAD_TICKETS_MAX` | `100` | Cap on live download tickets. |
+| `PUBLIC_BASE_URL` | *(unset)* | Base URL used to build `upload_url` and `download_url`. If unset, `https://$MCP_PUBLIC_HOSTNAME`, else derived from `X-Forwarded-Proto`/`X-Forwarded-Host` (or `Host`). |
 | `LOG_LEVEL` | `INFO` | |
 | `ENABLE_MCP` | `true` | Mount the [MCP connector](#mcp-connector) at `/mcp`. `false` disables it without rebuilding. |
 | `MCP_PUBLIC_HOSTNAME` | — | This service's public hostname, for the MCP SDK's DNS-rebinding guard. Unset disables that guard rather than 421ing real requests. |

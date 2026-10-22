@@ -81,6 +81,7 @@ import binascii
 import contextlib
 import hashlib
 import hmac
+import io
 import logging
 import os
 import secrets
@@ -117,6 +118,9 @@ To upload a file that already exists on your machine, use request_upload
 and run the curl command it returns -- never paste a file's contents into
 write_file or write_chunk. write_file is for short text you are composing
 now.
+
+To read a file that is binary (a PDF, an image) or too big for read_file's
+inline budget, use request_download and run the curl command it returns.
 
 Call get_folder_info first -- it reports this token's scope (rw/ro), the
 server's limits, and the inline size budgets read_file/write_file operate
@@ -373,7 +377,7 @@ def get_folder_info(ctx: Context) -> dict[str, Any]:
         "writes_allowed": scope == "rw",
         "token_scope_note": (
             "rw: every tool works. ro: list_files, stat_file, read_file, "
-            "get_folder_info and upload_status work; every write tool is refused "
+            "request_download, download_status, get_folder_info and upload_status work; every write tool is refused "
             "with a 'read-only' error. With an ro token, don't attempt writes -- "
             "tell the user this task needs a read-write token."
         ),
@@ -388,6 +392,12 @@ def get_folder_info(ctx: Context) -> dict[str, Any]:
             "over mcp_base64_limit_bytes decoded."
         ),
         "mcp_upload_chunk_advisory_bytes": appmain.CONFIG.mcp_upload_chunk_advisory_bytes,
+        "mcp_pdf_max_bytes": appmain.CONFIG.mcp_pdf_max_bytes,
+        "read_file_note": (
+            "read_file reads PDFs as text via pages=\"1-3\" (extraction limited to PDFs up "
+            "to mcp_pdf_max_bytes) and reads large text files in pieces via offset/length. "
+            "For a whole PDF, an image, or any binary file use request_download."
+        ),
         "upload_urls": {
             "ticket_ttl_seconds": appmain.CONFIG.upload_ticket_ttl_seconds,
             "note": (
@@ -396,6 +406,16 @@ def get_folder_info(ctx: Context) -> dict[str, Any]:
                 "local path filled in, and compare the sha256 curl prints with "
                 "sha256sum of your file. The bytes never pass through a tool call, "
                 "and you need no token in your shell."
+            ),
+        },
+        "download_urls": {
+            "ticket_ttl_seconds": appmain.CONFIG.download_ticket_ttl_seconds,
+            "note": (
+                "PREFERRED for any binary file (PDF, image, audio) or any text file "
+                "too big for read_file's inline budget: call request_download(path), "
+                "run the curl_command it returns with an output path filled in, and "
+                "compare sha256sum of the result with the sha256 it returned. Works "
+                "with a read-only token."
             ),
         },
         "bridge": {
@@ -461,22 +481,171 @@ def stat_file(path: str) -> dict[str, Any]:
     return _guard("stat_file", _do)
 
 
+_PDF_MAX_PAGES_PER_CALL = 50
+
+
+def _parse_page_spec(spec: str, page_count: int) -> list[int]:
+    """'3', '2-5', '1,3,7-9', '5-' (to the end) -> sorted unique 1-based pages."""
+    pages: set[int] = set()
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            if "-" in token:
+                lo_s, _, hi_s = token.partition("-")
+                lo = int(lo_s)
+                hi = int(hi_s) if hi_s.strip() else page_count
+            else:
+                lo = hi = int(token)
+        except ValueError:
+            raise ValueError(
+                f"Bad pages value {spec!r}: use page numbers like '3', '2-5', '1,3,7-9' or '5-'"
+            ) from None
+        if lo < 1 or hi < lo or hi > page_count:
+            raise ValueError(
+                f"pages {token!r} is out of range: this PDF has {page_count} page(s), "
+                f"numbered from 1"
+            )
+        pages.update(range(lo, hi + 1))
+    if not pages:
+        raise ValueError(f"Bad pages value {spec!r}: no page numbers given")
+    return sorted(pages)
+
+
+def _format_pages(pages: list[int]) -> str:
+    runs: list[str] = []
+    start = prev = pages[0]
+    for n in pages[1:] + [None]:  # type: ignore[list-item]
+        if n is not None and n == prev + 1:
+            prev = n
+            continue
+        runs.append(str(start) if start == prev else f"{start}-{prev}")
+        if n is not None:
+            start = prev = n
+    return ",".join(runs)
+
+
+def _read_pdf(data: bytes, rel: str, pages: str | None, limit: int, digest: str) -> dict[str, Any]:
+    from . import main as appmain
+
+    cap = appmain.CONFIG.mcp_pdf_max_bytes
+    if len(data) > cap:
+        raise ValueError(
+            f"'{rel}' is {len(data):,} bytes, over the {cap:,}-byte PDF text-extraction "
+            f"limit. Download it with request_download('{rel}') and run the curl command it returns."
+        )
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        raise ValueError(
+            f"PDF text extraction is not installed on this server. Download '{rel}' with "
+            f"request_download('{rel}') and run the curl command it returns."
+        ) from None
+
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        if reader.is_encrypted and not reader.decrypt(""):
+            raise ValueError(
+                f"'{rel}' is password-protected. Download it with request_download('{rel}')."
+            )
+        page_count = len(reader.pages)
+        selected = _parse_page_spec(pages, page_count) if pages else list(range(1, page_count + 1))
+
+        chunks: list[str] = []
+        used = 0
+        done: list[int] = []
+        truncated_page: int | None = None
+        empty: list[int] = []
+        for n in selected:
+            if len(done) >= _PDF_MAX_PAGES_PER_CALL:
+                break
+            text = (reader.pages[n - 1].extract_text() or "").strip()
+            if not text:
+                empty.append(n)
+            piece = f"--- page {n} ---\n{text}\n"
+            if used + len(piece) > limit:
+                if done:
+                    break
+                piece = piece[:limit]
+                truncated_page = n
+            chunks.append(piece)
+            used += len(piece)
+            done.append(n)
+            if truncated_page is not None:
+                break
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(
+            f"'{rel}' could not be parsed as a PDF ({type(exc).__name__}). Download it "
+            f"with request_download('{rel}') and run the curl command it returns."
+        ) from None
+
+    remaining = [n for n in selected if n > done[-1]]
+    out: dict[str, Any] = {
+        "text": "".join(chunks),
+        "format": "pdf",
+        "page_count": page_count,
+        "pages_returned": _format_pages(done),
+        "bytes": len(data),
+        "sha256": digest,
+    }
+    if remaining:
+        out["next_pages"] = _format_pages(remaining)
+        out["truncated"] = True
+        out["note"] = (
+            f"Stopped at the {limit:,}-character / {_PDF_MAX_PAGES_PER_CALL}-page budget for "
+            f"one call. Pass pages='{out['next_pages']}' to continue, or get the whole file "
+            f"with request_download('{rel}')."
+        )
+    if truncated_page is not None:
+        out["truncated"] = True
+        out["note"] = (
+            f"Page {truncated_page} alone exceeds the {limit:,}-character budget and was cut "
+            f"off. " + out.get("note", "") + f" Use request_download('{rel}') for the full page."
+        )
+    if empty:
+        out["pages_without_text"] = _format_pages(empty)
+        out["empty_note"] = (
+            "These pages have no extractable text (likely scanned images); "
+            f"request_download('{rel}') to view them."
+        )
+    return out
+
+
 @mcp.tool()
 def read_file(
-    path: str, encoding: str = "utf-8", max_chars: int | None = None
+    path: str,
+    encoding: str = "utf-8",
+    max_chars: int | None = None,
+    offset: int | None = None,
+    length: int | None = None,
+    pages: str | None = None,
 ) -> dict[str, Any]:
     """Read a file's contents. `encoding="utf-8"` (default) decodes the file
     as text; a file containing a NUL byte or that fails UTF-8 decoding is
     refused with an explanation, never returned as mojibake or silently
     base64'd. Pass `encoding="base64"` for a small binary file (capped well
-    below the text budget -- see get_folder_info). A result over the inline
-    character budget (`max_chars`, or the server default) comes back as
-    {preview, bytes, truncated: true, note} naming the REST endpoint for the
-    full content -- never a silent cut. Every successful result -- base64,
-    full text, or a truncated preview -- includes `bytes` and `sha256` for
-    the whole file, so a copy can be verified by forwarding them straight
-    into write_file's `expect_bytes`/`expect_sha256` without computing
-    anything yourself."""
+    below the text budget -- see get_folder_info).
+
+    PDFs: pass `pages` ("3", "2-5", "1,3,7-9", "5-") to get the extracted
+    text of those pages (1-based); with no `pages` you get from page 1 until
+    the per-call budget is used, plus `next_pages` to pass back in. Scanned
+    PDFs have no text layer -- those pages are listed in `pages_without_text`.
+
+    Large text: pass `offset` (characters from the start, default 0) and/or
+    `length` (characters, capped at the inline budget) to read a file in
+    pieces; the result has `total_chars` and `next_offset` (null at the end).
+    Without them, a result over the inline character budget (`max_chars`, or
+    the server default) comes back as {preview, bytes, truncated: true, note}
+    -- never a silent cut.
+
+    For the whole of a PDF, an image, or any big file, use request_download
+    instead. Every successful result includes `bytes` and `sha256` for the
+    whole file, so a copy can be verified by forwarding them straight into
+    write_file's `expect_bytes`/`expect_sha256` without computing anything
+    yourself."""
     from . import main as appmain
 
     def _do():  # type: ignore[no-untyped-def]
@@ -489,13 +658,16 @@ def read_file(
             os.close(fd)
         digest = hashlib.sha256(data).hexdigest()
 
+        if encoding == "base64" and (offset is not None or length is not None or pages):
+            raise ValueError("offset, length and pages apply to encoding='utf-8' reads only")
+
         if encoding == "base64":
             cap = appmain.CONFIG.mcp_base64_limit_bytes
             if len(data) > cap:
                 raise ValueError(
                     f"'{rel}' is {len(data):,} bytes, over the {cap:,}-byte base64 "
-                    f"limit for this connector. Fetch it directly with "
-                    f"GET /v1/content/{rel}."
+                    f"limit for this connector. Download it with "
+                    f"request_download('{rel}') and run the curl command it returns."
                 )
             return {
                 "content": base64.b64encode(data).decode("ascii"),
@@ -507,11 +679,25 @@ def read_file(
         if encoding != "utf-8":
             raise ValueError(f"Unknown encoding {encoding!r}; expected 'utf-8' or 'base64'")
 
+        read_limit = appmain.CONFIG.mcp_inline_limit_chars
+        if max_chars is not None:
+            read_limit = min(read_limit, max_chars)
+
+        if data.startswith(b"%PDF-"):
+            if offset is not None or length is not None:
+                raise ValueError(
+                    "offset/length are for text files; select PDF content with pages "
+                    "(e.g. pages='1-3')"
+                )
+            return _read_pdf(data, rel, pages, read_limit, digest)
+        if pages:
+            raise ValueError(f"'{rel}' is not a PDF, so pages does not apply")
+
         if b"\x00" in data:
             raise ValueError(
                 f"'{rel}' contains a NUL byte and cannot be decoded as UTF-8 text "
                 f"({len(data):,} bytes). Use encoding=\"base64\" if it fits that "
-                f"budget, or GET /v1/content/{rel} directly."
+                f"budget, or call request_download('{rel}') and run the curl command it returns."
             )
         try:
             text = data.decode("utf-8")
@@ -519,12 +705,29 @@ def read_file(
             raise ValueError(
                 f"'{rel}' is not valid UTF-8 and cannot be read as text "
                 f"({len(data):,} bytes). Use encoding=\"base64\" if it fits that "
-                f"budget, or GET /v1/content/{rel} directly."
+                f"budget, or call request_download('{rel}') and run the curl command it returns."
             ) from None
 
-        limit = appmain.CONFIG.mcp_inline_limit_chars
-        if max_chars is not None:
-            limit = min(limit, max_chars)
+        limit = read_limit
+        if offset is not None or length is not None:
+            start = 0 if offset is None else offset
+            if start < 0 or (length is not None and length <= 0):
+                raise ValueError("offset must be >= 0 and length must be > 0")
+            if start > len(text):
+                raise ValueError(
+                    f"offset {start:,} is past the end of '{rel}' ({len(text):,} characters)"
+                )
+            want = limit if length is None else min(length, limit)
+            end = min(start + want, len(text))
+            return {
+                "text": text[start:end],
+                "offset": start,
+                "returned_chars": end - start,
+                "total_chars": len(text),
+                "next_offset": end if end < len(text) else None,
+                "bytes": len(data),
+                "sha256": digest,
+            }
         if len(text) <= limit:
             return {"text": text, "bytes": len(data), "sha256": digest}
 
@@ -536,7 +739,8 @@ def read_file(
             "note": (
                 f"'{rel}' is {len(data):,} bytes, over the {limit:,}-character inline "
                 f"budget for this connector. Only the preview above is included; "
-                f"fetch the full file with GET /v1/content/{rel}."
+                f"read it in pieces with offset/length (next offset: {_PREVIEW_CHARS}), or get the "
+                f"whole file with request_download('{rel}') and the curl command it returns."
             ),
         }
 
@@ -1108,3 +1312,48 @@ def upload_status(upload_id: str) -> dict[str, Any]:
     from . import main as appmain
 
     return _guard("upload_status", lambda: appmain.upload_ticket_status(upload_id).model_dump())
+
+
+# =============================================================================
+# One-time download URLs -- docs/download-urls.md
+# =============================================================================
+
+
+@mcp.tool()
+def request_download(path: str, ctx: Context) -> dict[str, Any]:
+    """PREFERRED way to read any file that read_file cannot return inline:
+    PDFs, images, audio, other binary files, and text files over the inline
+    budget. Returns a single-use `download_url` scoped to `path`, the file's
+    `size` and `sha256`, and a `curl_command`; run it from your shell with
+    <OUTPUT_FILE> replaced by where to save the file, then check that
+    `sha256sum <OUTPUT_FILE>` (or `shasum -a 256`) equals the returned
+    `sha256`. The bytes go straight over HTTP and never pass through a tool
+    result. The URL expires if unused (see `expires_at`) and works exactly
+    once; request a new one to retry. No bearer token is needed for the curl
+    -- the URL itself is the authorization, so don't paste it anywhere else.
+    `download_status(download_id)` reports progress or the outcome. Works with
+    a read-only token. Needs a shell with outbound network access to this
+    server."""
+    from . import main as appmain
+
+    def _do():  # type: ignore[no-untyped-def]
+        resp = appmain.issue_download_ticket(path, request=ctx.request_context.request)
+        out = resp.model_dump()
+        out["next_steps"] = (
+            "1) Run curl_command with <OUTPUT_FILE> replaced by your local path. "
+            "2) Confirm sha256sum of that file equals the sha256 returned here. "
+            "If curl failed partway, request a new download."
+        )
+        return out
+
+    return _guard("request_download", _do)
+
+
+@mcp.tool()
+def download_status(download_id: str) -> dict[str, Any]:
+    """Status of a request_download ticket: `state` is pending (not used yet),
+    streaming (see bytes_sent), complete, failed (see `error`; request a new
+    download), or expired (request a new download)."""
+    from . import main as appmain
+
+    return _guard("download_status", lambda: appmain.download_ticket_status(download_id).model_dump())

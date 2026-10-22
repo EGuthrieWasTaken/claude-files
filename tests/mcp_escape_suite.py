@@ -187,7 +187,7 @@ def functional() -> None:
         "get_folder_info", "list_files", "stat_file", "read_file",
         "write_file", "delete_file", "make_directory", "move_file",
         "copy_file", "begin_write", "write_chunk", "commit_write", "abort_write",
-        "request_upload", "upload_status",
+        "request_upload", "upload_status", "request_download", "download_status",
     }
     if expected <= tools:
         R.ok("func", "all expected tools are registered", f"({sorted(tools)})")
@@ -369,8 +369,8 @@ def functional() -> None:
     binary_path = REPO / "shared" / "mcp-binary.bin"
     binary_path.write_bytes(b"\x00\x01\x02not-utf8\xff\xfe")
     status, is_err, out = call_tool("read_file", {"path": "mcp-binary.bin"})
-    if is_err and "GET /v1/content" in str(out):
-        R.ok("func", "read_file refuses a NUL-containing file, names the REST endpoint")
+    if is_err and "request_download" in str(out):
+        R.ok("func", "read_file refuses a NUL-containing file, names request_download")
     else:
         R.bad("func", "binary refusal", f"is_err {is_err} -> {str(out)[:200]!r}")
 
@@ -1081,6 +1081,269 @@ def upload_url_tests() -> None:
             R.bad("mcp-escape", f"request_upload {label}", f"{out!r}"[:200])
 
 
+# ==========================================================================
+# DOWNLOAD URLS -- request_download / download_status (docs/download-urls.md)
+# ==========================================================================
+
+def _get_url(url: str) -> tuple[int, dict, bytes]:
+    """GET a ticket's download_url with no Authorization header, as curl would."""
+    from urllib.parse import urlsplit
+    u = urlsplit(url)
+    conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=30)
+    try:
+        conn.request("GET", u.path)
+        resp = conn.getresponse()
+        return resp.status, {k.lower(): v for k, v in resp.getheaders()}, resp.read()
+    finally:
+        conn.close()
+
+
+def download_url_tests() -> None:
+    print(f"\n{YELLOW}DOWNLOAD URLS -- request_download / download_status{RESET}")
+
+    payload = b"%PDF-1.4\x00\x01\x02" + os.urandom(300_000)
+    digest = hashlib.sha256(payload).hexdigest()
+    (REPO / "shared" / "mcp-dl.pdf").write_bytes(payload)
+
+    _s, is_err, t = call_tool("request_download", {"path": "mcp-dl.pdf"})
+    if is_err or not isinstance(t, dict) or "download_url" not in t:
+        R.bad("download", "request_download issues a ticket", f"{t!r}"[:200])
+        return
+    R.ok("download", "request_download returns size, sha256 and a curl_command") \
+        if t.get("size") == len(payload) and t.get("sha256") == digest \
+        and "<OUTPUT_FILE>" in t.get("curl_command", "") and "Bearer" not in t["curl_command"] \
+        else R.bad("download", "ticket fields", f"{t!r}"[:300])
+
+    _s, is_err, st = call_tool("download_status", {"download_id": t["download_id"]})
+    R.ok("download", "download_status reports pending before the GET") \
+        if not is_err and st.get("state") == "pending" \
+        else R.bad("download", "pending status", f"{st!r}"[:200])
+
+    status, hdrs, body = _get_url(t["download_url"])
+    if status == 200 and body == payload and hdrs.get("x-file-sha256") == digest \
+            and "attachment" in hdrs.get("content-disposition", ""):
+        R.ok("download", "300 KB binary (NULs, a PDF) via download_url arrives byte-identical")
+    else:
+        R.bad("download", "GET download_url", f"status {status} len {len(body)}")
+
+    _s, is_err, st = call_tool("download_status", {"download_id": t["download_id"]})
+    R.ok("download", "download_status reports complete with all bytes sent") \
+        if not is_err and st.get("state") == "complete" and st.get("bytes_sent") == len(payload) \
+        else R.bad("download", "complete status", f"{st!r}"[:200])
+
+    status, _h, _b = _get_url(t["download_url"])
+    R.ok("download", "reusing the download_url -> 409") if status == 409 \
+        else R.bad("download", "reuse", f"status {status}")
+
+    bad_url = t["download_url"].rsplit("/", 1)[0] + "/wrong-secret"
+    status, _h, _b = _get_url(bad_url)
+    R.ok("download", "wrong secret -> 404") if status == 404 \
+        else R.bad("download", "wrong secret", f"status {status}")
+
+    # A file replaced after the ticket was issued must not be served under the old hash.
+    (REPO / "shared" / "mcp-dl-changed.txt").write_bytes(b"before")
+    _s, is_err, t3 = call_tool("request_download", {"path": "mcp-dl-changed.txt"})
+    (REPO / "shared" / "mcp-dl-changed.txt").write_bytes(b"after, different size")
+    if not is_err:
+        status, _h, _b = _get_url(t3["download_url"])
+        R.ok("download", "file changed after the ticket was issued -> 409, not served") \
+            if status == 409 and b"before" not in _b and b"different size" not in _b \
+            else R.bad("download", "changed file", f"status {status} {_b[:100]!r}")
+    else:
+        R.bad("download", "request_download for changed-file test", f"{t3!r}"[:200])
+
+    _s, is_err, out = call_tool("request_download", {"path": "mcp-no-such-file.pdf"})
+    R.ok("download", "request_download on a missing file is an error") if is_err \
+        else R.bad("download", "missing file", f"{out!r}"[:200])
+
+    _s, is_err, out = call_tool("download_status", {"download_id": "d_nope"})
+    R.ok("download", "download_status on an unknown id is an error") if is_err \
+        else R.bad("download", "unknown id", f"{out!r}"[:200])
+
+    if RO_TOKEN:
+        _s, is_err, ro = call_tool("request_download", {"path": "mcp-dl.pdf"}, token=RO_TOKEN)
+        if not is_err and isinstance(ro, dict) and "download_url" in ro:
+            status, _h, body = _get_url(ro["download_url"])
+            R.ok("download", "read-only token can request_download and fetch the file") \
+                if status == 200 and body == payload \
+                else R.bad("download", "ro download", f"status {status}")
+        else:
+            R.bad("download", "read-only token request_download", f"{ro!r}"[:200])
+
+    for label, path in [
+        ("traversal", "../secrets.env"),
+        ("absolute", "/etc/passwd"),
+        (".git component", ".git/config"),
+        ("symlink to a file outside", "link-to-secret"),
+        ("hard link to a file outside", "hardlink-to-secret"),
+        ("symlinked parent", "escape-dir/secrets.env"),
+    ]:
+        _s, is_err, out = call_tool("request_download", {"path": path})
+        if is_err and not leaked(out):
+            R.ok("mcp-escape", f"request_download refuses {label} path")
+        else:
+            R.bad("mcp-escape", f"request_download {label}", f"{out!r}"[:200])
+
+    # A symlink swapped in after the ticket was issued must be refused at fetch time.
+    target = REPO / "shared" / "mcp-dl-swap.txt"
+    target.write_bytes(b"harmless")
+    _s, is_err, t4 = call_tool("request_download", {"path": "mcp-dl-swap.txt"})
+    if not is_err:
+        target.unlink()
+        target.symlink_to("../secrets.env")
+        status, _h, body = _get_url(t4["download_url"])
+        R.ok("mcp-escape", "symlink planted after the ticket was issued is not followed") \
+            if status != 200 and not leaked(body) \
+            else R.bad("mcp-escape", "post-issue symlink swap", f"status {status} {body[:100]!r}")
+        target.unlink()
+    else:
+        R.bad("mcp-escape", "request_download for swap test", f"{t4!r}"[:200])
+
+
+# ==========================================================================
+# READ MODES -- read_file offset/length and PDF pages
+# ==========================================================================
+
+def _make_pdf(page_texts: list[str]) -> bytes:
+    """A minimal valid PDF with one line of Helvetica text per page."""
+    objs: list[bytes] = []
+    n = len(page_texts)
+    kids = " ".join(f"{3 + 2 * i} 0 R" for i in range(n))
+    objs.append(b"<< /Type /Catalog /Pages 2 0 R >>")
+    objs.append(f"<< /Type /Pages /Kids [{kids}] /Count {n} >>".encode())
+    font_id = 3 + 2 * n
+    for i, text in enumerate(page_texts):
+        content_id = 4 + 2 * i
+        objs.append(
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {content_id} 0 R "
+            f"/Resources << /Font << /F1 {font_id} 0 R >> >> >>".encode()
+        )
+        stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET".encode()
+        objs.append(b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream")
+    objs.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for i, body in enumerate(objs, start=1):
+        offsets.append(len(out))
+        out += f"{i} 0 obj\n".encode() + body + b"\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode()
+    for off in offsets:
+        out += f"{off:010d} 00000 n \n".encode()
+    out += f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+    return bytes(out)
+
+
+def read_mode_tests() -> None:
+    print(f"\n{YELLOW}READ MODES -- read_file offset/length and PDF pages{RESET}")
+    shared = REPO / "shared"
+
+    # -- ranged text reads ---------------------------------------------
+    text = "".join(f"line {i:05d} \u00e9\n" for i in range(1000))  # multi-byte chars
+    (shared / "mcp-range.txt").write_text(text, encoding="utf-8")
+    want_sha = hashlib.sha256(text.encode()).hexdigest()
+
+    got, off, ok = [], 0, True
+    for _ in range(100):
+        _s, is_err, r = call_tool("read_file", {"path": "mcp-range.txt", "offset": off, "length": 1500})
+        if is_err or not isinstance(r, dict) or r.get("sha256") != want_sha \
+                or r.get("total_chars") != len(text):
+            ok = False
+            break
+        got.append(r["text"])
+        if r["next_offset"] is None:
+            break
+        off = r["next_offset"]
+    R.ok("read", f"paging a {len(text):,}-char file with offset/length reassembles it exactly "
+                 f"({len(got)} calls)") \
+        if ok and "".join(got) == text and len(got) > 1 \
+        else R.bad("read", "ranged paging", f"ok={ok} calls={len(got)}")
+
+    _s, is_err, r = call_tool("read_file", {"path": "mcp-range.txt", "offset": 10})
+    R.ok("read", "offset without length is capped at the inline budget, with next_offset") \
+        if not is_err and r["returned_chars"] <= 2000 and r["next_offset"] == 10 + r["returned_chars"] \
+        else R.bad("read", "offset only", f"{r!r}"[:200])
+
+    _s, is_err, r = call_tool("read_file", {"path": "mcp-range.txt", "length": 99999})
+    R.ok("read", "length larger than the budget is clamped, not an error") \
+        if not is_err and r["returned_chars"] <= 2000 \
+        else R.bad("read", "length clamp", f"{r!r}"[:200])
+
+    _s, is_err, r = call_tool("read_file", {"path": "mcp-range.txt", "offset": len(text) + 1})
+    R.ok("read", "offset past the end is an error") if is_err \
+        else R.bad("read", "offset past end", f"{r!r}"[:200])
+    for bad in ({"offset": -1}, {"length": 0}):
+        _s, is_err, r = call_tool("read_file", {"path": "mcp-range.txt", **bad})
+        R.ok("read", f"read_file {bad} refused") if is_err \
+            else R.bad("read", f"read_file {bad}", f"{r!r}"[:200])
+
+    _s, is_err, r = call_tool("read_file", {"path": "mcp-range.txt"})
+    R.ok("read", "an unranged over-budget read still returns a preview that mentions offset/length") \
+        if not is_err and r.get("truncated") and "offset" in r.get("note", "") \
+        else R.bad("read", "preview note", f"{r!r}"[:200])
+
+    _s, is_err, r = call_tool("read_file", {"path": "mcp-range.txt", "pages": "1"})
+    R.ok("read", "pages on a non-PDF is refused") if is_err \
+        else R.bad("read", "pages on text", f"{r!r}"[:200])
+    _s, is_err, r = call_tool("read_file", {"path": "mcp-range.txt", "encoding": "base64", "offset": 1})
+    R.ok("read", "offset with base64 is refused") if is_err \
+        else R.bad("read", "offset+base64", f"{r!r}"[:200])
+
+    # -- PDF text extraction -------------------------------------------
+    pdf = _make_pdf([f"Homework solution number {i} alpha{i}" for i in range(1, 8)])
+    (shared / "mcp-doc.pdf").write_bytes(pdf)
+    pdf_sha = hashlib.sha256(pdf).hexdigest()
+
+    _s, is_err, r = call_tool("read_file", {"path": "mcp-doc.pdf", "pages": "2-3"})
+    if not is_err and isinstance(r, dict) and r.get("page_count") == 7 \
+            and "alpha2" in r["text"] and "alpha3" in r["text"] and "alpha4" not in r["text"] \
+            and r.get("pages_returned") == "2-3" and r.get("sha256") == pdf_sha \
+            and r.get("bytes") == len(pdf):
+        R.ok("read", "read_file(pages='2-3') returns just those pages' text, with page_count and sha256")
+    else:
+        R.bad("read", "pdf pages 2-3", f"{r!r}"[:300])
+
+    _s, is_err, r = call_tool("read_file", {"path": "mcp-doc.pdf", "pages": "1,5-"})
+    R.ok("read", "page specs like '1,5-' select pages 1,5,6,7") \
+        if not is_err and r.get("pages_returned") == "1,5-7" and "alpha6" in r["text"] \
+        and "alpha2" not in r["text"] \
+        else R.bad("read", "pdf page spec", f"{r!r}"[:300])
+
+    _s, is_err, r = call_tool("read_file", {"path": "mcp-doc.pdf"})
+    R.ok("read", "a PDF with no pages arg starts at page 1 (not a NUL-byte refusal)") \
+        if not is_err and "alpha1" in r.get("text", "") \
+        else R.bad("read", "pdf default", f"{r!r}"[:300])
+
+    _s, is_err, r = call_tool("read_file", {"path": "mcp-doc.pdf", "max_chars": 100})
+    if not is_err and r.get("truncated") and r.get("next_pages"):
+        _s, is_err2, r2 = call_tool("read_file", {"path": "mcp-doc.pdf", "pages": r["next_pages"], "max_chars": 100})
+        R.ok("read", "a tight budget stops early and next_pages continues from there") \
+            if not is_err2 and r2.get("pages_returned", "").split("-")[0] == r["next_pages"].split("-")[0] \
+            else R.bad("read", "pdf continuation", f"{r!r} / {r2!r}"[:300])
+    else:
+        R.bad("read", "pdf budget", f"{r!r}"[:300])
+
+    for bad in ("0", "8", "3-2", "x"):
+        _s, is_err, r = call_tool("read_file", {"path": "mcp-doc.pdf", "pages": bad})
+        R.ok("read", f"pages={bad!r} refused") if is_err and "page" in str(r) \
+            else R.bad("read", f"pdf bad pages {bad!r}", f"{r!r}"[:200])
+
+    _s, is_err, r = call_tool("read_file", {"path": "mcp-doc.pdf", "offset": 5})
+    R.ok("read", "offset on a PDF is refused (use pages)") if is_err and "pages" in str(r) \
+        else R.bad("read", "pdf offset", f"{r!r}"[:200])
+
+    (shared / "mcp-bad.pdf").write_bytes(b"%PDF-1.4\n\x00\x01 this is not a real pdf\n")
+    _s, is_err, r = call_tool("read_file", {"path": "mcp-bad.pdf"})
+    R.ok("read", "a corrupt PDF is refused with a pointer to request_download") \
+        if is_err and "request_download" in str(r) \
+        else R.bad("read", "corrupt pdf", f"{r!r}"[:200])
+
+    _s, is_err, r = call_tool("read_file", {"path": "mcp-doc.pdf", "pages": "1"}, token=RO_TOKEN) \
+        if RO_TOKEN else (0, False, {"text": "alpha1"})
+    R.ok("read", "read-only token can read PDF text") if not is_err and "alpha1" in r["text"] \
+        else R.bad("read", "ro pdf", f"{r!r}"[:200])
+
+
 def main() -> int:
     print(f"{YELLOW}claude-files MCP connector containment suite{RESET}  mode={MODE}  target={BASE}")
 
@@ -1090,6 +1353,8 @@ def main() -> int:
     chunked_writes()
     copy_tests()
     upload_url_tests()
+    download_url_tests()
+    read_mode_tests()
     escapes()
     after = snapshot()
 

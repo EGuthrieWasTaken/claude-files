@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .config import Config
+from .downloads import DownloadTicket, DownloadTickets
 from .safepath import Entry, PathError, Vault
 from .uploads import (
     TicketExpired,
@@ -39,11 +40,12 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
-# The upload-ticket URL is `/v1/uploads/{id}/{secret}` -- the secret in the
-# path is the sole authorization for that route (see docs/upload-urls.md), so
-# it must never reach a log. Redact it from uvicorn's access log, which
-# otherwise prints the raw request path verbatim.
-_TICKET_SECRET_IN_PATH = re.compile(r"(/v1/uploads/[^/\s\"?]+)/[^/\s\"?]+")
+# The ticket URLs are `/v1/uploads/{id}/{secret}` and
+# `/v1/downloads/{id}/{secret}` -- the secret in the path is the sole
+# authorization for those routes (see docs/upload-urls.md and
+# docs/download-urls.md), so it must never reach a log. Redact it from
+# uvicorn's access log, which otherwise prints the raw request path verbatim.
+_TICKET_SECRET_IN_PATH = re.compile(r"(/v1/(?:uploads|downloads)/[^/\s\"?]+)/[^/\s\"?]+")
 
 
 class _RedactUploadSecrets(logging.Filter):
@@ -79,6 +81,11 @@ VAULT = Vault(
 TICKETS = UploadTickets(
     ttl_seconds=CONFIG.upload_ticket_ttl_seconds,
     max_tickets=CONFIG.upload_tickets_max,
+)
+
+DOWNLOAD_TICKETS = DownloadTickets(
+    ttl_seconds=CONFIG.download_ticket_ttl_seconds,
+    max_tickets=CONFIG.download_tickets_max,
 )
 
 DESCRIPTION = """
@@ -230,6 +237,34 @@ class UploadResultResponse(BaseModel):
     path: str
     size: int
     sha256: str
+
+
+class DownloadCreateRequest(BaseModel):
+    path: str = Field(description="File to download, relative to the shared folder")
+
+
+class DownloadCreateResponse(BaseModel):
+    download_id: str
+    download_url: str
+    method: str = "GET"
+    path: str
+    size: int
+    sha256: str
+    expires_at: float
+    curl_command: str
+
+
+class DownloadStatusResponse(BaseModel):
+    download_id: str
+    path: str
+    state: str = Field(description="pending | streaming | complete | failed | expired")
+    bytes_sent: int
+    size: int
+    sha256: str
+    error: UploadErrorModel | None = None
+    created_at: float
+    expires_at: float
+    completed_at: float | None = None
 
 
 def _to_model(e: Entry) -> EntryModel:
@@ -391,6 +426,8 @@ def info(scope: ReadAuth) -> dict[str, Any]:
         "bridge_available": _bridge_script_path() is not None,
         "upload_ticket_ttl_seconds": CONFIG.upload_ticket_ttl_seconds,
         "upload_tickets_max": CONFIG.upload_tickets_max,
+        "download_ticket_ttl_seconds": CONFIG.download_ticket_ttl_seconds,
+        "download_tickets_max": CONFIG.download_tickets_max,
     }
 
 
@@ -697,7 +734,7 @@ def move(req: MoveRequest, _: WriteAuth) -> OkResponse:
 
 
 def _public_base_url(request: Request | None) -> str:
-    """Base URL for a ticket's upload_url: PUBLIC_BASE_URL, else
+    """Base URL for a ticket's upload_url / download_url: PUBLIC_BASE_URL, else
     MCP_PUBLIC_HOSTNAME, else whatever the (proxied) request says."""
     if CONFIG.public_base_url:
         return CONFIG.public_base_url.rstrip("/")
@@ -706,7 +743,7 @@ def _public_base_url(request: Request | None) -> str:
     if request is None:
         raise PathError(
             500, "no_base_url",
-            "Cannot build an upload URL: set PUBLIC_BASE_URL on the server",
+            "Cannot build a ticket URL: set PUBLIC_BASE_URL on the server",
         )
     proto = request.headers.get("x-forwarded-proto", request.url.scheme)
     host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
@@ -918,6 +955,160 @@ async def upload_bytes(request: Request, upload_id: str, secret: str) -> UploadR
     TICKETS.mark_complete(ticket.upload_id, size=size, sha256=digest)
     log.info("upload %s complete: %s (%d bytes)", ticket.upload_id, ticket.path, size)
     return UploadResultResponse(upload_id=ticket.upload_id, path=ticket.path, size=size, sha256=digest)
+
+
+# --------------------------------------------------------------------------
+# One-time download tickets -- docs/download-urls.md
+# --------------------------------------------------------------------------
+
+def issue_download_ticket(path: str, *, request: Request | None) -> DownloadCreateResponse:
+    """Validate a file and mint a one-time download ticket.
+
+    Shared by POST /v1/downloads and the MCP request_download tool. Hashes the
+    file now so the caller gets `sha256` up front and can verify the bytes
+    after curl; the download re-checks size and mtime so a file replaced in
+    between is refused rather than served with a stale hash.
+    """
+    parts = VAULT.components(path)
+    if not parts:
+        raise PathError(403, "is_root", "Cannot download the root itself")
+
+    fd, st = VAULT.open_read(parts)
+    hasher = hashlib.sha256()
+    try:
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    finally:
+        os.close(fd)
+
+    base_url = _public_base_url(request)
+    try:
+        ticket = DOWNLOAD_TICKETS.create(
+            parts=parts, size=st.st_size, mtime_ns=st.st_mtime_ns, sha256=hasher.hexdigest()
+        )
+    except TicketLimitReached:
+        raise PathError(
+            503, "too_many_downloads", "Too many pending downloads; try again shortly"
+        ) from None
+
+    download_url = f"{base_url}/v1/downloads/{ticket.download_id}/{ticket.secret}"
+    log.info("download ticket %s created for %s", ticket.download_id, ticket.path)
+    return DownloadCreateResponse(
+        download_id=ticket.download_id,
+        download_url=download_url,
+        path=ticket.path,
+        size=ticket.size,
+        sha256=ticket.sha256,
+        expires_at=ticket.expires_at,
+        curl_command=f"curl -sS --fail-with-body -o <OUTPUT_FILE> '{download_url}'",
+    )
+
+
+def download_ticket_status(download_id: str) -> DownloadStatusResponse:
+    ticket = DOWNLOAD_TICKETS.get(download_id)
+    if ticket is None:
+        raise PathError(404, "not_found", "No such download")
+    return DownloadStatusResponse(
+        download_id=ticket.download_id,
+        path=ticket.path,
+        state=ticket.effective_state(),
+        bytes_sent=ticket.bytes_sent,
+        size=ticket.size,
+        sha256=ticket.sha256,
+        error=UploadErrorModel(**ticket.error) if ticket.error else None,
+        created_at=ticket.created_at,
+        expires_at=ticket.expires_at,
+        completed_at=ticket.completed_at,
+    )
+
+
+@app.post("/v1/downloads", response_model=DownloadCreateResponse, status_code=201, tags=["read"],
+          summary="Create a one-time download ticket (read-only tokens allowed)")
+def create_download(
+    req: DownloadCreateRequest, request: Request, _: ReadAuth
+) -> DownloadCreateResponse:
+    return issue_download_ticket(req.path, request=request)
+
+
+@app.get("/v1/downloads/{download_id}", response_model=DownloadStatusResponse, tags=["read"],
+         summary="Check a download ticket's status")
+def download_status(_: ReadAuth, download_id: str) -> DownloadStatusResponse:
+    return download_ticket_status(download_id)
+
+
+def _stream_ticket_download(fd: int, ticket: DownloadTicket) -> Iterator[bytes]:
+    sent = 0
+    try:
+        while True:
+            data = os.read(fd, 256 * 1024)
+            if not data:
+                break
+            sent += len(data)
+            DOWNLOAD_TICKETS.update_progress(ticket.download_id, sent)
+            yield data
+    finally:
+        os.close(fd)
+        if sent == ticket.size:
+            DOWNLOAD_TICKETS.mark_complete(ticket.download_id)
+            log.info("download %s complete: %s (%d bytes)", ticket.download_id, ticket.path, sent)
+        else:
+            DOWNLOAD_TICKETS.mark_failed(
+                ticket.download_id,
+                code="interrupted",
+                message=f"Sent {sent} of {ticket.size} bytes before the transfer ended",
+            )
+            log.warning("download %s interrupted at %d/%d bytes", ticket.download_id, sent, ticket.size)
+
+
+@app.get("/v1/downloads/{download_id}/{secret}", tags=["read"],
+         summary="Download the bytes for a ticket (no bearer token; the secret is the authorization)")
+def download_bytes(download_id: str, secret: str, request: Request) -> StreamingResponse:
+    _rate_limit()
+    try:
+        ticket = DOWNLOAD_TICKETS.begin_stream(download_id, secret)
+    except TicketNotFound:
+        log.warning("denied %s /v1/downloads/%s/<secret> -> not_found", request.method, download_id)
+        raise HTTPException(404, detail={"code": "not_found", "message": "No such download"}) from None
+    except TicketExpired:
+        raise HTTPException(
+            410, detail={"code": "expired", "message": "Download ticket has expired"}
+        ) from None
+    except TicketNotPending as exc:
+        raise HTTPException(
+            409,
+            detail={"code": "conflict", "message": f"Download ticket already {exc.state}"},
+        ) from None
+
+    # Same as upload_bytes: PathError is translated to HTTPException so it
+    # never reaches the PathError handler, which logs a path carrying the secret.
+    try:
+        fd, st = VAULT.open_read(ticket.parts)
+    except PathError as exc:
+        DOWNLOAD_TICKETS.mark_failed(ticket.download_id, code=exc.code, message=exc.message)
+        log.warning("download %s failed: %s (%s)", ticket.download_id, exc.code, exc.message)
+        raise HTTPException(exc.status, detail={"code": exc.code, "message": exc.message}) from exc
+
+    if st.st_size != ticket.size or st.st_mtime_ns != ticket.mtime_ns:
+        os.close(fd)
+        message = "File changed after the ticket was issued; request a new download"
+        DOWNLOAD_TICKETS.mark_failed(ticket.download_id, code="file_changed", message=message)
+        log.warning("download %s failed: file_changed", ticket.download_id)
+        raise HTTPException(409, detail={"code": "file_changed", "message": message})
+
+    filename = ticket.parts[-1].replace('"', "")
+    return StreamingResponse(
+        _stream_ticket_download(fd, ticket),
+        media_type="application/octet-stream",
+        headers={
+            "Content-Length": str(ticket.size),
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-File-Size": str(ticket.size),
+            "X-File-Sha256": ticket.sha256,
+        },
+    )
 
 
 @app.post("/v1/copy", response_model=OkResponse, tags=["write"],

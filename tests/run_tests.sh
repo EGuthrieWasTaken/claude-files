@@ -96,6 +96,7 @@ common_flags=(
   -e API_TOKEN_READONLY="$RO_TOKEN"
   -e MAX_UPLOAD_BYTES=2097152
   -e UPLOAD_TICKET_TTL_SECONDS=3
+  -e DOWNLOAD_TICKET_TTL_SECONDS=3
   -e LOG_LEVEL=INFO
   -e ENABLE_MCP=true
   -e MCP_INLINE_LIMIT_CHARS="$MCP_INLINE_LIMIT_CHARS"
@@ -117,7 +118,7 @@ run_mode() {
 
   local test_out="$FIXTURE/test_output_$name.log"
   if ! ( BASE_URL="127.0.0.1:$port" API_TOKEN="$TOKEN" API_TOKEN_READONLY="$RO_TOKEN" \
-         FIXTURE_REPO="$FIXTURE/repo" MODE="$mode" UPLOAD_TICKET_TTL_SECONDS=3 \
+         FIXTURE_REPO="$FIXTURE/repo" MODE="$mode" UPLOAD_TICKET_TTL_SECONDS=3 DOWNLOAD_TICKET_TTL_SECONDS=3 \
            python3 tests/escape_suite.py 2>&1 | tee "$test_out" ); then
     FAIL=1
   fi

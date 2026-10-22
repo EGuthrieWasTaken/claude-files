@@ -52,11 +52,14 @@ class Config:
     # advertised budgets are wrong by roughly 200x"), not a context-cost
     # budget. Above it, write_file refuses and names begin_write.
     mcp_base64_limit_bytes: int = 8 * 1024
+    mcp_pdf_max_bytes: int = 32 * 1024 * 1024
     mcp_upload_session_ttl_seconds: int = 900
     mcp_max_concurrent_uploads: int = 8
     mcp_upload_chunk_advisory_bytes: int = 3072
     upload_ticket_ttl_seconds: int = 900
     upload_tickets_max: int = 100
+    download_ticket_ttl_seconds: int = 900
+    download_tickets_max: int = 100
     public_base_url: str = ""
 
     @classmethod
@@ -92,10 +95,13 @@ class Config:
             mcp_public_hostname=os.environ.get("MCP_PUBLIC_HOSTNAME", "").strip(),
             mcp_inline_limit_chars=_env_int("MCP_INLINE_LIMIT_CHARS", 100_000),
             mcp_base64_limit_bytes=_env_int("MCP_BASE64_LIMIT_BYTES", 8 * 1024),
+            mcp_pdf_max_bytes=_env_int("MCP_PDF_MAX_BYTES", 32 * 1024 * 1024),
             mcp_upload_session_ttl_seconds=_env_int("MCP_UPLOAD_SESSION_TTL_SECONDS", 900),
             mcp_max_concurrent_uploads=_env_int("MCP_MAX_CONCURRENT_UPLOADS", 8),
             mcp_upload_chunk_advisory_bytes=_env_int("MCP_UPLOAD_CHUNK_ADVISORY_BYTES", 3072),
             upload_ticket_ttl_seconds=_env_int("UPLOAD_TICKET_TTL_SECONDS", 900),
             upload_tickets_max=_env_int("UPLOAD_TICKETS_MAX", 100),
+            download_ticket_ttl_seconds=_env_int("DOWNLOAD_TICKET_TTL_SECONDS", 900),
+            download_tickets_max=_env_int("DOWNLOAD_TICKETS_MAX", 100),
             public_base_url=os.environ.get("PUBLIC_BASE_URL", "").strip(),
         )

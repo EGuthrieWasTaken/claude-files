@@ -873,13 +873,13 @@ Write mode only:
 11. `$GIT_REPO_ROOT/.git` and `DATA_ROOT` are writable (a probe with
     `os.access` and `statvfs`), so a misconfigured `:ro` on the wrong mount
     fails at startup, not on the first commit.
-11a. If `GIT_PULL_OUTSIDE_SCOPE=true` and the scope isn't `.`:
+12. If `GIT_PULL_OUTSIDE_SCOPE=true` and the scope isn't `.`:
     `GIT_REPO_ROOT` must be writable. Otherwise startup refuses, explaining
     that the option needs the root mounted read-write and that dropping the
     option keeps the read-only mount.
-12. If `SSH_KEY_PATH` is set: it's a file, it stages to 0600, and
+13. If `SSH_KEY_PATH` is set: it's a file, it stages to 0600, and
     `SSH_KNOWN_HOSTS_PATH` is set and is a file.
-13. If `ENABLE_GIT_READ=false`: log the warning described under
+14. If `ENABLE_GIT_READ=false`: log the warning described under
     [Why read and write are split this way](#why-read-and-write-are-split-this-way).
 
 Startup doesn't contact the remote. The first write call surfaces

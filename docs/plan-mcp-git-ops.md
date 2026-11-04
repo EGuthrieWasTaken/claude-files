@@ -1,6 +1,8 @@
 # Plan: git status / commit / pull / push / merge tools, scoped to one folder
 
-**Status: proposed.** Nothing in this document is implemented yet.
+**Status: proposed, design decisions taken.** Nothing in this document is
+implemented yet. The questions settled in review are recorded under
+[Decisions](#decisions); two remain under [Open questions](#open-questions).
 
 Follows [`docs/plan-mcp-connector.md`](plan-mcp-connector.md) and
 [`docs/plan-mcp-large-writes.md`](plan-mcp-large-writes.md), both shipped.
@@ -83,6 +85,11 @@ The two rules:
    working tree and history published to the remote. Where git would need to
    do so, the tool refuses **before touching anything** and says why.
 
+   There is one opt-in exception, off by default: `GIT_PULL_OUTSIDE_SCOPE=true`
+   lets a pull bring **remote** content into `sub-folder-2`. Even with it on,
+   the agent can never *author* a change outside its folder. See
+   [Opt-in: pulling remote changes outside the scope](#opt-in-pulling-remote-changes-outside-the-scope).
+
 A repository whose root *is* the agent's folder is the degenerate case: the
 scope is `.`, rule 2 is vacuous, and everything below still applies.
 
@@ -142,8 +149,8 @@ If the repo root is mounted **read-write** instead (a single
 still applies. But the write boundary is then enforced by code only.
 Startup detects this (`statvfs(GIT_REPO_ROOT).f_flag & ST_RDONLY`), logs a
 warning, and reports `"write_boundary": "software"` instead of `"kernel"`
-in `get_folder_info` (open question 6 asks whether this should be a refusal
-instead).
+in `get_folder_info`. **This is a warning, not a refusal** (decided). A
+writable root is also what `GIT_PULL_OUTSIDE_SCOPE` requires.
 
 ### How each write tool stays inside the scope
 
@@ -156,7 +163,7 @@ attempted.
 | Tool | What could leak out of scope | Pre-check |
 |---|---|---|
 | `git_commit` | Changes someone **staged on the host** in `sub-folder-2` would be included by a plain `git commit` | Build the commit with a **temporary index** that only scope paths are added to, then verify `diff-tree parent new` ⊆ scope **before** moving `HEAD` (see [`git_commit`](#git_commit)) |
-| `git_pull`, `git_merge` | Incoming commits that change `sub-folder-2` would rewrite those files on the host | Compute the result **without touching the tree** (`git merge-tree --write-tree`, or `diff HEAD..target` for fast-forward), and refuse with `outside_scope` if any changed path is outside scope |
+| `git_pull`, `git_merge` | Incoming commits that change `sub-folder-2` would rewrite those files on the host | Compute the result **without touching the tree** (`git merge-tree --write-tree`, or `diff HEAD..target` for fast-forward), and refuse with `outside_scope` if any changed path is outside scope. With the opt-in, outside paths are allowed only when their content comes verbatim from the remote. |
 | `git_push` | Commits made **on the host** that touch `sub-folder-2` and haven't been pushed would be published by the agent | Every commit in `<remote>/<branch>..HEAD` must change only scope paths (rule in [`git_push`](#git_push)); otherwise refuse with `outside_scope_commits` |
 | `git_fetch` | Nothing: only `refs/remotes/*` change | — |
 
@@ -165,14 +172,53 @@ output, against the scope prefix with a trailing slash, so `sub-folder-10/`
 doesn't match `sub-folder-1/`. Renames count as both paths: a file moved
 from `sub-folder-2` into scope touches `sub-folder-2`.
 
-**The trade-off this makes, deliberately.** If someone pushes changes to
-`sub-folder-2` upstream, the agent **can't pull them**: that would write
+**The trade-off the default makes, deliberately.** If someone pushes changes
+to `sub-folder-2` upstream, the agent **can't pull them**: that would write
 outside its folder. Until someone pulls on the host, the agent's own pushes
 will be rejected as non-fast-forward. The refusal message says exactly this
 and names the incoming paths, so the agent can tell the user "pull on the
-host, then I can push". Open question 2 is whether to offer an opt-in that
-lets the agent bring in *remote-authored* content outside its folder (which
-also needs a read-write root mount).
+host, then I can push". The opt-in below removes that blockage.
+
+### Opt-in: pulling remote changes outside the scope
+
+`GIT_PULL_OUTSIDE_SCOPE=true` (default `false`) lets `git_pull`, and
+`git_merge` of a remote-tracking ref, update files outside the scope, **but
+only with content that already exists on the remote**. The agent still can't
+author anything outside its folder. Commits stay scope-only, and the push
+check is unchanged. What it gains is the ability to keep the branch current
+when other people change `sub-folder-2` upstream.
+
+The rule, checked on the computed result before anything is touched (I8):
+
+> **For every path outside the scope, the result's blob must be identical to
+> the blob at that path in either `HEAD` (unchanged) or `T`, the
+> remote-tracking ref (taken verbatim from the remote).**
+
+What that allows and refuses:
+
+| Situation | Result |
+|---|---|
+| Upstream changed `sub-folder-2/a`; nobody changed it locally | Allowed: `a` becomes the remote's blob |
+| Upstream changed `sub-folder-2/a`; a host commit also changed it | **Refused** `outside_scope`. A 3-way content merge would produce a new blob that neither side wrote. Pull on the host. |
+| `git_merge` of a **local** branch that touches `sub-folder-2` | **Refused** `outside_scope`. That content isn't on the remote, so the opt-in doesn't apply to local refs. |
+| `strategy="rebase"` with an unpushed **host** commit touching `sub-folder-2` in `T..HEAD` | **Refused** `outside_scope_commits`, in both modes. Rebasing would rewrite a human's commits. Use `strategy="merge"`. |
+| A human's **uncommitted** edit to a file the pull would update | Git refuses before changing anything → `dirty_worktree`, listing the outside path. "Ask the user to commit or stash on the host." Git never overwrites it. |
+
+Requirements and consequences:
+
+- **The repository root must be mounted read-write.** A pull that changes
+  `sub-folder-2` can't happen through a read-only mount, so startup refuses
+  `GIT_PULL_OUTSIDE_SCOPE=true` when the root is read-only. The write
+  boundary is then `"software"`, and the warning above is logged as usual.
+- The files a human sees in `sub-folder-2` can change under them when the
+  agent pulls. That's the point of the option, and it's why it's off by
+  default.
+- With scope `.` (whole repository) the option has no effect; startup logs
+  that at INFO.
+- `get_folder_info.git.pull_outside_scope` reports it, and the tool
+  descriptions say which mode is active, so the agent knows whether
+  `outside_scope` means "ask the user to pull on the host" or "this specific
+  file has a local change too".
 
 ---
 
@@ -191,7 +237,9 @@ changes to the configured remote. In particular it must not get:
    `ext::` transports, and others. If the agent can write any of them, a
    commit or pull becomes `exec`.
 2. **A write outside the scope**, on disk or in published history. See
-   [The scope model](#the-scope-model).
+   [The scope model](#the-scope-model). The one exception is opt-in and
+   narrow: remote content brought in verbatim by a pull. Agent-authored
+   content outside the scope is impossible in both modes.
 3. **The deploy key or token.** It's mounted outside both `/repo` and
    `DATA_ROOT`, so no file tool can name it, and no git output may echo it.
    It now lives in the agent-facing process, not a separate container (see
@@ -281,7 +329,7 @@ None of it reaches git or ssh except through the names above.
 `.git/config` says otherwise:
 
 ```
--c core.hooksPath=/dev/null           # unless GIT_RUN_HOOKS=true, see open question 1
+-c core.hooksPath=/dev/null           # always: hooks never run (see Decisions)
 -c core.fsmonitor=false
 -c core.untrackedCache=false
 -c core.pager=cat
@@ -294,7 +342,7 @@ None of it reaches git or ssh except through the names above.
 -c submodule.recurse=false
 -c fetch.recurseSubmodules=false
 -c diff.external=
--c commit.gpgsign=false               # see open question 3
+-c commit.gpgsign=false               # see Open questions, 1
 -c gc.auto=0  -c maintenance.auto=false   # no multi-minute gc inside a tool call
 -c safe.directory=$GIT_REPO_ROOT      # container uid vs. host owner
 ```
@@ -439,7 +487,7 @@ like every other refusal. REST returns
 |---|---|---|
 | `readonly` | 403 | Write tool, read-only token. Same `READONLY_MESSAGE` as today. |
 | `git_disabled` | 404 | REST only. MCP never sees it, because disabled tools aren't registered. |
-| `outside_scope` | 409 | A pull/merge would change files outside the folder. Lists them. "Ask the user to pull on the host." |
+| `outside_scope` | 409 | A pull/merge would change files outside the folder (or, with `GIT_PULL_OUTSIDE_SCOPE`, would change them with content not taken verbatim from the remote). Lists them. "Ask the user to pull on the host." |
 | `outside_scope_commits` | 409 | A push would publish commits that touch files outside the folder. Lists commits and paths. "These were committed outside claude-files; push them from the host." |
 | `nothing_to_commit` | 409 | No changes in scope. Says how many out-of-scope changes exist, if any, so "but status shows changes" is explained. |
 | `too_many_changes` | 409 | Over `GIT_MAX_CHANGED_FILES`. |
@@ -508,10 +556,12 @@ git_diff(ctx, staged: bool = False, path: str | None = None,
 ```
 
 - `git diff [--cached] --no-ext-diff --no-textconv --no-color -- <scope or path>`.
-- **Scope only.** `path` is scope-relative and validated as above. With no
-  `path`, the whole scope is diffed. `git_status` already discloses *names*
-  outside the scope. Showing the *contents* of `sub-folder-2` is a bigger
-  read than you've signed off on, so v1 doesn't (open question 5).
+- **Scope only, always** (decided). `path` is scope-relative and validated as
+  above. With no `path`, the whole scope is diffed. The pathspec is always
+  the scope or a path under it, so changes outside `sub-folder-1` never
+  appear in a diff, staged or unstaged. `git_status` discloses only the
+  *names* of out-of-scope changes; their *contents* are never returned by any
+  git tool.
 - Same truncation contract as `read_file`'s text path:
   `MCP_INLINE_LIMIT_CHARS`, with `offset`/`length` paging and
   `{truncated, total_chars, note}`.
@@ -617,12 +667,19 @@ git_pull(ctx, strategy: Literal["ff-only", "merge", "rebase"] = "ff-only") -> di
      result and any conflicts **without touching the index or tree**.
      Conflicts → `conflict` (nothing changed). Otherwise
      `diff-tree HEAD <result>` ⊆ scope.
-   - `rebase`: `diff-tree $(merge-base HEAD T) T` ⊆ scope (what upstream
+   - `rebase`: every commit in `T..HEAD` (the ones that would be rewritten,
+     all unpushed by definition) must touch only scope paths. Otherwise the
+     result is `outside_scope_commits`, because rebasing would rewrite a human's
+     commits. Then `diff-tree $(merge-base HEAD T) T` ⊆ scope (what upstream
      changed), and a dry `merge-tree` of each local commit onto `T` must be
-     conflict-free. Only commits in `T..HEAD` are rebased, and those are by
-     definition unpushed.
+     conflict-free.
 
-   Any path outside scope → `outside_scope` with the list.
+   Any path outside scope → `outside_scope` with the list. With
+   `GIT_PULL_OUTSIDE_SCOPE=true`, the "⊆ scope" checks above are replaced by
+   the blob rule in
+   [the opt-in section](#opt-in-pulling-remote-changes-outside-the-scope).
+   Out-of-scope paths must end with `HEAD`'s or `T`'s exact blob. The
+   rebase commit check still applies.
 4. Take `WORKTREE_GATE` exclusive. Run the real `git merge --ff-only T` /
    `git merge --no-edit T` / `git rebase T` (no network). In-scope dirty
    files that incoming changes would overwrite make git refuse before
@@ -657,7 +714,10 @@ and 4 as `git_pull`, with the same results.
 4. Only the **resolved full refname** goes into argv, after
    `--end-of-options`. The agent's string never does.
 
-Merging the current branch into itself is refused.
+Merging the current branch into itself is refused. `GIT_PULL_OUTSIDE_SCOPE`
+applies only when `ref` resolved under `refs/remotes/<GIT_REMOTE>/`. A local
+branch's out-of-scope content isn't on the remote, so merging it is always
+held to the strict scope check.
 
 ### `git_fetch`
 
@@ -679,6 +739,7 @@ the range that `git_push`'s scope check uses.
   "write_enabled": true,
   "scope": "sub-folder-1/",
   "write_boundary": "kernel",
+  "pull_outside_scope": false,
   "remote": "origin",
   "branch": "main",
   "hooks": "disabled",
@@ -740,7 +801,7 @@ New variables in `app/config.py`, `.env.example`, `docker-compose.yml`,
 | `GIT_MAX_CHANGED_FILES` | `1000` | `git_commit` runaway guard. `0` disables. |
 | `GIT_NETWORK_TIMEOUT_SECONDS` | `60` | Fetch/push timeout. |
 | `GIT_LOCAL_TIMEOUT_SECONDS` | `30` | Timeout for every other git call. |
-| `GIT_RUN_HOOKS` | `false` | See open question 1. |
+| `GIT_PULL_OUTSIDE_SCOPE` | `false` | Let pulls bring remote content into paths outside the scope. Requires a writable repo-root mount. See [the opt-in section](#opt-in-pulling-remote-changes-outside-the-scope). |
 | `SSH_KEY_PATH` | — | Deploy key, for ssh remotes. |
 | `SSH_KNOWN_HOSTS_PATH` | — | **Required** if `SSH_KEY_PATH` is set. |
 | `GIT_TOKEN` | — | HTTPS token instead of a key. |
@@ -812,6 +873,10 @@ Write mode only:
 11. `$GIT_REPO_ROOT/.git` and `DATA_ROOT` are writable (a probe with
     `os.access` and `statvfs`), so a misconfigured `:ro` on the wrong mount
     fails at startup, not on the first commit.
+11a. If `GIT_PULL_OUTSIDE_SCOPE=true` and the scope isn't `.`:
+    `GIT_REPO_ROOT` must be writable. Otherwise startup refuses, explaining
+    that the option needs the root mounted read-write and that dropping the
+    option keeps the read-only mount.
 12. If `SSH_KEY_PATH` is set: it's a file, it stages to 0600, and
     `SSH_KNOWN_HOSTS_PATH` is set and is a file.
 13. If `ENABLE_GIT_READ=false`: log the warning described under
@@ -861,6 +926,23 @@ the test transport. A second, smaller pass runs the scope-`.` layout.
 - A merge commit whose out-of-scope content comes only from the published
   parent → push allowed.
 - `sub-folder-10/` sibling: not treated as in scope.
+- `git_diff` (staged and unstaged) with changes on both sides of the
+  boundary: output contains only `sub-folder-1` paths.
+- `strategy="rebase"` with an unpushed host commit touching `sub-folder-2`
+  → `outside_scope_commits`, history unchanged.
+
+**Scope: `GIT_PULL_OUTSIDE_SCOPE=true`** (writable-root fixture)
+- Upstream changes `sub-folder-2/a` → `git_pull` ff-only and merge both
+  succeed, and `a` matches the remote byte for byte.
+- Upstream and a host commit both change `sub-folder-2/a` → `outside_scope`,
+  nothing changed.
+- `git_merge` of a local branch touching `sub-folder-2` → `outside_scope`.
+- Host has an uncommitted edit to `sub-folder-2/a`, and upstream changes it →
+  `dirty_worktree` listing it, and the edit is intact.
+- After a merge that brought in outside content, `git_push` succeeds (the
+  merge commit's diff against the remote parent is scope-only).
+- With a read-only root mount → startup refused. With scope `.` → INFO
+  logged, no effect.
 - Every file tool and REST route with `../sub-folder-2/x`, encoded variants,
   and the absolute `/repo/sub-folder-2/x`: refused, canary unchanged.
 - With the `:ro` root mount: a `docker exec` write to
@@ -905,11 +987,12 @@ One PR per phase, each shippable on its own:
 1. **Foundations + push/pull.** `app/git_ops.py` (execution, env, `-c` flags,
    scrubbing, locks, startup validation, the scope engine), both switches,
    `GIT_REPO_ROOT`, `git_status`, `git_commit`, `git_pull` (`ff-only`),
-   `git_push`, `git_fetch`, the `get_folder_info`/`/v1/info` block, REST
-   routes, `WITH_GIT`, and **all of the scope and containment tests**. Those
-   tests land with the first tool that runs git, not after it.
-2. **Merge.** `git_merge`, `git_pull(strategy="merge" | "rebase")`, and the
-   conflict and `invalid_ref` tests.
+   `git_push`, `git_fetch`, `GIT_PULL_OUTSIDE_SCOPE` for ff-only pulls, the
+   `get_folder_info`/`/v1/info` block, REST routes, `WITH_GIT`, and **all of
+   the scope and containment tests**. Those tests land with the first tool
+   that runs git, not after it.
+2. **Merge.** `git_merge`, `git_pull(strategy="merge" | "rebase")`, the
+   opt-in blob rule for merges, and the conflict and `invalid_ref` tests.
 3. **Inspection.** `git_log`, `git_diff`.
 
 README (a new "Git mode" section under "MCP connector", a rewritten
@@ -954,30 +1037,33 @@ registration. It isn't in v1.
 
 ---
 
+## Decisions
+
+Settled in review. Recorded here so the reasoning survives.
+
+1. **Hooks never run.** `core.hooksPath=/dev/null` is forced on every
+   invocation, and there is no variable to change it. A hook that runs repo
+   code (`npm test`, `pre-commit run`) would execute agent-written files,
+   which would turn "can write a file" into "can execute code in the
+   container". `git_commit` uses plumbing (`commit-tree`), so commit hooks
+   wouldn't run anyway; the override covers merge, rebase, push and
+   reference-transaction hooks.
+2. **`git_diff` shows only changes inside the scope.** Its pathspec is always
+   the scope or a path under it. Content of out-of-scope changes is never
+   returned by any git tool; `git_status` discloses names only.
+3. **A writable repo-root mount is a warning, not a refusal.** It's logged,
+   and reported as `write_boundary: "software"`. The read-only root is the
+   recommended layout, and the README says why.
+4. **Pulling remote content outside the scope is an opt-in.**
+   `GIT_PULL_OUTSIDE_SCOPE=true`, off by default, requires a writable root
+   and is bounded by the blob rule in
+   [the opt-in section](#opt-in-pulling-remote-changes-outside-the-scope).
+
 ## Open questions
 
-1. **Hooks.** `GIT_RUN_HOOKS=false` is the default, and this spec recommends
-   leaving it that way. A hook that runs repo code (`npm test`,
-   `pre-commit run`) executes **agent-written files**, which turns "can write
-   a file" into "can execute code in the container". If the option is
-   offered at all, startup should log a warning that says exactly that.
-2. **Remote-authored changes outside the scope.** In strict mode, upstream
-   changes to `sub-folder-2` block the agent's pull, and so its push, until
-   someone pulls on the host. An opt-in `GIT_PULL_OUTSIDE_SCOPE=true` could
-   allow pulls/merges whose outside-scope changes come **only** from commits
-   already on the remote (the agent still can't author them). That requires
-   a writable repo-root mount (`write_boundary: "software"`), and it means
-   the agent's pull rewrites files a human may be looking at. Off unless you
-   want it.
-3. **Signed commits.** This spec forces `commit.gpgsign=false`. If the
+1. **Signed commits.** This spec forces `commit.gpgsign=false`. If the
    remote requires signed commits, every push will be rejected, and that
    needs a signing key in the container (out of scope).
-4. **Branch switching.** Deliberately absent: `GIT_BRANCH` pins one branch. A
+2. **Branch switching.** Deliberately absent: `GIT_BRANCH` pins one branch. A
    workflow where the agent opens `agent/*` branches for a human to merge
    needs branch-name policy and its own document.
-5. **`git_diff` outside the scope.** v1 diffs only the scope. You've accepted
-   reads across the boundary via `git_status`. Should `git_diff` also show
-   *contents* of out-of-scope changes?
-6. **Writable repo root: warn or refuse?** v1 warns and reports
-   `write_boundary: "software"`. A refusal (with an explicit override) would
-   make the kernel boundary non-optional for subfolder scopes.

@@ -29,6 +29,7 @@ new_fixture() {
 }
 IMAGE="claude-files:test"
 IMAGE_NOMCP="claude-files:test-nomcp"
+IMAGE_NOGIT="claude-files:test-nogit"
 TOKEN="test-token-$(openssl rand -hex 16)"
 RO_TOKEN="test-ro-token-$(openssl rand -hex 16)"
 # Deliberately small so tests/mcp_escape_suite.py's budget checks (truncation,
@@ -50,7 +51,7 @@ MCP_UPLOAD_CHUNK_ADVISORY_BYTES=3072
 FAIL=0
 
 cleanup() {
-  docker rm -f cf-test-a cf-test-b cf-test-nomcp cf-test-offswitch >/dev/null 2>&1 || true
+  docker rm -f cf-test-a cf-test-b cf-test-nomcp cf-test-offswitch cf-test-git >/dev/null 2>&1 || true
   [[ "${KEEP_FIXTURE:-0}" == "1" ]] || rm -rf "$FIXTURE_BASE"
 }
 trap cleanup EXIT
@@ -63,6 +64,15 @@ if docker run --rm --entrypoint /venv/bin/pip "$IMAGE" check; then
   echo "  PASS  no broken requirements (fastapi/mcp/starlette resolve cleanly)"
 else
   echo "  FAIL  pip check found a broken dependency graph"; FAIL=1
+fi
+
+echo "==> git and ssh are in the default image (WITH_GIT=1); uid 99 resolves (OpenSSH needs it)"
+if docker run --rm --entrypoint /usr/bin/git "$IMAGE" --version >/dev/null 2>&1 \
+   && docker run --rm --entrypoint /usr/bin/ssh "$IMAGE" -V >/dev/null 2>&1 \
+   && [[ "$(docker run --rm --user 99:100 --entrypoint /usr/bin/id "$IMAGE" -un 2>/dev/null)" == "unraid-nobody" ]]; then
+  echo "  PASS  git, ssh, and a passwd entry for uid 99 are present"
+else
+  echo "  FAIL  the default image is missing git, ssh, or the uid-99 passwd entry"; FAIL=1
 fi
 
 wait_healthy() {
@@ -288,6 +298,123 @@ else
   echo "  FAIL  /mcp -> $offswitch_status (wanted 404), info -> $info_body"; FAIL=1
 fi
 docker rm -f cf-test-offswitch >/dev/null 2>&1 || true
+
+# --------------------------------------------------------------------------
+# Git tools (docs/plan-mcp-git-ops.md) in a REAL container, in the layout the
+# "kernel boundary" claim rests on: the repository root mounted read-only, with
+# only .git and the shared folder mounted read-write on top. tests/git_suite.py
+# and tests/git_surface_tests.py cover the logic in-process; what only a real
+# container can show is that this mount arrangement, the read-only rootfs, the
+# noexec /tmp, and the uid mapping all work with the image's own git -- and that
+# the kernel, not just the application, refuses a write outside the folder.
+# --------------------------------------------------------------------------
+
+echo
+echo "==> Git mode: real image, repo root :ro with .git and shared/ writable"
+GITFX="$FIXTURE_BASE/gitmode"
+rm -rf "$GITFX"
+mkdir -p "$GITFX/repo/shared" "$GITFX/repo/other"
+(
+  cd "$GITFX/repo"
+  git init -q -b main
+  git config user.email test@example.invalid
+  git config user.name test
+  echo "mine" > shared/a.txt
+  echo "not yours" > other/b.txt
+  git add -A
+  git commit -q -m init
+  # Startup validates the URL's scheme but never contacts the remote.
+  git remote add origin ssh://git@example.invalid/org/repo.git
+)
+docker rm -f cf-test-git >/dev/null 2>&1 || true
+docker run "${common_flags[@]}" --name cf-test-git -p "127.0.0.1:18084:8080" \
+  -v "$GITFX/repo:/repo:ro" \
+  -v "$GITFX/repo/.git:/repo/.git" \
+  -v "$GITFX/repo/shared:/repo/shared" \
+  -e DATA_ROOT=/repo/shared -e GIT_REPO_ROOT=/repo \
+  -e ENABLE_GIT_READ=true -e ENABLE_GIT_WRITE=true -e GIT_BRANCH=main \
+  "$IMAGE" >/dev/null
+if wait_healthy cf-test-git 18084; then
+  gj() {  # gj <expression over the parsed JSON on stdin>
+    python3 -c "import json,sys; d=json.load(sys.stdin); print($1)"
+  }
+  api() { curl -s -H "Authorization: Bearer $TOKEN" "$@"; }
+
+  info=$(api http://127.0.0.1:18084/v1/info)
+  if [[ "$(gj 'd["git"]["write_boundary"]' <<<"$info")" == "kernel" \
+     && "$(gj 'd["git"]["scope"]' <<<"$info")" == "shared/" ]]; then
+    echo "  PASS  /v1/info reports scope shared/ and a kernel write boundary"
+  else
+    echo "  FAIL  unexpected git info: $info"; FAIL=1
+  fi
+
+  # The kernel, not the application, refuses a write outside the folder.
+  if docker exec cf-test-git python -c "open('/repo/other/b.txt','w')" >/dev/null 2>&1; then
+    echo "  FAIL  the container could WRITE outside the shared folder"; FAIL=1
+  else
+    echo "  PASS  a write to /repo/other is refused by the read-only mount"
+  fi
+  if docker exec cf-test-git python -c "open('/repo/shared/probe','w').close()" >/dev/null 2>&1; then
+    echo "  PASS  the shared folder is writable"
+  else
+    echo "  FAIL  the shared folder is not writable"; FAIL=1
+  fi
+
+  # git reads the whole repo; the agent's commit takes only its folder.
+  api -X PUT "http://127.0.0.1:18084/v1/content/new.txt" --data-binary "agent file" >/dev/null
+  echo "host edit" >> "$GITFX/repo/other/b.txt"           # a person edits outside the folder
+  st=$(api http://127.0.0.1:18084/v1/git/status)
+  if [[ "$(gj 'sorted((c["path"], c["in_scope"]) for c in d["changes"] if c["path"] != "shared/probe")' <<<"$st")" \
+        == "[('other/b.txt', False), ('shared/new.txt', True)]" ]]; then
+    echo "  PASS  git_status sees both folders, marking only shared/ as in scope"
+  else
+    echo "  FAIL  unexpected status: $st"; FAIL=1
+  fi
+  diff_body=$(api "http://127.0.0.1:18084/v1/git/diff")
+  if grep -q "host edit" <<<"$diff_body"; then
+    echo "  FAIL  git_diff leaked a change outside the shared folder"; FAIL=1
+  else
+    echo "  PASS  git_diff shows nothing from outside the shared folder"
+  fi
+  commit=$(api -X POST http://127.0.0.1:18084/v1/git/commit -H "Content-Type: application/json" \
+           -d '{"message":"agent: container commit"}')
+  changed=$(git -C "$GITFX/repo" diff-tree -r --no-commit-id --name-only HEAD | sort | tr '\n' ' ')
+  if [[ "$(gj 'd.get("ok")' <<<"$commit")" == "True" && "$changed" == "shared/new.txt shared/probe " ]] \
+     && [[ "$(git -C "$GITFX/repo" log -1 --format=%s)" == "agent: container commit" ]]; then
+    echo "  PASS  git_commit committed only the shared folder, in a real container"
+  else
+    echo "  FAIL  commit result: $commit; changed files: $changed"; FAIL=1
+  fi
+  if grep -q "host edit" "$GITFX/repo/other/b.txt"; then
+    echo "  PASS  the host's edit outside the folder is untouched"
+  else
+    echo "  FAIL  the host's edit outside the folder was lost"; FAIL=1
+  fi
+  push=$(api -X POST http://127.0.0.1:18084/v1/git/push -H "Content-Type: application/json" -d '{}')
+  if [[ "$(gj 'd.get("code")' <<<"$push")" == "stale_remote" ]]; then
+    echo "  PASS  push without a fetched remote ref is refused (stale_remote), no network used"
+  else
+    echo "  FAIL  push result: $push"; FAIL=1
+  fi
+  if docker logs cf-test-git 2>&1 | grep -qi "mounted read-write"; then
+    echo "  FAIL  the read-only layout logged the 'root mounted read-write' warning"; FAIL=1
+  else
+    echo "  PASS  no read-write-root warning in the read-only layout"
+  fi
+fi
+docker rm -f cf-test-git >/dev/null 2>&1 || true
+
+echo
+echo "==> WITH_GIT=0: asking for the git tools on an image without git refuses to start"
+docker build -q --build-arg WITH_GIT=0 -t "$IMAGE_NOGIT" . >/dev/null
+new_fixture
+nogit_out=$(docker run --rm -e API_TOKEN=aaaaaaaaaaaaaaaaaaaa -e ENABLE_GIT_READ=true \
+            --user "$(id -u):$(id -g)" -v "$FIXTURE/repo/shared:/data" "$IMAGE_NOGIT" 2>&1 || true)
+if grep -q "WITH_GIT=1" <<<"$nogit_out"; then
+  echo "  PASS  refuses to start and names the build arg"
+else
+  echo "  FAIL  expected a startup error naming WITH_GIT=1; got: $nogit_out" | head -5; FAIL=1
+fi
 
 echo
 if [[ $FAIL -eq 0 ]]; then

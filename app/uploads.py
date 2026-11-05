@@ -129,6 +129,18 @@ class UploadTickets:
         with self._lock:
             return self._tickets.get(upload_id)
 
+    def active(self) -> list[UploadTicket]:
+        """Tickets that could still write into the folder: unexpired pending
+        ones (a curl may be about to run) and ones currently receiving. A git
+        pull/merge refuses to run alongside any of these -- see
+        docs/plan-mcp-git-ops.md, 'In-flight uploads'."""
+        now = time.time()
+        with self._lock:
+            return [
+                t for t in self._tickets.values()
+                if t.state == RECEIVING or (t.state == PENDING and now < t.expires_at)
+            ]
+
     def begin_receive(self, upload_id: str, secret: str) -> UploadTicket:
         """Atomically claim a pending ticket for the single upload it allows."""
         now = time.time()

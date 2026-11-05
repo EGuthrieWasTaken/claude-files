@@ -23,7 +23,9 @@ import os
 import stat
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Any, Iterator
+
+from .gate import GateTimeout, NullGate
 
 # Errnos that mean "you tried to walk through a symlink".  Linux reports
 # ELOOP; some BSD-derived kernels report EMLINK for O_NOFOLLOW.
@@ -81,6 +83,14 @@ class NoParent(PathError):
 class Conflict(PathError):
     def __init__(self, message: str) -> None:
         super().__init__(409, "conflict", message)
+
+
+class GitBusy(PathError):
+    """A git operation holds the worktree gate exclusively (a pull/merge/commit
+    is in progress). Retrying in a few seconds is the right response."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(423, "git_busy", message)
 
 
 @dataclass(frozen=True)
@@ -162,10 +172,14 @@ class Vault:
         *,
         denied_names: frozenset[str] = frozenset({".git"}),
         allow_hardlinked_files: bool = False,
+        gate: Any = None,
     ) -> None:
         self.root_path = os.path.realpath(root)
         self.denied_names = denied_names
         self.allow_hardlinked_files = allow_hardlinked_files
+        # docs/plan-mcp-git-ops.md, WORKTREE_GATE. A NullGate when git mode is
+        # off, so the file tools pay nothing for a feature that isn't on.
+        self.gate = gate if gate is not None else NullGate()
 
         if not os.path.isdir(self.root_path):
             raise RuntimeError(f"Root directory does not exist: {self.root_path}")
@@ -204,6 +218,15 @@ class Vault:
             os.close(self._root_fd)
         except OSError:
             pass
+
+    @contextmanager
+    def _shared(self) -> Iterator[None]:
+        """Hold the worktree gate shared around a mutation of the tree."""
+        try:
+            with self.gate.shared():
+                yield
+        except GateTimeout as exc:
+            raise GitBusy(str(exc)) from exc
 
     # -- path resolution --------------------------------------------------
 
@@ -492,7 +515,9 @@ class Vault:
             except OSError as exc:
                 raise _translate_oserror(exc, "the target directory") from exc
 
-            committer = Committer(dir_fd=dir_fd, tmp_name=tmp_name, final_name=name)
+            committer = Committer(
+                dir_fd=dir_fd, tmp_name=tmp_name, final_name=name, shared=self._shared
+            )
             try:
                 yield fd, committer
             finally:
@@ -506,12 +531,13 @@ class Vault:
         """Create a directory. Returns True if it was created, False if it existed."""
         if not parts:
             return False
-        if parents:
-            created = False
-            for i in range(1, len(parts) + 1):
-                created = self._mkdir_one(parts[:i]) or created
-            return created
-        return self._mkdir_one(parts)
+        with self._shared():
+            if parents:
+                created = False
+                for i in range(1, len(parts) + 1):
+                    created = self._mkdir_one(parts[:i]) or created
+                return created
+            return self._mkdir_one(parts)
 
     def _mkdir_one(self, parts: list[str]) -> bool:
         with self._parent_fd(parts) as (dir_fd, name):
@@ -529,6 +555,10 @@ class Vault:
                 raise _translate_oserror(exc, f"'{join_components(parts)}'") from exc
 
     def delete(self, parts: list[str], *, recursive: bool) -> None:
+        with self._shared():
+            self._delete(parts, recursive=recursive)
+
+    def _delete(self, parts: list[str], *, recursive: bool) -> None:
         with self._parent_fd(parts) as (dir_fd, name):
             try:
                 st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
@@ -582,7 +612,7 @@ class Vault:
     ) -> None:
         if not src or not dst:
             raise Denied("is_root", "Cannot move the root directory")
-        with self._parent_fd(src) as (src_fd, src_name):
+        with self._shared(), self._parent_fd(src) as (src_fd, src_name):
             with self._parent_fd(
                 dst, for_write=True, create_parents=create_parents
             ) as (dst_fd, dst_name):
@@ -637,24 +667,34 @@ class Vault:
 class Committer:
     """Renames the temp file into place, or cleans it up."""
 
-    def __init__(self, *, dir_fd: int, tmp_name: str, final_name: str) -> None:
+    def __init__(
+        self, *, dir_fd: int, tmp_name: str, final_name: str, shared: Any = None
+    ) -> None:
         self._dir_fd = dir_fd
         self._tmp_name = tmp_name
         self._final_name = final_name
         self._done = False
+        # The worktree gate is held only around the rename itself, never
+        # across a whole write: a chunked begin_write session keeps this
+        # object alive for minutes, and holding the gate that long would
+        # starve every git operation. A half-written upload is a
+        # .upload-*.tmp file, which git_commit excludes and git_pull refuses
+        # to run alongside (uploads_in_flight).
+        self._shared = shared if shared is not None else contextmanager(lambda: (yield))
 
     def commit(self, fd: int) -> None:
         os.fsync(fd)
         try:
-            # rename() replaces the destination entry itself.  If the
-            # destination is a symlink, the link is replaced -- the target is
-            # never written through.
-            os.rename(
-                self._tmp_name,
-                self._final_name,
-                src_dir_fd=self._dir_fd,
-                dst_dir_fd=self._dir_fd,
-            )
+            with self._shared():
+                # rename() replaces the destination entry itself.  If the
+                # destination is a symlink, the link is replaced -- the target
+                # is never written through.
+                os.rename(
+                    self._tmp_name,
+                    self._final_name,
+                    src_dir_fd=self._dir_fd,
+                    dst_dir_fd=self._dir_fd,
+                )
         except OSError as exc:
             raise _translate_oserror(exc, "the commit") from exc
         self._done = True

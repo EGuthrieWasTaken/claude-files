@@ -401,6 +401,11 @@ if wait_healthy cf-test-git 18084; then
   else
     echo "  PASS  no read-write-root warning in the read-only layout"
   fi
+else
+  # `if wait_healthy` disables errexit for the call, so without this branch a
+  # git-mode container that never starts would skip every check above and the
+  # script would still exit 0.
+  echo "  FAIL  the git-mode container never became healthy (log above)"; FAIL=1
 fi
 docker rm -f cf-test-git >/dev/null 2>&1 || true
 

@@ -260,3 +260,54 @@ minutes**. Two consequences:
 
 Mass deletions are refused by a safety guard, so don't try to clear the folder
 wholesale; delete only what you specifically intend to.
+
+### If this server has the git tools
+
+Call `get_folder_info` (or `GET /v1/info`) and look at its `git` block:
+`read_enabled` / `write_enabled` say which of the tools below exist. If
+`write_enabled` is true, **nothing is committed or pushed automatically** — the
+paragraph above doesn't apply and you do it yourself. Your folder is a *scope*
+inside a larger repository (`git.scope`).
+
+| Tool (MCP) | REST | What it does |
+|---|---|---|
+| `git_status` | `GET /v1/git/status` | Branch, ahead/behind, and changed files across the **whole** repository, each marked `in_scope` or not |
+| `git_log` | `GET /v1/git/log?limit=` | Recent commits; `touches_outside_scope` per commit |
+| `git_diff` | `GET /v1/git/diff?staged=&path=` | Diff of **your folder only** |
+| `git_commit` | `POST /v1/git/commit` `{"message","paths"?}` | Commit changes inside your folder |
+| `git_fetch` | `POST /v1/git/fetch` | Update the remote-tracking branch only |
+| `git_pull` | `POST /v1/git/pull` `{"strategy"?: "ff-only"\|"merge"\|"rebase"}` | Fetch and integrate |
+| `git_push` | `POST /v1/git/push` | Push the current branch (never forced) |
+| `git_merge` | `POST /v1/git/merge` `{"ref","no_ff"?}` | Merge a branch (`name` or `origin/name`) |
+
+The usual loop: `git_status` → `git_commit` → `git_push`. If the push is
+refused with `non_fast_forward`, `git_pull` and push again.
+
+**You can read about changes outside your folder, but never write them.**
+`git_status` lists them (names only; `git_diff` never shows their contents),
+and every write is refused before anything changes if it would touch them:
+
+- `outside_scope` — a pull/merge would change files outside your folder.
+  Nothing was changed. **Tell the user** to pull on the host; until then your
+  pushes will be rejected as `non_fast_forward`.
+- `outside_scope_commits` — a commit you'd be publishing changes files outside
+  your folder (a person committed it on the host). Those must be pushed from
+  the host. The message names the commits.
+- `conflict` — the merge would conflict. **Nothing was changed.** Edit your
+  files so both sides agree, commit, and retry, or ask the user.
+- `dirty_worktree` — uncommitted changes block this. The message says which
+  are in your folder (`git_commit` them) and which are outside it (only a
+  person on the host can deal with those).
+- `uploads_in_flight` — an upload is still open. `commit_write` or
+  `abort_write` it, or wait for its ticket to expire, then retry.
+- `too_many_changes` — a runaway number of files changed; commit a narrower
+  `paths=[...]` instead of everything.
+- `wrong_branch`, `detached_head`, `operation_in_progress` — someone changed
+  the repository on the host; ask the user to put it back.
+- `auth_failed`, `network`, `timeout` — the remote couldn't be reached. Retrying
+  won't fix a bad credential.
+
+`ahead`/`behind` are only as fresh as the last fetch (`as_of_fetch`); call
+`git_fetch` before trusting `behind: 0`. A read-only token can use the read
+tools; every write tool answers `readonly`. Never put a credential in a commit
+message or a file you commit — once pushed it is public history.

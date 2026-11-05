@@ -101,4 +101,44 @@
   <Config Name="MCP Upload Chunk Advisory (bytes)" Target="MCP_UPLOAD_CHUNK_ADVISORY_BYTES" Default="3072" Mode=""
           Description="Suggested chunk size for write_chunk, reported by begin_write and get_folder_info. Advisory only -- not enforced."
           Type="Variable" Display="advanced" Required="false" Mask="false">3072</Config>
+
+  <!-- Git tools (docs/plan-mcp-git-ops.md). Off by default. To use them, add
+       the three Path entries described in the README ("Git tools": repo root
+       read-only, .git, and the shared folder), and point Shared Folder's
+       container path at /repo/<folder> via DATA_ROOT. -->
+  <Config Name="Enable Git Read Tools" Target="ENABLE_GIT_READ" Default="false" Mode=""
+          Description="git_status, git_log, git_diff. Work with the read-only token."
+          Type="Variable" Display="advanced" Required="false" Mask="false">false</Config>
+
+  <Config Name="Enable Git Write Tools" Target="ENABLE_GIT_WRITE" Default="false" Mode=""
+          Description="git_commit, git_pull, git_push, git_merge, git_fetch. Need the read-write token. Nothing is committed or pushed automatically."
+          Type="Variable" Display="advanced" Required="false" Mask="false">false</Config>
+
+  <Config Name="Git Repo Root (container path)" Target="GIT_REPO_ROOT" Default="" Mode=""
+          Description="Where the repository root is mounted in the container (e.g. /repo). Leave empty if the shared folder IS the repository root."
+          Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
+
+  <Config Name="Git Remote" Target="GIT_REMOTE" Default="origin" Mode=""
+          Description="The only remote ever fetched from or pushed to."
+          Type="Variable" Display="advanced" Required="false" Mask="false">origin</Config>
+
+  <Config Name="Git Branch" Target="GIT_BRANCH" Default="" Mode=""
+          Description="The only branch ever committed to or pushed. Empty = the branch checked out at startup."
+          Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
+
+  <Config Name="Git SSH Key (container path)" Target="SSH_KEY_PATH" Default="" Mode=""
+          Description="Deploy key file, mounted read-only OUTSIDE the repository. Use a key scoped to this one repo."
+          Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
+
+  <Config Name="Git known_hosts (container path)" Target="SSH_KNOWN_HOSTS_PATH" Default="" Mode=""
+          Description="REQUIRED with an SSH key: pins the remote's host key. This container never trusts a host key on first use."
+          Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
+
+  <Config Name="Git HTTPS Token" Target="GIT_TOKEN" Default="" Mode=""
+          Description="Token for an https:// remote, instead of an SSH key. Never written to disk or put in a command line."
+          Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
+
+  <Config Name="Pull Outside Scope" Target="GIT_PULL_OUTSIDE_SCOPE" Default="false" Mode=""
+          Description="Let pulls bring REMOTE content into files outside the shared folder. Needs the repo root mounted read-write. The agent can never author a change outside its folder either way."
+          Type="Variable" Display="advanced" Required="false" Mask="false">false</Config>
 </Container>

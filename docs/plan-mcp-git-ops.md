@@ -1,8 +1,12 @@
 # Plan: git status / commit / pull / push / merge tools, scoped to one folder
 
-**Status: proposed, design decisions taken.** Nothing in this document is
-implemented yet. The questions settled in review are recorded under
-[Decisions](#decisions); two remain under [Open questions](#open-questions).
+**Status: implemented** — all three phases, in one change: `app/git_ops.py`,
+`app/gate.py`, and their wiring in `app/main.py`, `app/mcp_endpoint.py`,
+`app/safepath.py` and `app/config.py`. What differed from this brief, and why,
+is recorded in [Implementation notes](#implementation-notes) at the end of this
+document — read that before assuming the text above still describes the code
+exactly. The questions settled in review are under [Decisions](#decisions); two
+remain under [Open questions](#open-questions).
 
 Follows [`docs/plan-mcp-connector.md`](plan-mcp-connector.md) and
 [`docs/plan-mcp-large-writes.md`](plan-mcp-large-writes.md), both shipped.
@@ -1067,3 +1071,115 @@ Settled in review. Recorded here so the reasoning survives.
 2. **Branch switching.** Deliberately absent: `GIT_BRANCH` pins one branch. A
    workflow where the agent opens `agent/*` branches for a human to merge
    needs branch-name policy and its own document.
+
+---
+
+## Implementation notes
+
+What the code does differently from the brief above, and the reasons. Nothing
+here weakens a stated guarantee; where something is weaker than the text
+claims, it says so.
+
+### Deviations
+
+1. **Rebase detects conflicts by attempting and aborting, not by dry run.**
+   `merge-tree` takes commits, not trees, so replaying a series of local
+   commits one at a time without creating commits to chain them isn't
+   possible. Every *scope* check for a rebase still runs before anything is
+   touched (no host-authored commit in `T..HEAD`, no merge commits, outside
+   paths per the opt-in rule); only the *conflict* check is
+   attempt-then-`rebase --abort`. So for `strategy="rebase"` the working tree
+   is briefly rewritten and then restored, rather than never touched.
+   `git_pull(strategy="merge")` and `git_merge` do compute their result with
+   `merge-tree` first and never start a conflicting merge. Threat-model
+   guarantee 6 ("conflicts are detected before the tree is touched") holds for
+   merge and ff-only, and is "restored by abort" for rebase.
+2. **Merges are applied with `git merge`, with a post-operation check, not by
+   plumbing.** The result is predicted with `merge-tree` (same ort
+   implementation) and the real merge is then verified against the prediction
+   (`post` check in `_integrate`); a mismatch cannot be undone without `reset`,
+   so it logs at ERROR and tells the agent the repository state. It should never
+   fire. The reason for not building the merge commit by hand: `git merge`
+   brings git's own refusals for free, and one of them is useful (below).
+3. **Staged changes on the host block merges; unstaged ones don't.** Measured
+   against git 2.43: a non-fast-forward `git merge` refuses ("Your local changes
+   ... would be overwritten") whenever the *index* differs from `HEAD`, even for
+   files the merge doesn't touch, so a person's `git add` in `sub-folder-2`
+   blocks the agent's merge. A rebase refuses on *any* dirty tracked file. Both
+   surface as `dirty_worktree`, with the files split into "yours to commit" and
+   "only a person on the host can deal with these". Fast-forward and
+   unstaged-only cases are unaffected.
+4. **New error codes** beyond the table: `detached_head`, `wrong_branch`,
+   `operation_in_progress` (the host changed the repository after startup),
+   `stale_remote` (push before any fetch: the push scope check needs the
+   remote-tracking ref), and `invalid_argument`.
+5. **The per-process state directory is `mkdtemp`, not `/tmp/claude-files-git`,
+   and is `HOME`.** `HOME` is that directory (0700, removed at exit), not
+   `/tmp`, so there is no `~/.ssh` or `~/.gitconfig` for anything to find; the
+   staged key, `known_hosts`, token file, global config and temporary indexes
+   all live there. `ssh` runs with `-F /dev/null`.
+6. **`diff.external=` is not set.** An empty value is ambiguous to git;
+   `--no-ext-diff --no-textconv` on every diff is used instead, and
+   `GIT_EXTERNAL_DIFF` is absent from the built environment.
+7. **The remote URL patterns are stricter** than first drafted: every one must
+   start the user/host with an alphanumeric. A leading dash would reach `ssh` as
+   an option (`-oProxyCommand=...@host:x`), which is code execution.
+8. **`rev-parse --show-toplevel` is not the "is this the repo root" check.**
+   With `GIT_DIR` and `GIT_WORK_TREE` forced on every call (I4) it is true by
+   construction and proves nothing. Startup instead checks `.git` is a real
+   directory at the repository root, that `rev-parse --git-dir` succeeds, and
+   that the path from the repository root to `DATA_ROOT` is plain directories.
+9. **The worktree gate is held only around the rename, `mkdir`, `delete` and
+   `move`, never across a whole `atomic_write`.** A chunked `begin_write`
+   session keeps its `atomic_write` open for minutes; holding the gate that long
+   would starve every git operation. That window is covered by the
+   `uploads_in_flight` refusal on pull/merge instead, and by `.upload-*.tmp`
+   being excluded from every commit.
+10. **The git tools are `async def` and run git in a worker thread.** FastMCP
+    calls a synchronous tool inline on the event loop, and a push can take a
+    minute. `tests/git_surface_tests.py` stalls a remote and times `/health`
+    meanwhile (and fails if git is run inline).
+11. **`git_status` returns one `changes` list**, in-scope entries first, not
+    separate staged/unstaged/untracked lists, so `limit` truncation drops
+    outside-scope noise before the agent's own files. `git_log` gained
+    `scope_only`. `get_folder_info.git.remote` is null when the write tools are
+    off (the remote is irrelevant to a read-only deployment).
+12. **Startup requires at least one commit.** The temporary-index commit and
+    the range checks need a `HEAD` to diff against.
+
+### Known limits
+
+- **`git_commit` cost scales with the size of the folder.** The temporary index
+  has no stat cache, so `git add` rehashes every file in scope (timeout: the
+  larger of `GIT_LOCAL_TIMEOUT_SECONDS` and 120 s). Fine for documents and
+  reports; slow for a folder of many large files.
+- **`git_push`'s scope check runs git once per unpushed commit**, capped at
+  1000 commits (refused beyond that: push from the host).
+- A single git call's output is capped at 32 MiB.
+- `ahead`/`behind` are as fresh as the last fetch, by design.
+
+### What is and is not tested
+
+`tests/git_suite.py` (real git, throwaway repos, a bare-repo remote) and
+`tests/git_surface_tests.py` (the real app over `/mcp` and REST, all four
+`ENABLE_GIT_READ` x `ENABLE_GIT_WRITE` combinations, plus startup refusals)
+run in CI as the `git-tools` job. The suites were mutation-checked: disabling
+the scope check, the push range check, the hooks override, the fsmonitor
+override, the opt-in blob rule, or running git on the event loop each fails the
+test written for it.
+
+Not covered by those suites, and so verified only by reading:
+
+- **The ssh transport and deploy-key plumbing.** The in-process suites reach
+  the remote over git's file transport through two module-level seams in
+  `app.git_ops` (`EXTRA_URL_PATTERNS`, `EXTRA_PROTOCOLS`) that exist for the
+  tests and are not reachable from an environment variable or an agent. The
+  brief called for a throwaway `sshd`; none is written.
+- **The container.** `tests/run_tests.sh` gained image-level checks (git, ssh
+  and the uid-99 passwd entry present; the three-mount layout; the kernel
+  refusing a write outside the folder; a real commit in the container;
+  `WITH_GIT=0` refusing to start). They were written and their assertions
+  exercised against a locally started server, but not run under Docker.
+- **A host-side `index.lock` during the post-commit index refresh** is
+  best-effort by design (the commit itself uses a temporary index and needs no
+  lock); the result carries a `note` when the refresh was skipped.

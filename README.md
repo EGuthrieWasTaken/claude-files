@@ -426,6 +426,154 @@ never pass through the tool call or a model's context, so there's no size
 ceiling. Useful for re-archiving or duplicating a file that's already in the
 folder, which is cheaper than reading it out and writing it back in.
 
+### Git tools
+
+Optional (off by default): the agent can inspect and synchronise the git
+repository that contains its folder — `git_status`, `git_commit`, `git_pull`,
+`git_push`, `git_merge`, `git_fetch`, `git_log`, `git_diff` — as MCP tools and
+matching `/v1/git/*` REST routes. **Nothing is committed or pushed
+automatically; the agent runs every git operation itself.** Full design:
+`docs/plan-mcp-git-ops.md`.
+
+Two independent switches. A disabled class is not registered at all, so its
+tools are absent from the tool list rather than present and refusing:
+
+| Variable | Tools | Token |
+|---|---|---|
+| `ENABLE_GIT_READ` | `git_status`, `git_log`, `git_diff` | works with the read-only token |
+| `ENABLE_GIT_WRITE` | `git_commit`, `git_pull`, `git_push`, `git_merge`, `git_fetch` | needs the read-write token |
+
+(`git_fetch` counts as a write — it moves refs and uses the deploy key — so
+`git_status(fetch=true)` needs the write switch and a read-write token.)
+
+**The idea: your folder is a *scope* inside the repository, and no write may
+leave it.** Say the repository holds `sub-folder-1/` (the folder this service
+serves) and `sub-folder-2/` (someone else's work):
+
+- `git_status` reports changes **across the whole repository**, each marked
+  `in_scope` or not, so the agent can see that `sub-folder-2` changed. This is
+  a deliberate read across the boundary, and it discloses file *names* only:
+  `git_diff` shows only `sub-folder-1`, always.
+- Every **write** is refused if it would touch anything outside the folder. It
+  works out what git *would* change and refuses **before** touching anything:
+  a commit is built from a temporary index containing only the folder (a file
+  a person staged in `sub-folder-2` can't ride along); a pull or merge is
+  computed with `git merge-tree` and refused if it would change outside paths
+  or conflict, so a conflicted merge is never left half-applied; a push is
+  refused if any commit it would publish touches outside paths (checked per
+  commit, so a host-side edit-then-revert is still refused).
+- The price of that rule: if someone pushes a change to `sub-folder-2`
+  upstream, the agent **can't pull it**, and until someone pulls on the host
+  its pushes are rejected as non-fast-forward. The refusal names the paths and
+  says so. `GIT_PULL_OUTSIDE_SCOPE=true` (below) lifts this for remote
+  content only.
+
+#### Mount layout: let the kernel enforce the boundary too
+
+The application enforces the scope, but the recommended deployment makes the
+kernel enforce it as well — three nested bind mounts, so that **no process in
+the container** can write outside `.git` and the shared folder:
+
+```yaml
+volumes:
+  - /mnt/user/appdata/repos/myrepo:/repo:ro                     # whole repo, READ-ONLY
+  - /mnt/user/appdata/repos/myrepo/.git:/repo/.git              # git needs to write here
+  - /mnt/user/appdata/repos/myrepo/shared:/repo/shared          # the scope
+  - /mnt/user/appdata/keys/deploy_ed25519:/keys/id_ed25519:ro
+  - /mnt/user/appdata/keys/known_hosts:/keys/known_hosts:ro
+environment:
+  DATA_ROOT: "/repo/shared"
+  GIT_REPO_ROOT: "/repo"
+  ENABLE_GIT_READ: "true"
+  ENABLE_GIT_WRITE: "true"
+  GIT_REMOTE: "origin"
+  GIT_BRANCH: "main"
+  SSH_KEY_PATH: "/keys/id_ed25519"
+  SSH_KNOWN_HOSTS_PATH: "/keys/known_hosts"
+```
+
+The scope is **derived** — `DATA_ROOT` relative to `GIT_REPO_ROOT` — so there
+is no separate scope setting that could disagree with the folder the file
+tools serve. If the shared folder *is* the repository root, leave
+`GIT_REPO_ROOT` unset; the scope is the whole repository.
+
+This **changes the first layer of the [security model](#security-model)**:
+the rest of the repository is no longer *absent* from the container, only
+read-only, and `.git` is present and writable (git can't work without it). A
+bug in the path layer could therefore let the agent *read* the rest of the
+repository, and a bug that let a file tool write into `.git` would be code
+execution through the next git call. The path layer is the barrier for both,
+and `.git` is refused by it at any depth (and git mode refuses to start
+otherwise). If the root is mounted read-write instead, git mode still works
+and every software check still applies, but the server logs a warning and
+reports `write_boundary: "software"` in `get_folder_info`.
+
+Use a **deploy key scoped to this one repository** — the credential now lives
+in the same process the agent talks to. `SSH_KNOWN_HOSTS_PATH` is required
+with a key; unlike the autocommit sidecar, this container never trusts a host
+key on first use.
+
+#### How git is kept from becoming a way out
+
+Git runs programs named in config (hooks, `core.fsmonitor`, filters, `ssh`
+commands, credential helpers, pagers). So git is **never** run with the
+container's environment, never with repository discovery, and with hooks and
+every program-naming setting forced off on the command line, which beats any
+config file. **Hooks never run**, and there is no setting to enable them: a
+hook that ran repo code would execute files the agent wrote. At startup the
+server refuses to run if `.git` isn't in `DENIED_NAMES`, if git's config
+`[include]`s a file inside the working tree (which an agent could write), if
+`.git` is a gitlink file, or if the remote isn't `ssh://`, `https://`, or
+scp-style (never `file://`, `ext::`, or a local path). The agent never
+supplies a remote, URL, refspec, or flag; the only thing it chooses is
+`git_merge`'s branch name, validated against a strict character allow-list
+and resolved to a SHA before git sees it. Push is never forced, and nothing
+in the module can reset, clean, check out, delete a branch, or force. Output
+returned to the agent is scrubbed of credentials.
+
+#### `GIT_PULL_OUTSIDE_SCOPE`
+
+Off by default. When `true`, `git_pull` (and `git_merge` of an
+`origin/<branch>`) may update files outside the folder, but **only with
+content that already exists on the remote**: the result at every outside path
+must be byte-identical to what's already in `HEAD` or to what the remote has.
+The agent still can't *author* anything outside its folder. It refuses when
+the result would be content neither side wrote (a three-way merge of a file
+both a person and the remote changed), when merging a *local* branch that
+touches outside paths, and when it would overwrite a person's uncommitted
+edit. A rebase that would rewrite a host-made commit touching outside paths
+is refused in both modes. It needs the repo root mounted read-write.
+
+#### Working alongside everything else
+
+- **Uploads:** `git_pull` and `git_merge` refuse while any chunked
+  `begin_write` session or `request_upload` ticket is open
+  (`uploads_in_flight`, naming them) — a pull could rename a folder an upload
+  is writing into. `git_commit` always excludes `.upload-*.tmp`.
+- **Writes during a git operation:** file writes take a shared gate and the
+  commit/merge step takes it exclusively, so a write arriving mid-merge waits
+  up to 10 s and then fails `423 git_busy`; it never interleaves.
+- **Host-side git:** a person running git on the host is respected. The
+  index lock is never deleted (`locked` is reported), `HEAD` moving
+  underneath is caught by a compare-and-swap on commit, and a host
+  `checkout`, detached `HEAD`, or half-finished merge makes the write tools
+  refuse (`wrong_branch`, `detached_head`, `operation_in_progress`).
+- **The autocommit sidecar:** with `ENABLE_GIT_WRITE` on, stop the sidecar for
+  that repository — the two would race on the index lock and the agent's
+  picture of what's pushed would go stale. With only `ENABLE_GIT_READ`, they
+  coexist fine. (`get_folder_info`'s instruction text stops claiming writes are
+  "committed and pushed automatically" when the write tools are on.)
+- Run a **single worker** (the image does): the locks are in-process.
+
+Errors carry a stable `code` — `outside_scope`, `outside_scope_commits`,
+`non_fast_forward`, `diverged`, `conflict`, `dirty_worktree`,
+`uploads_in_flight`, `nothing_to_commit`, `too_many_changes`, `invalid_ref`,
+`stale_remote`, `locked`, `git_busy`, `auth_failed`, `network`, `timeout` —
+with the paths involved and the next step in the message. The image needs
+`git` and `openssh-client`, installed by default (`--build-arg WITH_GIT=0`
+leaves them out, and then enabling a git switch is a startup error that says
+so). Tests: [Verifying it yourself](#verifying-it-yourself).
+
 ### Adding it as a connector
 
 1. Set `ENABLE_MCP=true` (the default) and, if this service sits behind a
@@ -486,6 +634,13 @@ components at any depth, and regular files with more than one hard link are
 refused, because a hard link created on the host can alias a file outside the
 mounted subtree. Set `ALLOW_HARDLINKED_FILES=true` only if you have a reason.
 
+**With the [git tools](#git-tools) on, layer 1 changes shape:** git needs the
+repository, so the rest of it is mounted *read-only* rather than being absent,
+and `.git` is present and writable. Layer 2 (which refuses `.git` at any depth)
+is then the only barrier for both. The recommended three-mount layout keeps the
+kernel enforcing "nothing but `.git` and the shared folder is writable"; see
+[Mount layout](#mount-layout-let-the-kernel-enforce-the-boundary-too).
+
 The optional `/mcp` connector (see [MCP connector](#mcp-connector)) is the
 same three layers behind the same token check — it is a second front end onto
 the same `Vault`, not a second implementation of path handling. Every MCP
@@ -526,6 +681,25 @@ bash tests/run_tests.sh
 CI runs exactly this on every pull request (`.github/workflows/ci.yml`), plus
 `tests/autocommit_tests.sh` against the sidecar image — there is no separate
 CI-only test list to keep in sync.
+
+The [git tools](#git-tools) add two suites that need only `git` and the app's
+requirements (no Docker), and CI runs them as their own job:
+
+```bash
+python3 tests/git_suite.py            # app.git_ops against throwaway repos, real git
+python3 tests/git_surface_tests.py    # the same tools through /mcp and REST, all four on/off combinations
+```
+
+`git_suite.py` covers the scope boundary (a commit with a person's staged file
+in `sub-folder-2`, pulls and pushes that would cross it, a host commit and its
+revert), the opt-in rule, planted hooks and config that name programs (each
+test first proves the hook *would* fire under plain git), hostile merge refs,
+every startup refusal, credential scrubbing, and a stalled remote. It reaches
+its remote over git's *file* transport via test-only seams in `app.git_ops`
+that production does not expose (it allows only ssh and https), so the ssh
+transport itself is not exercised in-process. `tests/run_tests.sh` also runs
+the image's own `git` in the three-mount layout and checks that the kernel
+refuses a write outside the folder.
 
 This builds the image and runs the suite against two configurations:
 
@@ -766,6 +940,20 @@ reproducible, and `:latest` there would silently change what runs on the next
 | `MCP_UPLOAD_SESSION_TTL_SECONDS` | `900` | Idle timeout for a `begin_write` session, reaped lazily. |
 | `MCP_MAX_CONCURRENT_UPLOADS` | `8` | Cap on open chunked-upload sessions at once. |
 | `MCP_UPLOAD_CHUNK_ADVISORY_BYTES` | `3072` | Suggested chunk size, reported by `begin_write`/`get_folder_info`. Advisory, not enforced. |
+| `ENABLE_GIT_READ` | `false` | Register `git_status`, `git_log`, `git_diff` ([git tools](#git-tools)). Works with the read-only token. |
+| `ENABLE_GIT_WRITE` | `false` | Register `git_commit`, `git_pull`, `git_push`, `git_merge`, `git_fetch`. Needs the read-write token. Nothing is committed or pushed automatically. |
+| `GIT_REPO_ROOT` | `DATA_ROOT` | Where the repository root is mounted. `DATA_ROOT` must be it or a folder under it; the difference is the agent's scope. |
+| `GIT_REMOTE` | `origin` | The only remote ever fetched from or pushed to. Must be `ssh://`, `https://`, or scp-style. |
+| `GIT_BRANCH` | checked-out branch | The only branch ever committed to or pushed. Re-checked on every write. |
+| `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL` | `claude-files agent` / `agent@localhost` | Author and committer of `git_commit`. The agent can't choose. |
+| `GIT_COMMIT_TRAILER` | — | Optional trailer appended to every commit message. |
+| `GIT_MAX_CHANGED_FILES` | `1000` | `git_commit` refuses to commit more files than this. `0` disables. |
+| `GIT_NETWORK_TIMEOUT_SECONDS` | `60` | Bound on fetch/push. A timeout kills git's whole process group, `ssh` included. |
+| `GIT_LOCAL_TIMEOUT_SECONDS` | `30` | Bound on every other git call. |
+| `GIT_PULL_OUTSIDE_SCOPE` | `false` | Let pulls bring *remote* content into paths outside the folder. Needs the repo root mounted read-write. |
+| `SSH_KEY_PATH` | — | Deploy key for an ssh remote, mounted read-only outside the repo. Staged to tmpfs at 0600. |
+| `SSH_KNOWN_HOSTS_PATH` | — | **Required** with a key. No trust-on-first-use. |
+| `GIT_TOKEN` | — | Token for an `https://` remote instead of a key. Kept off the command line and out of remote URLs. |
 
 The [local bridge](#uploading-binary-files-the-local-bridge)'s own settings
 (`CLAUDE_FILES_URL`, `CLAUDE_FILES_TOKEN`, etc.) are deliberately not in this

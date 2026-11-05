@@ -16,6 +16,16 @@ services:
     # ------------------------------------------------------------------
     volumes:
       - /mnt/user/appdata/repos/myrepo/shared:/data
+      # GIT TOOLS (ENABLE_GIT_READ/WRITE), subfolder layout. Replace the line
+      # above with these, so git can see the repository but the KERNEL still
+      # stops anything except .git and the shared folder from being written:
+      #   - /mnt/user/appdata/repos/myrepo:/repo:ro
+      #   - /mnt/user/appdata/repos/myrepo/.git:/repo/.git
+      #   - /mnt/user/appdata/repos/myrepo/shared:/repo/shared
+      #   - /mnt/user/appdata/keys/deploy_ed25519:/keys/id_ed25519:ro
+      #   - /mnt/user/appdata/keys/known_hosts:/keys/known_hosts:ro
+      # and set DATA_ROOT=/repo/shared, GIT_REPO_ROOT=/repo (below). Use a
+      # deploy key scoped to this one repository.
 
     environment:
       # openssl rand -hex 32
@@ -45,6 +55,22 @@ services:
       MCP_UPLOAD_SESSION_TTL_SECONDS: "900"   # begin_write session idle timeout
       MCP_MAX_CONCURRENT_UPLOADS: "8"         # cap on open chunked-upload sessions
       MCP_UPLOAD_CHUNK_ADVISORY_BYTES: "3072" # suggested write_chunk size (advisory only)
+
+      # -- Optional git tools (docs/plan-mcp-git-ops.md) ---------------------
+      # Off by default. To turn them on, ALSO change the volumes above to the
+      # three-mount layout described in the comment on `volumes:` -- the repo
+      # root read-only, with only .git and the shared folder writable -- and
+      # mount a deploy key. Nothing here commits or pushes on its own; the
+      # agent calls git_commit / git_push itself.
+      ENABLE_GIT_READ: "false"     # git_status, git_log, git_diff   (ro token ok)
+      ENABLE_GIT_WRITE: "false"    # git_commit/pull/push/merge/fetch (rw token)
+      # GIT_REPO_ROOT: "/repo"                  # where the repo root is mounted
+      # DATA_ROOT: "/repo/sub-folder-1"         # the agent's folder = its write scope
+      # GIT_REMOTE: "origin"
+      # GIT_BRANCH: "main"
+      # SSH_KEY_PATH: "/keys/id_ed25519"
+      # SSH_KNOWN_HOSTS_PATH: "/keys/known_hosts"   # required with a key; no trust-on-first-use
+      # GIT_PULL_OUTSIDE_SCOPE: "false"         # needs the repo root mounted read-write
 
     # unRAID's nobody:users. Files the API writes will be owned by this.
     user: "99:100"

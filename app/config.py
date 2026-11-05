@@ -61,6 +61,25 @@ class Config:
     download_ticket_ttl_seconds: int = 900
     download_tickets_max: int = 100
     public_base_url: str = ""
+    # -- git tools (docs/plan-mcp-git-ops.md) --------------------------------
+    # Two independent switches. A disabled class is not registered at all.
+    enable_git_read: bool = False
+    enable_git_write: bool = False
+    # Where the repository root is mounted. Empty means "same as root": the
+    # shared folder IS the repository root and the scope is the whole repo.
+    git_repo_root: str = ""
+    git_remote: str = "origin"
+    git_branch: str = ""
+    git_author_name: str = "claude-files agent"
+    git_author_email: str = "agent@localhost"
+    git_commit_trailer: str = ""
+    git_max_changed_files: int = 1000
+    git_network_timeout_seconds: int = 60
+    git_local_timeout_seconds: int = 30
+    git_pull_outside_scope: bool = False
+    ssh_key_path: str = ""
+    ssh_known_hosts_path: str = ""
+    git_token: str = ""
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -104,4 +123,21 @@ class Config:
             download_ticket_ttl_seconds=_env_int("DOWNLOAD_TICKET_TTL_SECONDS", 900),
             download_tickets_max=_env_int("DOWNLOAD_TICKETS_MAX", 100),
             public_base_url=os.environ.get("PUBLIC_BASE_URL", "").strip(),
+            enable_git_read=_env_bool("ENABLE_GIT_READ", False),
+            enable_git_write=_env_bool("ENABLE_GIT_WRITE", False),
+            git_repo_root=os.environ.get("GIT_REPO_ROOT", "").strip(),
+            git_remote=os.environ.get("GIT_REMOTE", "origin").strip() or "origin",
+            git_branch=os.environ.get("GIT_BRANCH", "").strip(),
+            git_author_name=os.environ.get("GIT_AUTHOR_NAME", "").strip()
+            or "claude-files agent",
+            git_author_email=os.environ.get("GIT_AUTHOR_EMAIL", "").strip()
+            or "agent@localhost",
+            git_commit_trailer=os.environ.get("GIT_COMMIT_TRAILER", "").strip(),
+            git_max_changed_files=_env_int("GIT_MAX_CHANGED_FILES", 1000),
+            git_network_timeout_seconds=_env_int("GIT_NETWORK_TIMEOUT_SECONDS", 60),
+            git_local_timeout_seconds=_env_int("GIT_LOCAL_TIMEOUT_SECONDS", 30),
+            git_pull_outside_scope=_env_bool("GIT_PULL_OUTSIDE_SCOPE", False),
+            ssh_key_path=os.environ.get("SSH_KEY_PATH", "").strip(),
+            ssh_known_hosts_path=os.environ.get("SSH_KNOWN_HOSTS_PATH", "").strip(),
+            git_token=os.environ.get("GIT_TOKEN", "").strip(),
         )

@@ -77,6 +77,7 @@ import that pulls this module in).
 # image) so the modern `X | None` / `list[...]` syntax below works natively
 # without it.
 import base64
+import asyncio
 import binascii
 import contextlib
 import hashlib
@@ -94,9 +95,11 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
+from .git_ops import GitOpError, GitRepo
 from .safepath import PathError
 
 log = logging.getLogger("claude-files.mcp")
@@ -150,9 +153,32 @@ def _transport_security() -> TransportSecuritySettings:
     return TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
 
+def _build_instructions() -> str:
+    """The server instructions, with one sentence swapped when the git write
+    tools are on: "committed and pushed automatically" describes the autocommit
+    sidecar, and is simply untrue when the agent is the one who commits."""
+    from . import main as appmain
+
+    if not appmain.CONFIG.enable_git_write:
+        return _INSTRUCTIONS
+    old = (
+        "This folder is a git repository. Anything written through these tools is\n"
+        "committed and pushed automatically, usually within a couple of minutes --\n"
+        "writes are effectively permanent and enter public git history. Never write"
+    )
+    new = (
+        "This folder is inside a git repository, and nothing is committed or pushed\n"
+        "automatically: when you want your changes in git, call git_status, then\n"
+        "git_commit and git_push yourself. Once pushed, writes are effectively\n"
+        "permanent and enter public git history. Never write"
+    )
+    assert old in _INSTRUCTIONS
+    return _INSTRUCTIONS.replace(old, new)
+
+
 mcp = FastMCP(
     "claude-files",
-    instructions=_INSTRUCTIONS,
+    instructions=_build_instructions(),
     streamable_http_path="/",
     transport_security=_transport_security(),
     stateless_http=True,
@@ -247,6 +273,13 @@ def _guard(op: str, fn, *args, **kwargs):  # type: ignore[no-untyped-def]
         return fn(*args, **kwargs)
     except PathError as exc:
         appmain.log.warning("denied MCP %s -> %s (%s)", op, exc.code, exc.message)
+        raise ValueError(f"{exc.code}: {exc.message}") from exc
+    except GitOpError as exc:
+        # The message already names the paths involved and the next step; it
+        # is all the agent gets, since an MCP error carries only text.
+        appmain.log.warning(
+            "denied MCP %s -> %s (%s)", op, exc.code, exc.message.splitlines()[0] if exc.message else ""
+        )
         raise ValueError(f"{exc.code}: {exc.message}") from exc
     except ValueError as exc:
         appmain.log.warning("denied MCP %s -> %s", op, exc)
@@ -347,6 +380,14 @@ def _reap_expired_sessions() -> None:
             session.lock.release()
 
 
+def active_upload_paths() -> list[str]:
+    """Paths of open chunked-write sessions, for git_pull/git_merge's
+    uploads_in_flight check. Sweeps expired ones first so a session its owner
+    abandoned does not block pulls forever."""
+    _reap_expired_sessions()
+    return ["/".join(sess.parts) for sess in list(_SESSIONS.values())]
+
+
 # =============================================================================
 # Tools -- one per REST capability (docs/plan-mcp-connector.md, "Tool
 # surface"). find_files is deliberately not included yet: the plan's open
@@ -367,7 +408,8 @@ def get_folder_info(ctx: Context) -> dict[str, Any]:
 
     request = ctx.request_context.request
     scope = getattr(request.state, "token_scope", "ro") if request is not None else "ro"
-    return {
+    git_ro_tools = ", git_status, git_log, git_diff" if appmain.CONFIG.enable_git_read else ""
+    info: dict[str, Any] = {
         "max_upload_bytes": appmain.CONFIG.max_upload_bytes,
         "max_list_entries": appmain.CONFIG.max_list_entries,
         "denied_names": sorted(appmain.CONFIG.denied_names),
@@ -377,7 +419,7 @@ def get_folder_info(ctx: Context) -> dict[str, Any]:
         "writes_allowed": scope == "rw",
         "token_scope_note": (
             "rw: every tool works. ro: list_files, stat_file, read_file, "
-            "request_download, download_status, get_folder_info and upload_status work; every write tool is refused "
+            f"request_download, download_status, get_folder_info and upload_status{git_ro_tools} work; every write tool is refused "
             "with a 'read-only' error. With an ro token, don't attempt writes -- "
             "tell the user this task needs a read-write token."
         ),
@@ -434,6 +476,8 @@ def get_folder_info(ctx: Context) -> dict[str, Any]:
             ),
         },
     }
+    info["git"] = appmain.GIT.info_block() if appmain.GIT is not None else GitRepo.disabled_info()
+    return info
 
 
 @mcp.tool()
@@ -1357,3 +1401,159 @@ def download_status(download_id: str) -> dict[str, Any]:
     from . import main as appmain
 
     return _guard("download_status", lambda: appmain.download_ticket_status(download_id).model_dump())
+
+
+# =============================================================================
+# Git tools -- docs/plan-mcp-git-ops.md
+#
+# Registered only for the enabled class (ENABLE_GIT_READ / ENABLE_GIT_WRITE), so
+# a disabled tool is absent from tools/list rather than present and refusing.
+#
+# These are `async def`, unlike every tool above. FastMCP calls a sync tool
+# inline on the event loop, and a git push can take a minute: run in a worker
+# thread so the server keeps answering health checks and other requests.
+# `_guard` is sync, so it runs inside the thread; the read-write check runs
+# first, in the coroutine, where the request context is.
+# =============================================================================
+
+
+def _git() -> GitRepo:
+    from . import main as appmain
+
+    assert appmain.GIT is not None  # only registered when git mode is on
+    return appmain.GIT
+
+
+async def _git_run(op: str, fn):  # type: ignore[no-untyped-def]
+    return await asyncio.to_thread(_guard, op, fn)
+
+
+def _token_is_rw(ctx: Context) -> bool:
+    request = ctx.request_context.request
+    return request is not None and getattr(request.state, "token_scope", None) == "rw"
+
+
+async def git_status(ctx: Context, fetch: bool = False, limit: int = 500) -> dict[str, Any]:
+    """Branch, ahead/behind, and every changed file across the WHOLE repository,
+    each marked `in_scope` (inside your folder, so yours to commit) or not (a
+    person's work elsewhere in the repo: you can see that it changed, but you
+    cannot commit, pull over, or push it). Paths are given as `path`
+    (repo-relative) and `scope_path` (relative to your folder, null if outside;
+    pass it straight to read_file). In-scope changes are listed first.
+
+    ahead/behind are only as fresh as the last fetch (see `as_of_fetch`);
+    `fetch=true` runs git_fetch first, which needs the write tools and a
+    read-write token. Works with a read-only token otherwise."""
+    token_rw = _token_is_rw(ctx)
+    return await _git_run(
+        "git_status", lambda: _git().status_tool(fetch=fetch, token_rw=token_rw, limit=limit)
+    )
+
+
+async def git_log(ctx: Context, limit: int = 20, scope_only: bool = False) -> dict[str, Any]:
+    """The last `limit` (max 200) commits on the current branch: hash, author,
+    date, subject, and `touches_outside_scope` (true if the commit changed
+    anything outside your folder). `scope_only=true` lists only commits that
+    touched your folder. Commit bodies are not returned."""
+    return await _git_run("git_log", lambda: _git().log(limit=limit, scope_only=scope_only))
+
+
+async def git_diff(
+    ctx: Context,
+    staged: bool = False,
+    path: str | None = None,
+    offset: int = 0,
+    length: int | None = None,
+) -> dict[str, Any]:
+    """The diff of YOUR FOLDER ONLY against HEAD (or, with staged=true, the
+    index against HEAD). Changes elsewhere in the repository never appear here,
+    even when they exist; git_status shows only their names. `path` (relative
+    to your folder) narrows it to one file or subfolder. Large diffs are paged
+    like read_file: pass the `offset` from the note to continue. Does not show
+    untracked files; use git_status for those."""
+    from . import main as appmain
+
+    limit = appmain.CONFIG.mcp_inline_limit_chars
+    return await _git_run(
+        "git_diff",
+        lambda: _git().diff(staged=staged, path=path, offset=offset, length=length, inline_limit=limit),
+    )
+
+
+async def git_commit(ctx: Context, message: str, paths: list[str] | None = None) -> dict[str, Any]:
+    """Commit changes inside YOUR FOLDER. Omit `paths` to commit everything
+    changed there, or pass folder-relative paths (files or subfolders) to commit
+    only those. Changes anywhere else in the repository are never included, even
+    if a person staged them: this builds the commit from your folder alone. The
+    author is fixed by the server. Refuses with nothing_to_commit, or
+    too_many_changes if a runaway number of files changed (commit a narrower
+    `paths`). Does not push; call git_push. Requires a read-write token."""
+    _require_write(ctx)
+    return await _git_run("git_commit", lambda: _git().commit(message, paths))
+
+
+async def git_fetch(ctx: Context) -> dict[str, Any]:
+    """Update the remote-tracking branch only; your files and your branch are
+    not touched. Use it to see how far behind you are (`branch.behind`) before
+    choosing a git_pull strategy. Requires a read-write token."""
+    _require_write(ctx)
+    return await _git_run("git_fetch", lambda: _git().fetch())
+
+
+async def git_pull(ctx: Context, strategy: str = "ff-only") -> dict[str, Any]:
+    """Fetch and integrate the remote branch. `strategy`: "ff-only" (default;
+    refuses with `diverged` if you have unpushed commits the remote lacks),
+    "merge" (merge commit), or "rebase" (replay your unpushed commits on top).
+
+    Every outcome is decided BEFORE anything changes: a pull that would conflict
+    is refused (`conflict`) with the tree untouched, never left half-merged. A
+    pull that would change files OUTSIDE your folder is refused (`outside_scope`)
+    unless the server allows pulling remote content there; the refusal lists the
+    paths so you can ask the user to pull on the host. Refused while uploads are
+    in flight (`uploads_in_flight`: finish or abort them first), and with
+    `dirty_worktree` if uncommitted changes would be overwritten (git_commit
+    yours first). Requires a read-write token."""
+    _require_write(ctx)
+    return await _git_run("git_pull", lambda: _git().pull(strategy))
+
+
+async def git_push(ctx: Context) -> dict[str, Any]:
+    """Push the current branch to the configured remote. Never forced. If the
+    remote has commits you lack, refuses with `non_fast_forward`: git_pull, then
+    git_push again. Refuses with `outside_scope_commits` if any commit being
+    published changes files outside your folder (for example a commit a person
+    made on the host): those must be pushed from the host, and the refusal names
+    the commits. Requires a read-write token."""
+    _require_write(ctx)
+    return await _git_run("git_push", lambda: _git().push())
+
+
+async def git_merge(ctx: Context, ref: str, no_ff: bool = False) -> dict[str, Any]:
+    """Merge another branch into the current one. `ref` is a local branch name
+    or `<remote>/<branch>` (e.g. "origin/feature"); raw SHAs, tags and revision
+    syntax are refused (`invalid_ref`). Same guarantees as git_pull: a conflict
+    or a change outside your folder is refused before anything is touched, and
+    it is refused while uploads are in flight. `no_ff=true` always makes a merge
+    commit. Requires a read-write token."""
+    _require_write(ctx)
+    return await _git_run("git_merge", lambda: _git().merge(ref, no_ff))
+
+
+def _register_git_tools() -> None:
+    from . import main as appmain
+
+    cfg = appmain.CONFIG
+    reads = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+    local_writes = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False)
+    net_writes = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True)
+    if cfg.enable_git_read:
+        for fn in (git_status, git_log, git_diff):
+            mcp.add_tool(fn, annotations=reads)
+    if cfg.enable_git_write:
+        for fn in (git_commit, git_merge):
+            mcp.add_tool(fn, annotations=local_writes)
+        for fn in (git_fetch, git_pull, git_push):
+            mcp.add_tool(fn, annotations=net_writes)
+
+
+_register_git_tools()

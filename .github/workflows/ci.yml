@@ -73,3 +73,33 @@ jobs:
 
       - name: Run tests/autocommit_tests.sh
         run: bash tests/autocommit_tests.sh
+
+  git-tools:
+    name: Git tools (real git, in-process)
+    needs: quick-checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # One pip invocation, not two: mcp and fastapi share starlette (see the
+      # Dockerfile and docs/plan-mcp-connector.md).
+      - name: Install app requirements
+        run: pip install -r app/requirements.txt -r app/requirements-mcp.txt
+
+      # app.git_ops against throwaway repositories with a bare-repo remote:
+      # the scope boundary, the opt-in rule, planted hooks and config, startup
+      # refusals, credential scrubbing, timeouts. Reaches the remote over git's
+      # file transport through test-only seams (production allows only ssh and
+      # https); the container-level run in tests/run_tests.sh covers the image.
+      - name: tests/git_suite.py
+        run: python3 tests/git_suite.py
+
+      # The same tools through /mcp and REST: tool registration for each
+      # ENABLE_GIT_READ x ENABLE_GIT_WRITE combination, token scopes, error
+      # mapping, uploads-in-flight, and a bad deployment refusing to start.
+      - name: tests/git_surface_tests.py
+        run: python3 tests/git_surface_tests.py

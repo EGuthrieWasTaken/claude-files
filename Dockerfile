@@ -42,6 +42,26 @@ ENV PATH="/venv/bin:$PATH" \
     DATA_ROOT=/data
 
 COPY --from=build /venv /venv
+
+# The git tools (docs/plan-mcp-git-ops.md) shell out to git and ssh. Built in
+# by default; `--build-arg WITH_GIT=0` leaves them out, and then setting
+# ENABLE_GIT_READ/ENABLE_GIT_WRITE is a startup error that names this arg
+# (app/git_ops.py, _find_git) rather than a silent no-op.
+#
+# The uid-99 entry (unRAID's nobody:users, gid 100 already exists in Debian)
+# is for the same reason the autocommit sidecar adds one: OpenSSH calls
+# getpwuid() and refuses to run for a uid with no passwd entry ("No user
+# exists for uid 99"), which breaks git-over-ssh whenever the container is run
+# with --user 99:100. Home is /tmp, the only writable path on a read-only rootfs.
+ARG WITH_GIT=1
+RUN if [ "$WITH_GIT" = "1" ]; then \
+      apt-get update \
+      && apt-get install -y --no-install-recommends git openssh-client \
+      && rm -rf /var/lib/apt/lists/* \
+      && useradd --system --uid 99 --gid 100 --no-create-home --home-dir /tmp \
+           --shell /usr/sbin/nologin unraid-nobody; \
+    fi
+
 WORKDIR /srv
 COPY app/ /srv/app/
 # The bridge (docs/feature-request-path-based-upload.md) is client-side code

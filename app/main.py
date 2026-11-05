@@ -24,6 +24,8 @@ from pydantic import BaseModel, Field
 
 from .config import Config
 from .downloads import DownloadTicket, DownloadTickets
+from .gate import NullGate, WorktreeGate
+from .git_ops import GitOpError, GitRepo
 from .safepath import Entry, PathError, Vault
 from .uploads import (
     TicketExpired,
@@ -72,10 +74,17 @@ if CONFIG.require_mount and os.stat(CONFIG.root).st_dev == os.stat("/").st_dev:
         f"Bind-mount your shared folder to {CONFIG.root}, or set REQUIRE_MOUNT=false."
     )
 
+# docs/plan-mcp-git-ops.md. Either switch turns git mode on; the gate is the
+# reader-writer lock between file writes and git (a NullGate otherwise, so a
+# deployment without git mode pays nothing for it).
+_GIT_ENABLED = CONFIG.enable_git_read or CONFIG.enable_git_write
+GATE = WorktreeGate() if _GIT_ENABLED else NullGate()
+
 VAULT = Vault(
     CONFIG.root,
     denied_names=CONFIG.denied_names,
     allow_hardlinked_files=CONFIG.allow_hardlinked_files,
+    gate=GATE,
 )
 
 TICKETS = UploadTickets(
@@ -87,6 +96,26 @@ DOWNLOAD_TICKETS = DownloadTickets(
     ttl_seconds=CONFIG.download_ticket_ttl_seconds,
     max_tickets=CONFIG.download_tickets_max,
 )
+
+
+def _uploads_in_flight() -> list[str]:
+    """Paths an upload could still be writing to: pending/receiving tickets and
+    open chunked sessions. git_pull / git_merge refuse while any exist.
+    `_mcp_endpoint` is a module global set at the bottom of this file."""
+    paths = [t.path for t in TICKETS.active()]
+    if _mcp_endpoint is not None:
+        paths += _mcp_endpoint.active_upload_paths()
+    return sorted(set(paths))
+
+
+GIT: GitRepo | None = None
+if _GIT_ENABLED:
+    # Validates the whole deployment (layout, .git denied, config origins,
+    # remote URL, credentials, mount mode) and raises RuntimeError with a fix
+    # if anything is wrong -- the container refuses to start rather than run
+    # git in a state nobody has checked, exactly like the mount check above.
+    GIT = GitRepo(CONFIG, vault=VAULT, gate=GATE, uploads_in_flight=_uploads_in_flight)
+    GIT.start()
 
 DESCRIPTION = """
 A REST API for reading and writing files inside a single shared folder.
@@ -373,6 +402,18 @@ async def _path_error_handler(request: Request, exc: PathError) -> JSONResponse:
     )
 
 
+@app.exception_handler(GitOpError)
+async def _git_error_handler(request: Request, exc: GitOpError) -> JSONResponse:
+    log.warning(
+        "denied %s %s -> %s (%s)", request.method, request.url.path, exc.code,
+        exc.message.splitlines()[0] if exc.message else "",
+    )
+    return JSONResponse(
+        status_code=exc.status,
+        content={"code": exc.code, "message": exc.message, "detail": exc.detail},
+    )
+
+
 @app.exception_handler(HTTPException)
 async def _http_error_handler(request: Request, exc: HTTPException) -> JSONResponse:
     detail: Any = exc.detail
@@ -428,6 +469,7 @@ def info(scope: ReadAuth) -> dict[str, Any]:
         "upload_tickets_max": CONFIG.upload_tickets_max,
         "download_ticket_ttl_seconds": CONFIG.download_ticket_ttl_seconds,
         "download_tickets_max": CONFIG.download_tickets_max,
+        "git": GIT.info_block() if GIT is not None else GitRepo.disabled_info(),
     }
 
 
@@ -1119,6 +1161,96 @@ def copy(req: CopyRequest, _: WriteAuth) -> OkResponse:
     size = VAULT.copy(src, dst, overwrite=req.overwrite, create_parents=req.parents)
     log.info("copied %s -> %s (%d bytes)", "/".join(src), "/".join(dst), size)
     return OkResponse(path="/".join(dst), size=size, created=True)
+
+
+# --------------------------------------------------------------------------
+# Git -- docs/plan-mcp-git-ops.md
+#
+# One route per MCP tool. A disabled class answers 404 git_disabled. The
+# handlers are plain `def`, so FastAPI runs them in its threadpool: a git push
+# can take a minute and must not stall the event loop.
+# --------------------------------------------------------------------------
+
+class GitCommitRequest(BaseModel):
+    message: str = Field(description="The commit message.")
+    paths: list[str] | None = Field(
+        default=None,
+        description="Folder-relative paths to commit. Omit to commit everything changed in the folder.",
+    )
+
+
+class GitPullRequest(BaseModel):
+    strategy: str = Field(default="ff-only", description="ff-only, merge, or rebase.")
+
+
+class GitMergeRequest(BaseModel):
+    ref: str = Field(description="A local branch name, or '<remote>/<branch>'.")
+    no_ff: bool = False
+
+
+def _git_read() -> GitRepo:
+    if GIT is None or not GIT.read_enabled:
+        raise GitOpError("git_disabled", "git read tools are disabled on this server (ENABLE_GIT_READ=false)")
+    return GIT
+
+
+def _git_write() -> GitRepo:
+    if GIT is None or not GIT.write_enabled:
+        raise GitOpError("git_disabled", "git write tools are disabled on this server (ENABLE_GIT_WRITE=false)")
+    return GIT
+
+
+@app.get("/v1/git/status", tags=["git"], summary="Branch and changed files across the whole repository")
+def git_status(
+    scope: ReadAuth, fetch: bool = False, limit: int = Query(500, ge=1, le=5000)
+) -> dict[str, Any]:
+    return _git_read().status_tool(fetch=fetch, token_rw=(scope == "rw"), limit=limit)
+
+
+@app.get("/v1/git/log", tags=["git"], summary="Recent commits on the current branch")
+def git_log(
+    _: ReadAuth, limit: int = Query(20, ge=1, le=200), scope_only: bool = False
+) -> dict[str, Any]:
+    return _git_read().log(limit=limit, scope_only=scope_only)
+
+
+@app.get("/v1/git/diff", tags=["git"], summary="Diff of the shared folder only")
+def git_diff(
+    _: ReadAuth,
+    staged: bool = False,
+    path: str | None = None,
+    offset: int = Query(0, ge=0),
+    length: int | None = Query(None, ge=0),
+) -> dict[str, Any]:
+    return _git_read().diff(
+        staged=staged, path=path, offset=offset, length=length,
+        inline_limit=CONFIG.mcp_inline_limit_chars,
+    )
+
+
+@app.post("/v1/git/commit", tags=["git"], summary="Commit changes inside the shared folder")
+def git_commit(req: GitCommitRequest, _: WriteAuth) -> dict[str, Any]:
+    return _git_write().commit(req.message, req.paths)
+
+
+@app.post("/v1/git/fetch", tags=["git"], summary="Update remote-tracking refs only")
+def git_fetch(_: WriteAuth) -> dict[str, Any]:
+    return _git_write().fetch()
+
+
+@app.post("/v1/git/pull", tags=["git"], summary="Fetch and integrate the remote branch")
+def git_pull(req: GitPullRequest, _: WriteAuth) -> dict[str, Any]:
+    return _git_write().pull(req.strategy)
+
+
+@app.post("/v1/git/push", tags=["git"], summary="Push the current branch (never forced)")
+def git_push(_: WriteAuth) -> dict[str, Any]:
+    return _git_write().push()
+
+
+@app.post("/v1/git/merge", tags=["git"], summary="Merge a branch into the current one")
+def git_merge(req: GitMergeRequest, _: WriteAuth) -> dict[str, Any]:
+    return _git_write().merge(req.ref, req.no_ff)
 
 
 # --------------------------------------------------------------------------

@@ -145,9 +145,20 @@ run_mode() {
 
   echo
   echo "--- bridge: local upload/download client (docs/feature-request-path-based-upload.md) ---"
-  BASE_URL="127.0.0.1:$port" API_TOKEN="$TOKEN" API_TOKEN_READONLY="$RO_TOKEN" \
-  FIXTURE_REPO="$FIXTURE/repo" MODE="$mode" MAX_UPLOAD_BYTES=2097152 \
-    python3 tests/bridge_tests.py || FAIL=1
+  if python3 -c "import ssl" >/dev/null 2>&1; then
+    BASE_URL="127.0.0.1:$port" API_TOKEN="$TOKEN" API_TOKEN_READONLY="$RO_TOKEN" \
+    FIXTURE_REPO="$FIXTURE/repo" MODE="$mode" MAX_UPLOAD_BYTES=2097152 \
+      python3 tests/bridge_tests.py || FAIL=1
+  else
+    # Some hosts (e.g. unRAID) ship a python3 whose ssl module cannot load, and
+    # the bridge imports ssl. Run the same test inside the image, which has one.
+    echo "  (host python3 cannot import ssl; running the bridge tests inside $IMAGE)"
+    docker run --rm --network host --user 0:0 --entrypoint python \
+      -v "$ROOT:/src:ro" -v "$FIXTURE/repo:$FIXTURE/repo" \
+      -e BASE_URL="127.0.0.1:$port" -e API_TOKEN="$TOKEN" -e API_TOKEN_READONLY="$RO_TOKEN" \
+      -e FIXTURE_REPO="$FIXTURE/repo" -e MODE="$mode" -e MAX_UPLOAD_BYTES=2097152 \
+      -e PYTHONDONTWRITEBYTECODE=1 -w /src "$IMAGE" tests/bridge_tests.py || FAIL=1
+  fi
 
   echo
   echo "--- server log: denials recorded ---"

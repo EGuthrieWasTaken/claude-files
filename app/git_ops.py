@@ -772,11 +772,26 @@ class GitRepo:
         rc, _, _ = self._git(["merge-base", "--is-ancestor", a, b], rc_ok=(0, 1))
         return rc == 0
 
+    @staticmethod
+    def _is_upload_tmp(path: str) -> bool:
+        """An in-flight upload's temp file (.upload-*.tmp, at any depth)."""
+        base = path.rsplit("/", 1)[-1]
+        return base.startswith(".upload-") and base.endswith(".tmp")
+
     def _pathspecs(self, rels: list[str] | None = None) -> list[str]:
         """Positive pathspecs for the scope (or for validated scope-relative
-        paths under it), plus the .upload-*.tmp exclusions autocommit.sh uses.
+        paths under it), plus the .upload-*.tmp exclusion autocommit.sh uses.
         ':(literal)' means '*' and ':(...)' magic in an agent-supplied path
-        cannot widen it."""
+        cannot widen it.
+
+        There is exactly ONE exclude spec, '<scope>**/.upload-*.tmp': '**/'
+        matches zero or more directories, so it already covers a temp file
+        directly in the scope. Do not add a second '<scope>.upload-*.tmp' spec
+        for "completeness": with the whole-repository scope (empty prefix) git
+        2.47 reads ':(exclude,glob).upload-*.tmp' as hiding every UNTRACKED
+        file named by the other specs, so `git add -A` silently skipped new
+        files while reporting success (tests/git_suite.py,
+        commit_explicit_paths_include_new_untracked_files*)."""
         if rels:
             specs = [":(literal)" + self.scope + r for r in rels]
         elif self.scope:
@@ -784,10 +799,7 @@ class GitRepo:
         else:
             specs = ["."]
         prefix = _escape_glob(self.scope)
-        specs += [
-            f":(exclude,glob){prefix}**/.upload-*.tmp",
-            f":(exclude,glob){prefix}.upload-*.tmp",
-        ]
+        specs.append(f":(exclude,glob){prefix}**/.upload-*.tmp")
         return specs
 
     # ======================================================================
@@ -1154,11 +1166,23 @@ class GitRepo:
             rels = [self._scope_rel(p) for p in paths]
             rels = [r for r in rels if r] or None   # "" means the scope root
 
-        specs = self._pathspecs(rels)
         with self._lock, self._exclusive():
             self._require_branch()
             old = self._rev("HEAD")
             assert old is not None
+            requested = rels
+            if rels:
+                # A path that is neither on disk nor in HEAD cannot be committed
+                # and would make `git add` abort the whole commit ("pathspec did
+                # not match"); report it in `skipped` instead.
+                rels = [r for r in rels if self._path_known(r, old)]
+                if not rels:
+                    raise GitOpError(
+                        "nothing_to_commit",
+                        "none of the requested paths exist in your folder: "
+                        + _listing(requested) + ".",
+                    )
+            specs = self._pathspecs(rels)
             tmp_index = os.path.join(self._state_dir, f"index.{os.urandom(6).hex()}")
             idx = {"GIT_INDEX_FILE": tmp_index}
             try:
@@ -1227,10 +1251,20 @@ class GitRepo:
 
             # Bring the real index's entries for the committed paths up to date,
             # so git_status shows them clean. Entries outside the scope are left
-            # exactly as the person on the host left them.
+            # exactly as the person on the host left them. Only the paths the
+            # commit actually changed are touched (by exact name), so an
+            # unrelated untracked file or an upload temp file is never staged.
+            committed = self._names(old, new)
             note = None
             try:
-                self._git(["add", "-A", "--", *specs], write=True)
+                self._git(
+                    ["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"],
+                    write=True,
+                    stdin=b"".join(
+                        (":(literal)" + n).encode("utf-8", "surrogateescape") + b"\0"
+                        for n in committed
+                    ),
+                )
             except GitOpError:
                 note = (
                     "committed, but the index could not be refreshed (another git process holds "
@@ -1256,9 +1290,44 @@ class GitRepo:
                 "outside_scope_changes_left": left,
                 "branch": self.branch_summary(),
             }
-            if note:
+            if requested:
+                skipped = self._skipped_paths(requested or [], old, set(committed))
+                if skipped:
+                    result["skipped"] = skipped
+                    result["note"] = (
+                        (note + " " if note else "")
+                        + f"{len(skipped)} requested path(s) had nothing to commit and are not "
+                        "in this commit; see `skipped`."
+                    )
+            if note and "note" not in result:
                 result["note"] = note
             return result
+
+    def _path_known(self, rel: str, rev: str) -> bool:
+        """True if a scope-relative path exists on disk or in `rev`."""
+        if os.path.lexists(os.path.join(self.cfg.root, rel)):
+            return True
+        out = self._git(
+            ["ls-tree", "--name-only", "-z", rev, "--", ":(literal)" + self.scope + rel]
+        )[1]
+        return bool(out)
+
+    def _skipped_paths(self, rels: list[str], old: str, committed: set[str]) -> list[dict[str, str]]:
+        """Requested paths that contributed nothing to the commit, with why, so
+        a path that was silently left out can never look like a success."""
+        out: list[dict[str, str]] = []
+        for r in rels:
+            full = self.scope + r
+            if any(c == full or c.startswith(full + "/") for c in committed):
+                continue
+            if self._is_upload_tmp(full):
+                reason = "upload_in_flight"
+            elif os.path.lexists(os.path.join(self.cfg.root, r)):
+                reason = "unchanged"
+            else:
+                reason = "not_found"
+            out.append({"path": r, "reason": reason})
+        return out
 
     # -- network -----------------------------------------------------------
 

@@ -1485,7 +1485,10 @@ async def git_commit(ctx: Context, message: str, paths: list[str] | None = None)
     changed there, or pass folder-relative paths (files or subfolders) to commit
     only those. Changes anywhere else in the repository are never included, even
     if a person staged them: this builds the commit from your folder alone. The
-    author is fixed by the server. Refuses with nothing_to_commit, or
+    author is fixed by the server. New (untracked) files and folders named in
+    `paths` are added. Any requested path that contributed nothing is listed in
+    the result's `skipped` (with a reason) rather than being dropped silently.
+    Refuses with nothing_to_commit, or
     too_many_changes if a runaway number of files changed (commit a narrower
     `paths`). Does not push; call git_push. Requires a read-write token."""
     _require_write(ctx)

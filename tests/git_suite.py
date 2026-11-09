@@ -207,6 +207,14 @@ def test(fn: Callable[[], None]) -> Callable[[], None]:
 # ----------------------------------------------------------------------------
 
 
+def _read_bytes(path: str) -> bytes:
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return b""
+
+
 @test
 def status_lists_whole_repo_with_scope_flags() -> None:
     w = World()
@@ -358,6 +366,119 @@ def commit_explicit_paths_and_deletions() -> None:
     g.commit("remove a", paths=["a.txt"])
     assert changed_in_head(w) == {"sub-folder-1/a.txt"}
     assert not (w.repo / "sub-folder-1/a.txt").exists()
+
+
+def _explicit_paths_commit_untracked(w: World, base: str) -> None:
+    g = w.ops()
+    w.write(f"{base}a.txt", "edited\n") if base else w.write("README.md", "edited\n")
+    tracked = f"{base}a.txt" if base else "README.md"
+    rel = lambda p: p[len(base):]  # noqa: E731  (scope-relative form of a repo path)
+    w.write(f"{base}briefs/2026/x.pdf", "new\n")       # new file in folders that do not exist yet
+    w.write(f"{base}top-new.md", "new top\n")           # new file in an existing folder
+    res = g.commit("tracked + untracked",
+                   paths=[rel(tracked), "briefs/2026/x.pdf", "top-new.md"])
+    assert res["files_changed"] == 3, res
+    assert not res.get("skipped"), res
+    assert changed_in_head(w) == {tracked, f"{base}briefs/2026/x.pdf", f"{base}top-new.md"}
+    assert w.host("status", "--porcelain").strip() == "", w.host("status", "--porcelain")
+    # a brand-new SUBFOLDER named on its own is accepted as a path too
+    w.write(f"{base}more/y.md", "y\n")
+    res = g.commit("folder path", paths=["more"])
+    assert res["files_changed"] == 1 and changed_in_head(w) == {f"{base}more/y.md"}
+
+
+@test
+def commit_explicit_paths_include_new_untracked_files() -> None:
+    """Reported bug: paths=[modified tracked file, brand-new file] committed
+    only the tracked file, with ok:true. Scoped folder."""
+    _explicit_paths_commit_untracked(World(), "sub-folder-1/")
+
+
+@test
+def commit_explicit_paths_include_new_untracked_files_whole_repo_scope() -> None:
+    """Same, with scope = the whole repository (empty prefix). This is the
+    layout where git 2.47's `git add -A` dropped untracked files whenever an
+    ':(exclude,glob).upload-*.tmp' pathspec rode along."""
+    _explicit_paths_commit_untracked(World(scope_dir=None), "")
+
+
+@test
+def commit_new_file_beside_tracked_files_is_committed_with_explicit_paths() -> None:
+    """The reported shape exactly: daily-briefs/news-log.md (tracked, modified)
+    plus daily-briefs/2026/x.pdf, a new file in a folder that already holds
+    tracked files. This is the shape git 2.47 got wrong in whole-repo scope."""
+    for scope_dir, base in (("sub-folder-1", "sub-folder-1/"), (None, "")):
+        w = World(scope_dir=scope_dir)
+        w.host_commit(f"{base}daily-briefs/news-log.md", "log\n")
+        w.host_commit(f"{base}daily-briefs/2026/old.pdf", "old\n")
+        g = w.ops()
+        w.write(f"{base}daily-briefs/news-log.md", "log\nmore\n")
+        (w.repo / f"{base}daily-briefs/2026/x.pdf").write_bytes(b"%PDF-1.4\n\x00\xff binary\n")
+        res = g.commit("brief", paths=["daily-briefs/news-log.md", "daily-briefs/2026/x.pdf"])
+        assert res["files_changed"] == 2 and not res.get("skipped"), res
+        assert changed_in_head(w) == {f"{base}daily-briefs/news-log.md", f"{base}daily-briefs/2026/x.pdf"}
+        assert w.host("status", "--porcelain").strip() == ""
+
+
+@test
+def commit_add_carries_only_the_slash_star_star_upload_exclude() -> None:
+    """Version-independent guard for the bug above, which only misbehaves on
+    some git versions: assert the cause directly. The only exclude spec an
+    `add` may carry is '<scope>**/.upload-*.tmp'; a second, prefix-only
+    ':(exclude,glob)<scope>.upload-*.tmp' made git 2.47 skip untracked files."""
+    for scope_dir in ("sub-folder-1", None):
+        w = World(scope_dir=scope_dir)
+        g = w.ops()
+        seen: list[list[str]] = []
+        real = g._git
+
+        def spy(args: list[str], *a: Any, **kw: Any) -> Any:
+            seen.append(list(args))
+            return real(args, *a, **kw)
+
+        g._git = spy  # type: ignore[method-assign]
+        base = "sub-folder-1/" if scope_dir else ""
+        w.write(f"{base}fresh/new.md", "n\n")
+        g.commit("c", paths=["fresh/new.md"])
+        w.write(f"{base}fresh/new2.md", "n\n")
+        g.commit("c2")
+        excludes = [x for a in seen if a and a[0] == "add" for x in a if "exclude" in x]
+        assert excludes, seen
+        assert all(x.endswith("**/.upload-*.tmp") for x in excludes), excludes
+
+
+@test
+def commit_reports_requested_paths_that_added_nothing() -> None:
+    w = World()
+    g = w.ops()
+    w.write("sub-folder-1/a.txt", "edited\n")
+    res = g.commit("one real, two empty", paths=["a.txt", "notes/n.md", "ghost.md"])
+    assert res["ok"] and res["files_changed"] == 1, res
+    assert sorted((x["path"], x["reason"]) for x in res["skipped"]) == [
+        ("ghost.md", "not_found"), ("notes/n.md", "unchanged")], res
+    assert "skipped" in res["note"]
+    # nothing at all to commit is still the hard error, not a skipped list
+    expect_err("nothing_to_commit", g.commit, "none", paths=["notes/n.md", "ghost.md"])
+
+
+@test
+def commit_leaves_in_flight_upload_temp_files_out_in_every_layout() -> None:
+    for scope_dir, base in (("sub-folder-1", "sub-folder-1/"), (None, "")):
+        w = World(scope_dir=scope_dir)
+        g = w.ops()
+        w.write(f"{base}docs/.upload-abc123.tmp", "half\n")
+        w.write(f"{base}.upload-root.tmp", "half\n")
+        w.write(f"{base}docs/real.md", "real\n")
+        res = g.commit("with tmp lying around")                         # no paths
+        assert changed_in_head(w) == {f"{base}docs/real.md"}, changed_in_head(w)
+        assert not res.get("skipped")
+        w.write(f"{base}docs/real2.md", "real2\n")
+        res = g.commit("explicit", paths=["docs/real2.md", "docs/.upload-abc123.tmp"])
+        assert changed_in_head(w) == {f"{base}docs/real2.md"}, changed_in_head(w)
+        assert res["skipped"] == [{"path": "docs/.upload-abc123.tmp", "reason": "upload_in_flight"}], res
+        # the temp files are still untracked and unstaged afterwards
+        st = w.host("status", "--porcelain")
+        assert "?? " in st and ".upload-abc123.tmp" in st and "A " not in st, st
 
 
 @test
@@ -1090,7 +1211,11 @@ def a_stalled_remote_times_out_without_leaving_locks_or_processes() -> None:
     expect_err("timeout", g.fetch)
     assert time.monotonic() - t0 < 15, "timeout was not enforced"
     time.sleep(0.3)
-    left = subprocess.run(["pgrep", "-f", marker], capture_output=True, text=True).stdout.split()
+    # (/proc scan rather than pgrep: the runtime image has no procps)
+    left = [
+        d for d in os.listdir("/proc") if d.isdigit() and int(d) != os.getpid()
+        and marker.encode() in _read_bytes(f"/proc/{d}/cmdline")
+    ]
     assert not left, f"orphaned child processes survived the timeout: {left}"
     assert not (w.repo / ".git/index.lock").exists()
     w.write("sub-folder-1/b.txt", "y\n")
@@ -1145,7 +1270,7 @@ def source_only_invokes_an_allow_list_of_git_subcommands() -> None:
     allowed = {
         "rev-parse", "symbolic-ref", "check-ref-format", "remote", "config", "status", "log",
         "diff", "diff-tree", "diff-index", "rev-list", "merge-base", "merge-tree", "read-tree",
-        "add", "write-tree", "commit-tree", "update-ref", "fetch", "push", "merge", "rebase",
+        "add", "ls-tree", "write-tree", "commit-tree", "update-ref", "fetch", "push", "merge", "rebase",
     }
     used = set(re.findall(r'self\._(?:git|out)\(\s*\[\s*"([a-z-]+)"', code))
     used |= set(re.findall(r'abort = \["([a-z-]+)", "--abort"\]', code))

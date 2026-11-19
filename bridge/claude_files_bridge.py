@@ -68,7 +68,7 @@ if not log.handlers:
     log.setLevel(logging.INFO)
     log.propagate = False
 
-USER_AGENT = "claude-files-bridge/1.1.0"
+USER_AGENT = "claude-files-bridge/1.4.0"
 
 _UPLOAD_HASH_BLOCK = 1024 * 1024        # 1 MiB -- hashing block size
 _DOWNLOAD_BLOCK = 256 * 1024            # 256 KiB -- download streaming block size

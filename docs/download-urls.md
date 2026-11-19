@@ -10,8 +10,8 @@ Read-side mirror of [`upload-urls.md`](upload-urls.md).
 
 `read_file` is the only MCP read path, and it returns file contents inline.
 It cannot return PDFs (NUL bytes; the base64 route is capped at 8 KB) and cuts
-off text over `MCP_INLINE_LIMIT_CHARS` (100,000 characters). In a course
-folder that meant the homework-solution and syllabus PDFs were unreadable and
+off text over `MCP_INLINE_LIMIT_CHARS` (100,000 characters). In a folder of
+course material, for example, that meant every PDF handout was unreadable and
 large HTML slide decks came back as a CSS-only preview.
 
 ## Design

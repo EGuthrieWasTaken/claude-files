@@ -1,5 +1,11 @@
 # File API access
 
+<!-- For operators: this is a paste-ready brief for an agent. Before handing it
+over, replace https://files.example.com with your deployment's URL, and keep
+only the git paragraphs at the end that match how you run it (the MCP
+connector makes the same choice from AUTOCOMMIT_NOTICE and ENABLE_GIT_WRITE).
+Delete this comment. -->
+
 You have write access to one shared folder on a remote machine. **If you have
 an MCP connector for this service (tools named `list_files`, `read_file`,
 `write_file`, ...), use those instead of the REST calls below** — they're
@@ -26,7 +32,7 @@ file you can't read inline" below.
 Use it whenever you need to hand back a file rather than paste content
 into the conversation: reports, generated data, build artifacts, logs.
 
-**Base URL:** `https://claude-files.guthrieec.dev`
+**Base URL:** `https://files.example.com`
 **Auth:** every request except `/health` needs `Authorization: Bearer $CLAUDE_FILES_TOKEN`
 (or `X-API-Key: $CLAUDE_FILES_TOKEN` — the header the MCP connector dialog uses;
 `Authorization` is the documented primary and wins if both are sent).
@@ -93,7 +99,7 @@ file, or large text file can't come back that way (the call is refused, or
 you get a truncated preview). **Download it to your shell instead** — the
 bytes never pass through you, and a read-only token is enough:
 
-1. **Request a ticket.** MCP: `request_download(path="stat519/syllabus.pdf")`.
+1. **Request a ticket.** MCP: `request_download(path="reports/q3/summary.pdf")`.
    REST: `POST /v1/downloads {"path": "..."}`. You get
    `download_url`, `curl_command` (with `<OUTPUT_FILE>`), `size`, `sha256`,
    and `expires_at`.

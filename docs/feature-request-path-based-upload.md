@@ -103,7 +103,7 @@ running in production.** Neither are the chunked tools the reporting agent
 independently re-invented ("something like `upload_chunk` + `finalize_upload`"),
 which is itself evidence it never saw them.
 
-**Why:** `docker-compose.yml:3` pins `eguthriewastaken2/claude-files:1.0.0`, and
+**Why:** `docker-compose.yml:3` pins `<registry>/claude-files:1.0.0`, and
 `009633b` did not bump `app/main.py:99` (`version="1.0.0"`) or publish a new
 image. The unRAID templates track `:latest`, so whichever of those the live
 deployment uses, nothing republished means nothing changed.
@@ -114,8 +114,8 @@ deployment uses, nothing republished means nothing changed.
 2. Build and push per README "Publishing a new version", both tags:
    ```bash
    docker buildx build --platform linux/amd64,linux/arm64 \
-     --tag eguthriewastaken2/claude-files:1.1.0 \
-     --tag eguthriewastaken2/claude-files:latest --push .
+     --tag <registry>/claude-files:1.1.0 \
+     --tag <registry>/claude-files:latest --push .
    ```
 3. Bump the `docker-compose.yml` pins to `:1.1.0`.
 4. Redeploy, then **verify from a client, not from the host**: `GET /health`

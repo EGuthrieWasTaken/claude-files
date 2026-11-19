@@ -7,8 +7,8 @@
   <MyIP/>
   <Shell>bash</Shell>
   <Privileged>false</Privileged>
-  <Support/>
-  <Project/>
+  <Support>https://github.com/EGuthrieWasTaken/claude-files/issues</Support>
+  <Project>https://github.com/EGuthrieWasTaken/claude-files</Project>
   <Overview>
     Optional companion to claude-files. Polls the shared folder and commits
     and pushes whatever an agent writes there.

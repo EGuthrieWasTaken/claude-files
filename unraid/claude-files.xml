@@ -7,8 +7,8 @@
   <MyIP/>
   <Shell>sh</Shell>
   <Privileged>false</Privileged>
-  <Support/>
-  <Project/>
+  <Support>https://github.com/EGuthrieWasTaken/claude-files/issues</Support>
+  <Project>https://github.com/EGuthrieWasTaken/claude-files</Project>
   <Overview>
     REST file API confined to a single shared folder. Give Claude (or any
     agent) upload/download/replace/delete access to one subfolder of a git
@@ -79,7 +79,7 @@
           Type="Variable" Display="always" Required="false" Mask="false">true</Config>
 
   <Config Name="MCP Public Hostname" Target="MCP_PUBLIC_HOSTNAME" Default="" Mode=""
-          Description="This container's public hostname as reached through your reverse proxy / tunnel, e.g. claude-files.example.dev. Allow-lists that Host header for the MCP SDK's DNS-rebinding guard. Left blank, that guard is disabled instead of 421ing every real request -- /mcp is still gated by the API Token either way."
+          Description="This container's public hostname as reached through your reverse proxy / tunnel, e.g. files.example.com. Allow-lists that Host header for the MCP SDK's DNS-rebinding guard. Left blank, that guard is disabled instead of 421ing every real request -- /mcp is still gated by the API Token either way."
           Type="Variable" Display="always" Required="false" Mask="false"></Config>
 
   <Config Name="MCP Inline Limit (chars)" Target="MCP_INLINE_LIMIT_CHARS" Default="100000" Mode=""

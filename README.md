@@ -862,16 +862,49 @@ open.
 
 ## Publishing a new version
 
-> **1.2.0's release notes should say:** `EXTRA_TOOL_MODULES`
+> **1.3.0's release notes should say:** `EXTRA_TOOL_MODULES`
 > ([extension modules](#extension-modules), [`docs/extensions.md`](docs/extensions.md))
 > is new in this version: a derived image can add its own tools to `/mcp`, and
 > `GET /v1/info` and `get_folder_info` gain an `extensions` block. Derived
-> images should build `FROM eguthriewastaken2/claude-files:1.2.0` (or later),
+> images should build `FROM eguthriewastaken2/claude-files:1.3.0` (or later),
 > not `:latest`. Nothing changes for a deployment that leaves
 > `EXTRA_TOOL_MODULES` unset. After redeploying, **verify from a client, not
-> the host**: `GET /health` reports `"version":"1.2.0"`, and `GET /v1/info`
+> the host**: `GET /health` reports `"version":"1.3.0"`, and `GET /v1/info`
 > has `"extensions": {"api_version": 1, ...}`. `unraid/deploy.sh verify`
-> checks the version for you.
+> checks the version for you. (There is no 1.2.0 from this source: that tag
+> was already on Docker Hub, pushed 2026-09-23 from a build that still said
+> 1.1.0, so this release skips to 1.3.0.)
+
+### Releases are automatic
+
+1. **Every PR bumps the version.** `version=` in `app/main.py` is the one
+   source of truth; the `docker-compose.yml` pins (both images) and
+   `unraid/deploy.sh`'s fallback `TAG` must match it. CI's
+   *Version is new and consistent* job fails a PR whose version is already a
+   tag of either image on Docker Hub, or a git tag `vX.Y.Z`, or whose pins
+   disagree. `.github/scripts/check-version.sh unpublished` runs the same check
+   locally.
+2. **Merge, then publish a GitHub release** tagged `vX.Y.Z` (exactly
+   `v` + `app/main.py`'s version) from `main`. The *Release* workflow
+   (`.github/workflows/release.yml`) checks the tag again, builds both images
+   for `linux/amd64` and `linux/arm64`, pushes `:X.Y.Z` and `:latest` (not
+   `:latest` for a release marked pre-release), and confirms both
+   architectures landed. It refuses to overwrite a tag already on Docker Hub.
+3. **Redeploy** with `unraid/deploy.sh` (below), or unRAID's "Force Update".
+
+The workflow needs two repository secrets (Settings → Secrets and variables
+→ Actions): `DOCKERHUB_USERNAME`, and `DOCKERHUB_TOKEN`, a Docker Hub access
+token with Read & Write scope. To make the version check block merges, mark
+*Version is new and consistent* as a required status check on `main`
+(Settings → Branches).
+
+If a release run fails after pushing one image but not the other, the re-run
+is refused because that tag now exists. Bump to the next patch version
+rather than deleting a published tag.
+
+### By hand
+
+The commands below are what the workflow does, for publishing without it.
 
 `unraid/deploy.sh` scripts the redeploy-and-verify half of this section —
 `build` (the buildx command below), `pull` + recreate (via `docker compose`
@@ -892,19 +925,19 @@ The image is multi-arch (`linux/amd64` for unRAID, `linux/arm64` for local
 work on Apple silicon). Build both in one shot and push a single manifest:
 
 ```bash
-docker buildx build --platform linux/amd64,linux/arm64 --tag eguthriewastaken2/claude-files:1.2.0 --tag eguthriewastaken2/claude-files:latest --push .
+docker buildx build --platform linux/amd64,linux/arm64 --tag eguthriewastaken2/claude-files:1.3.0 --tag eguthriewastaken2/claude-files:latest --push .
 ```
 
 Confirm both architectures landed under one tag:
 
 ```bash
-docker buildx imagetools inspect eguthriewastaken2/claude-files:1.2.0
+docker buildx imagetools inspect eguthriewastaken2/claude-files:1.3.0
 ```
 
 The sidecar is a separate image, built the same way:
 
 ```bash
-docker buildx build --platform linux/amd64,linux/arm64 --tag eguthriewastaken2/claude-files-autocommit:1.2.0 --tag eguthriewastaken2/claude-files-autocommit:latest --push ./autocommit
+docker buildx build --platform linux/amd64,linux/arm64 --tag eguthriewastaken2/claude-files-autocommit:1.3.0 --tag eguthriewastaken2/claude-files-autocommit:latest --push ./autocommit
 ```
 
 Building on separate machines and pushing to the same tag does **not** produce
@@ -912,13 +945,13 @@ a multi-arch image -- the second push replaces the first. If you build
 natively on each host, push arch-suffixed tags and merge them:
 
 ```bash
-docker buildx imagetools create --tag eguthriewastaken2/claude-files:1.2.0 eguthriewastaken2/claude-files:1.2.0-arm64 eguthriewastaken2/claude-files:1.2.0-amd64
+docker buildx imagetools create --tag eguthriewastaken2/claude-files:1.3.0 eguthriewastaken2/claude-files:1.3.0-arm64 eguthriewastaken2/claude-files:1.3.0-amd64
 ```
 
 On Arch Linux, `docker buildx` is a separate package: `sudo pacman -S docker-buildx`.
 
 The unRAID templates pull `:latest`, so always push both tags. `docker-compose.yml`
-stays pinned to `:1.2.0` on purpose — compose deployments should be
+stays pinned to `:1.3.0` on purpose — compose deployments should be
 reproducible, and `:latest` there would silently change what runs on the next
 `up`.
 

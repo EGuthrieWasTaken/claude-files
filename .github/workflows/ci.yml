@@ -29,10 +29,31 @@ jobs:
 
       - name: Shell syntax check
         run: |
-          for f in tests/*.sh autocommit/*.sh unraid/*.sh; do
+          for f in tests/*.sh autocommit/*.sh unraid/*.sh .github/scripts/*.sh; do
             echo "checking $f"
             bash -n "$f"
           done
+
+  version:
+    name: Version is new and consistent
+    runs-on: ubuntu-latest
+    # Every PR must ship a version that has never been released: app/main.py's
+    # version= must not already be a tag of either image on Docker Hub, nor a
+    # git tag vX.Y.Z, and docker-compose.yml / unraid/deploy.sh must match it.
+    # On a push to main only the consistency half runs -- once a release is
+    # published, main's version is "taken" until the next PR bumps it.
+    # .github/scripts/check-version.sh holds the logic; the release workflow
+    # (.github/workflows/release.yml) runs the same script before it pushes.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PR version has never been published
+        if: github.event_name == 'pull_request'
+        run: bash .github/scripts/check-version.sh unpublished
+
+      - name: Version strings agree
+        if: github.event_name != 'pull_request'
+        run: bash .github/scripts/check-version.sh consistent
 
   containment-suite:
     name: API containment & functional suite (both container modes)

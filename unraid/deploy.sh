@@ -23,12 +23,12 @@ COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.yml}"
 _default_tag() {
   # Whatever docker-compose.yml is currently pinned to -- the same source of
   # truth README.md points at ("docker-compose.yml stays pinned ... on
-  # purpose"). Falls back to 1.2.0 if the file or the pin isn't found, so
+  # purpose"). Falls back to 1.3.0 if the file or the pin isn't found, so
   # this script still runs from outside a checkout.
   grep -oE "${IMAGE//\//\\/}:[0-9][0-9A-Za-z.+-]*" "$COMPOSE_FILE" 2>/dev/null | head -1 | cut -d: -f2
 }
 TAG="${TAG:-$(_default_tag)}"
-TAG="${TAG:-1.2.0}"
+TAG="${TAG:-1.3.0}"
 
 GREEN=$'\033[32m'; RED=$'\033[31m'; YELLOW=$'\033[33m'; RESET=$'\033[0m'
 ok()   { echo "  ${GREEN}OK${RESET}    $*"; }

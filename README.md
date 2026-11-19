@@ -36,103 +36,81 @@ this README is for running the custom one.
 
 ## Quick start
 
-```bash
-cp .env.example .env && openssl rand -hex 32
-```
-
-Put that token in `.env`, point the volume in `docker-compose.yml` at your
-subfolder, then:
-
-```bash
-docker compose up -d
-```
-
-That pulls the published image. To run your own build instead, uncomment
-`build: .` in `docker-compose.yml` and use `docker compose up -d --build`.
-
-Verify:
-
-```bash
-curl -s localhost:8080/health
-```
-
----
-
-## unRAID setup
-
-### 1. Pick the folder to expose
-
-Decide which subfolder of the repo the agent may touch. Everything outside it
-will be invisible.
+You need Docker and a folder you want an agent to be able to read and write.
+Everything outside that folder stays invisible to the container.
 
 ```
-/mnt/user/appdata/repos/myrepo/          <- repo root, stays private
-├── .git/                                <- stays private
-├── src/                                 <- stays private
-└── shared/                              <- THE ONLY THING YOU MOUNT
+/srv/repos/myrepo/          <- repo root, stays private
+├── .git/                   <- stays private
+├── src/                    <- stays private
+└── shared/                 <- THE ONLY THING YOU MOUNT
 ```
 
-If the folder doesn't exist yet:
+1. **Configure.** Copy the example environment and generate a token:
 
-```bash
-mkdir -p /mnt/user/appdata/repos/myrepo/shared && chown 99:100 /mnt/user/appdata/repos/myrepo/shared
-```
+   ```bash
+   cp .env.example .env
+   ```
 
-### 2. Nothing to build
+   ```bash
+   openssl rand -hex 32
+   ```
 
-The image is published multi-arch on GitHub Container Registry (GHCR), so
-unRAID pulls `linux/amd64` on its own:
+   Put the token in `.env` as `API_TOKEN`. Set `PUID`/`PGID` to the owner of
+   the shared folder (`id -u` / `id -g` if it's yours); files the API writes
+   will be owned by that uid:gid.
 
-```bash
-docker pull ghcr.io/eguthriewastaken/claude-files:latest
-```
+2. **Point the volume at your folder.** In `docker-compose.yml`, change the
+   left side of `/srv/repos/myrepo/shared:/data` to your folder's path.
 
-Versions up to 1.2.0 were on Docker Hub as `eguthriewastaken2/claude-files`;
-1.3.0 and later are only on GHCR. An existing container switches over by
-changing its Repository to the GHCR name (the templates in `unraid/` already
-use it).
+   > **This is the single most important setting.** Point it at the
+   > subfolder. If you point it at the repo root, you have handed the agent
+   > the whole repository and none of the rest of this matters.
 
-### 3. Generate a token
+3. **Start it:**
+
+   ```bash
+   docker compose up -d claude-files
+   ```
+
+   That pulls the published image from the GitHub Container Registry. To run
+   your own build instead, uncomment `build: .` in `docker-compose.yml` and
+   add `--build`.
+
+4. **Check it's up:**
+
+   ```bash
+   curl -s localhost:8080/health
+   ```
+
+The container refuses to start if `/data` isn't a mount point, so a typo in
+the path fails loudly instead of silently accepting uploads into a directory
+that disappears with the container.
+
+### Without Compose
+
+The same thing as a single `docker run`. Every flag after the port removes a
+way out of the container (see [Security model](#security-model)):
 
 ```bash
-openssl rand -hex 32
+docker run -d --name claude-files -p 8080:8080 \
+  -v /srv/repos/myrepo/shared:/data \
+  -e API_TOKEN="$(cat /path/to/claude-files.token)" \
+  --user 1000:1000 --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
+  --cap-drop ALL --security-opt no-new-privileges:true \
+  --pids-limit 200 --memory 512m \
+  ghcr.io/eguthriewastaken/claude-files:latest
 ```
 
-### 4. Add the container
+### Exposing it to remote agents
 
-Copy the templates to `/boot/config/plugins/dockerMan/templates-user/` and
-they appear under **Docker → Add Container → Template**:
-
-```bash
-cp unraid/claude-files.xml unraid/claude-files-autocommit.xml /boot/config/plugins/dockerMan/templates-user/
-```
-
-`claude-files-autocommit.xml` is the optional sidecar covered in
-[Auto-committing what agents write](#auto-committing-what-agents-write); skip
-it if you only want the API. To add the API by hand instead:
-
-| Field | Value |
-|---|---|
-| Repository | `ghcr.io/eguthriewastaken/claude-files:latest` |
-| Network Type | `bridge` |
-| Port | `8080` → `8080` |
-| Path | **Container** `/data` → **Host** `/mnt/user/appdata/repos/myrepo/shared` (Read/Write) |
-| Variable | `API_TOKEN` = the token from step 3 |
-| Extra Parameters | `--read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m --cap-drop ALL --security-opt no-new-privileges:true --pids-limit 200 --memory 512m --user 99:100` |
-
-> **The single most important field is the Host Path.** Point it at the
-> subfolder. If you point it at the repo root, you have handed the agent the
-> whole repository and none of the rest of this matters.
-
-`--user 99:100` makes written files owned by `nobody:users`, which is what the
-rest of unRAID expects. The container refuses to start if `/data` isn't a
-mount point, so a typo in the path fails loudly instead of silently accepting
-uploads into a directory that disappears with the container.
-
-### 5. Expose it to Claude's cloud processes
-
-You already run `cloudflared` on this box, so the tidiest route is a hostname
-on the existing tunnel — no inbound port forward:
+The container speaks plain HTTP on port 8080. An agent running anywhere other
+than this machine (a Claude cloud session, the claude.ai connector, a laptop)
+needs to reach it over **HTTPS**: the token is sent in a header on every
+request. Put it behind whatever you already use to terminate TLS, such as a
+reverse proxy (Caddy, Traefik, nginx) or a tunnel (Cloudflare Tunnel,
+Tailscale Funnel). For example, with `cloudflared`:
 
 ```yaml
 # in your cloudflared config
@@ -142,9 +120,53 @@ ingress:
   - service: http_status:404
 ```
 
-Put a Cloudflare Access policy in front of it as a second gate if you can.
-Either way the bearer token is required, so **use TLS** — the token is sent in
-a header on every request.
+Then set `MCP_PUBLIC_HOSTNAME=files.example.com` (or `PUBLIC_BASE_URL`) in
+`.env`, so the [MCP connector](#mcp-connector) and the one-time upload and
+download links use the public name. An identity-aware proxy in front (for
+example a Cloudflare Access policy) is a good second gate, with the bypass
+rules described under [MCP connector](#mcp-connector).
+
+Don't publish port 8080 directly to the internet.
+
+### Running on unRAID
+
+Templates for both containers are in `unraid/`. Copy them to
+`/boot/config/plugins/dockerMan/templates-user/` and they appear under
+**Docker → Add Container → Template**:
+
+```bash
+cp unraid/claude-files.xml unraid/claude-files-autocommit.xml /boot/config/plugins/dockerMan/templates-user/
+```
+
+`claude-files-autocommit.xml` is the optional sidecar covered in
+[Auto-committing what agents write](#auto-committing-what-agents-write); skip
+it if you only want the API. If the shared folder doesn't exist yet, create
+it owned by `nobody:users`, which is what the template runs as
+(`--user 99:100`):
+
+```bash
+mkdir -p /mnt/user/appdata/repos/myrepo/shared && chown 99:100 /mnt/user/appdata/repos/myrepo/shared
+```
+
+To add the API by hand instead of from the template:
+
+| Field | Value |
+|---|---|
+| Repository | `ghcr.io/eguthriewastaken/claude-files:latest` |
+| Network Type | `bridge` |
+| Port | `8080` → `8080` |
+| Path | **Container** `/data` → **Host** `/mnt/user/appdata/repos/myrepo/shared` (Read/Write) |
+| Variable | `API_TOKEN` = a token from `openssl rand -hex 32` |
+| Extra Parameters | `--read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m --cap-drop ALL --security-opt no-new-privileges:true --pids-limit 200 --memory 512m --user 99:100` |
+
+The image is multi-arch, so unRAID pulls `linux/amd64` on its own. If you use
+`docker-compose.yml` on unRAID instead of the templates, set `PUID=99` and
+`PGID=100` in `.env`.
+
+Versions up to 1.2.0 were on Docker Hub as `eguthriewastaken2/claude-files`;
+1.3.0 and later are only on GHCR. An existing container switches over by
+changing its Repository to the GHCR name (the templates in `unraid/` already
+use it).
 
 ---
 
@@ -242,14 +264,14 @@ ticket (any token works, read-only included):
 ```bash
 curl -H "Authorization: Bearer $TOKEN" -X POST "$API/v1/downloads" \
      -H "Content-Type: application/json" \
-     -d '{"path": "stat519/syllabus.pdf"}'
+     -d '{"path": "reports/q3/summary.pdf"}'
 # -> {"download_id": "d_3f9c…",
 #     "download_url": "https://.../v1/downloads/d_3f9c…/<secret>",
 #     "curl_command": "curl -sS --fail-with-body -o <OUTPUT_FILE> '.../v1/downloads/d_3f9c…/<secret>'",
-#     "path": "stat519/syllabus.pdf", "size": ..., "sha256": "...", "expires_at": ...}
+#     "path": "reports/q3/summary.pdf", "size": ..., "sha256": "...", "expires_at": ...}
 
-curl -sS --fail-with-body -o syllabus.pdf "https://.../v1/downloads/d_3f9c…/<secret>"
-sha256sum syllabus.pdf        # must equal the sha256 returned with the ticket
+curl -sS --fail-with-body -o summary.pdf "https://.../v1/downloads/d_3f9c…/<secret>"
+sha256sum summary.pdf         # must equal the sha256 returned with the ticket
 ```
 
 The `GET` needs **no bearer token**; the secret is single-use authorization
@@ -481,11 +503,11 @@ the container** can write outside `.git` and the shared folder:
 
 ```yaml
 volumes:
-  - /mnt/user/appdata/repos/myrepo:/repo:ro                     # whole repo, READ-ONLY
-  - /mnt/user/appdata/repos/myrepo/.git:/repo/.git              # git needs to write here
-  - /mnt/user/appdata/repos/myrepo/shared:/repo/shared          # the scope
-  - /mnt/user/appdata/keys/deploy_ed25519:/keys/id_ed25519:ro
-  - /mnt/user/appdata/keys/known_hosts:/keys/known_hosts:ro
+  - /srv/repos/myrepo:/repo:ro                     # whole repo, READ-ONLY
+  - /srv/repos/myrepo/.git:/repo/.git              # git needs to write here
+  - /srv/repos/myrepo/shared:/repo/shared          # the scope
+  - /srv/keys/deploy_ed25519:/keys/id_ed25519:ro
+  - /srv/keys/known_hosts:/keys/known_hosts:ro
 environment:
   DATA_ROOT: "/repo/shared"
   GIT_REPO_ROOT: "/repo"
@@ -566,8 +588,9 @@ is refused in both modes. It needs the repo root mounted read-write.
 - **The autocommit sidecar:** with `ENABLE_GIT_WRITE` on, stop the sidecar for
   that repository — the two would race on the index lock and the agent's
   picture of what's pushed would go stale. With only `ENABLE_GIT_READ`, they
-  coexist fine. (`get_folder_info`'s instruction text stops claiming writes are
-  "committed and pushed automatically" when the write tools are on.)
+  coexist fine. With the write tools on, the connector tells agents to commit
+  and push themselves even if `AUTOCOMMIT_NOTICE` is also set; that
+  combination logs a warning at startup.
 - Run a **single worker** (the image does): the locks are in-process.
 
 Errors carry a stable `code` — `outside_scope`, `outside_scope_commits`,
@@ -764,27 +787,29 @@ serves and agent output lands in git on its own.
 docker compose up -d autocommit
 ```
 
-On unRAID, add `unraid/claude-files-autocommit.xml` as a second container.
-Two fields matter:
-
-| Field | Value |
-|---|---|
-| Repository Root | the repo root — `/mnt/user/appdata/repos/myrepo`, the folder containing `.git` |
-| Commit Subfolder | `shared` — the same folder `claude-files` exposes |
-
-Point the deploy key and `known_hosts` at host paths and leave the rest at
-their defaults. If you declare an SSH key path but don't mount a key, the
+In `docker-compose.yml`, point its `/repo` volume at the repo root (the folder
+containing `.git`), set `SUBDIR` to the folder `claude-files` exposes
+(`shared` in the example), and mount a deploy key and `known_hosts`. On
+unRAID, add `unraid/claude-files-autocommit.xml` as a second container; its
+**Repository Root** and **Commit Subfolder** fields are the same two
+settings. If you declare an SSH key path but don't mount a key, the
 container refuses to start and says so in the log rather than running without
 push access.
 
-It isn't tied to `claude-files`, either. Set Commit Subfolder to `.` and it
+**Then set `AUTOCOMMIT_NOTICE=true` on `claude-files`** (in `.env`, or the
+unRAID template's **Autocommit Notice** field) and recreate that container.
+That is what makes the MCP connector tell agents their writes are committed
+and pushed automatically. `claude-files` can't see whether a sidecar is
+running, so without the setting its instructions make no claim about git.
+
+It isn't tied to `claude-files`, either. Set `SUBDIR` to `.` and it
 commits the whole repository instead — a general-purpose autocommit for any
 git working tree on the server (see [whole-repository mode](#whole-repository-mode)).
 
-**It polls rather than watching with inotify, deliberately.** unRAID's
-`/mnt/user` is a FUSE layer, and inotify through it silently drops events —
-and a missed event is a file that never gets committed, with nothing to tell
-you. A poll cannot miss anything, and it batches a burst of forty uploads
+**It polls rather than watching with inotify, deliberately.** On FUSE and
+network filesystems (unRAID's `/mnt/user`, NFS, SMB), inotify silently drops
+events — and a missed event is a file that never gets committed, with nothing
+to tell you. A poll cannot miss anything, and it batches a burst of forty uploads
 into one commit instead of forty.
 
 ### What keeps it in scope
@@ -865,7 +890,51 @@ open.
 
 ---
 
-## Publishing a new version
+## Releases
+
+Images are published to the GitHub Container Registry, for `linux/amd64` and
+`linux/arm64`:
+
+| Image | |
+|---|---|
+| `ghcr.io/eguthriewastaken/claude-files` | The API and MCP connector. |
+| `ghcr.io/eguthriewastaken/claude-files-autocommit` | The optional [autocommit sidecar](#auto-committing-what-agents-write). |
+
+Each release `vX.Y.Z` is pushed as `:X.Y.Z` and `:latest`; a release marked
+pre-release gets only its own tag and never moves `:latest`.
+`docker-compose.yml` pins an exact version on purpose: compose deployments
+should be reproducible, and `:latest` there would silently change what runs on
+the next `up`. The unRAID templates track `:latest`. Versions up to 1.2.0 were
+published on Docker Hub; 1.3.0 and later are published only here.
+
+> **`/mcp` is on by default.** Pulling the image serves the
+> [MCP connector](#mcp-connector), gated by the same `API_TOKEN` as every
+> other route. Set `ENABLE_MCP=false` to turn it off, or build with
+> `--build-arg WITH_MCP=0` for an image without the `mcp` package at all.
+
+### Upgrading
+
+After pulling a new version, **verify from a client, not the host**: `GET
+/health` reports the version you expect, and `GET /v1/info` reports the
+features you expect (`bridge_available`, `mcp_enabled`). If a claude.ai
+connector still shows the old tool list, its tool cache needs refreshing:
+remove and re-add the connector. `unraid/deploy.sh` scripts this for both
+compose- and template-managed containers (`deploy` pulls and recreates,
+`verify` runs the client-side checks); `unraid/deploy.sh --help` lists the
+steps.
+
+> **1.4.0's release notes should say:** the MCP connector no longer tells
+> every agent its writes are "committed and pushed automatically". It says so
+> only with the new `AUTOCOMMIT_NOTICE=true`, and by default makes no claim
+> about git. If you run the [autocommit sidecar](#auto-committing-what-agents-write),
+> set `AUTOCOMMIT_NOTICE=true` on `claude-files` (`docker-compose.yml` reads it
+> from `.env`; an unRAID container made from the older template doesn't gain
+> the new field when its image updates, so add the variable by hand), then
+> remove and re-add the claude.ai connector so it reloads the instructions and
+> tool descriptions. With `ENABLE_GIT_WRITE=true`, nothing changes. After
+> redeploying, **verify from a client, not the host**: `GET /health` reports
+> `"version":"1.4.0"`, and `initialize` on `/mcp` returns the paragraph for
+> your setting.
 
 > **1.3.0's release notes should say:** images now live on GHCR
 > (`ghcr.io/eguthriewastaken/claude-files`, `.../claude-files-autocommit`);
@@ -883,7 +952,7 @@ open.
 > already on Docker Hub, pushed 2026-09-23 from a build that still said 1.1.0,
 > so this release skips to 1.3.0.)
 
-### Releases are automatic
+### Cutting a release
 
 1. **Every PR bumps the version.** `version=` in `app/main.py` is the one
    source of truth; the `docker-compose.yml` pins (both images) and
@@ -898,7 +967,8 @@ open.
    image already has that tag on GHCR, builds both for `linux/amd64` and
    `linux/arm64`, pushes `:X.Y.Z` and `:latest` (not `:latest` for a release
    marked pre-release), and confirms both architectures landed.
-3. **Redeploy** with `unraid/deploy.sh` (below), or unRAID's "Force Update".
+3. **Redeploy** with `unraid/deploy.sh` (see [Upgrading](#upgrading)), or
+   unRAID's "Force Update".
 
 The workflow pushes with the repository's own `GITHUB_TOKEN`, so it needs no
 secrets. To make the version check block merges, mark *Version is new and
@@ -921,38 +991,26 @@ Log in first with `docker login ghcr.io` (a personal access token with
 `write:packages`), and push the matching git tag `vX.Y.Z` afterwards, so the
 version check knows the number is taken.
 
-`unraid/deploy.sh` scripts the redeploy-and-verify half of this section —
-`build` (the buildx command below), `pull` + recreate (via `docker compose`
-if that's how the container is managed, otherwise it tells you to hit
-unRAID's own "Force Update" instead of guessing at a template it can't see),
-and `verify` (the client-side checks above). Run it with no argument for
-`deploy` then `verify`, or `unraid/deploy.sh --help` for the full list.
+To publish under your own name instead, replace `ghcr.io/eguthriewastaken`
+with your own registry and namespace.
 
-> **Pulling this image starts serving the [MCP connector](#mcp-connector)**
-> at `/mcp` by default (unRAID templates track `:latest`, so this happens
-> without anyone asking for it). It's defensible — `/mcp` is gated by the
-> same `API_TOKEN` as every other route — but say it plainly rather than let
-> it be discovered. Set `ENABLE_MCP=false` to opt out, or build with
-> `--build-arg WITH_MCP=0` for an image that doesn't have the `mcp` package
-> at all.
-
-The image is multi-arch (`linux/amd64` for unRAID, `linux/arm64` for local
-work on Apple silicon). Build both in one shot and push a single manifest:
+The image is multi-arch (`linux/amd64` and `linux/arm64`). Build both in one
+shot and push a single manifest:
 
 ```bash
-docker buildx build --platform linux/amd64,linux/arm64 --tag ghcr.io/eguthriewastaken/claude-files:1.3.0 --tag ghcr.io/eguthriewastaken/claude-files:latest --push .
+docker buildx build --platform linux/amd64,linux/arm64 --tag ghcr.io/eguthriewastaken/claude-files:1.4.0 --tag ghcr.io/eguthriewastaken/claude-files:latest --push .
 ```
 
 Confirm both architectures landed under one tag:
 
 ```bash
-docker buildx imagetools inspect ghcr.io/eguthriewastaken/claude-files:1.3.0
+docker buildx imagetools inspect ghcr.io/eguthriewastaken/claude-files:1.4.0
 ```
 
 The sidecar is a separate image, built the same way:
 
 ```bash
-docker buildx build --platform linux/amd64,linux/arm64 --tag ghcr.io/eguthriewastaken/claude-files-autocommit:1.3.0 --tag ghcr.io/eguthriewastaken/claude-files-autocommit:latest --push ./autocommit
+docker buildx build --platform linux/amd64,linux/arm64 --tag ghcr.io/eguthriewastaken/claude-files-autocommit:1.4.0 --tag ghcr.io/eguthriewastaken/claude-files-autocommit:latest --push ./autocommit
 ```
 
 Building on separate machines and pushing to the same tag does **not** produce
@@ -960,15 +1018,10 @@ a multi-arch image -- the second push replaces the first. If you build
 natively on each host, push arch-suffixed tags and merge them:
 
 ```bash
-docker buildx imagetools create --tag ghcr.io/eguthriewastaken/claude-files:1.3.0 ghcr.io/eguthriewastaken/claude-files:1.3.0-arm64 ghcr.io/eguthriewastaken/claude-files:1.3.0-amd64
+docker buildx imagetools create --tag ghcr.io/eguthriewastaken/claude-files:1.4.0 ghcr.io/eguthriewastaken/claude-files:1.4.0-arm64 ghcr.io/eguthriewastaken/claude-files:1.4.0-amd64
 ```
 
-On Arch Linux, `docker buildx` is a separate package: `sudo pacman -S docker-buildx`.
-
-The unRAID templates pull `:latest`, so always push both tags. `docker-compose.yml`
-stays pinned to `:1.3.0` on purpose — compose deployments should be
-reproducible, and `:latest` there would silently change what runs on the next
-`up`.
+The unRAID templates pull `:latest`, so always push both tags.
 
 ---
 
@@ -1002,6 +1055,7 @@ reproducible, and `:latest` there would silently change what runs on the next
 | `MCP_MAX_CONCURRENT_UPLOADS` | `8` | Cap on open chunked-upload sessions at once. |
 | `MCP_UPLOAD_CHUNK_ADVISORY_BYTES` | `3072` | Suggested chunk size, reported by `begin_write`/`get_folder_info`. Advisory, not enforced. |
 | `EXTRA_TOOL_MODULES` | — | Comma-separated Python modules whose `register(api)` adds tools to `/mcp` at startup ([extension modules](#extension-modules)). Meant to be set by a derived image, not by hand. A module that fails to load stops the server from starting. |
+| `AUTOCOMMIT_NOTICE` | `false` | `true` tells MCP agents (in the server instructions and the `write_file`/`delete_file` descriptions) that their writes are committed and pushed automatically. Set it only when the [autocommit sidecar](#auto-committing-what-agents-write), or something else, commits this folder. `false` makes no claim about git. Changes only what agents are told, never what is committed. Ignored when `ENABLE_GIT_WRITE` is on: agents are then told to commit and push themselves. |
 | `ENABLE_GIT_READ` | `false` | Register `git_status`, `git_log`, `git_diff` ([git tools](#git-tools)). Works with the read-only token. |
 | `ENABLE_GIT_WRITE` | `false` | Register `git_commit`, `git_pull`, `git_push`, `git_merge`, `git_fetch`. Needs the read-write token. Nothing is committed or pushed automatically. |
 | `GIT_REPO_ROOT` | `DATA_ROOT` | Where the repository root is mounted. `DATA_ROOT` must be it or a folder under it; the difference is the agent's scope. |
@@ -1021,3 +1075,11 @@ The [local bridge](#uploading-binary-files-the-local-bridge)'s own settings
 (`CLAUDE_FILES_URL`, `CLAUDE_FILES_TOKEN`, etc.) are deliberately not in this
 table — they're *client-side* environment, read by `bridge/claude_files_bridge.py`
 wherever an agent runs it, never by this server. See `bridge/README.md`.
+
+---
+
+## License
+
+claude-files is free software, released under the
+[GNU General Public License v3.0](LICENSE). To report a security issue, see
+[SECURITY.md](SECURITY.md).

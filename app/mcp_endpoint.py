@@ -1,9 +1,9 @@
 """Streamable HTTP MCP endpoint mounted at /mcp.
 
 Design brief: docs/plan-mcp-connector.md -- read that before touching this
-file. It mirrors meeting-transcriber/app/mcp_endpoint.py closely enough that
-a reader of one recognises the other; four gotchas were found there and
-reproduce here unchanged:
+file. It mirrors an earlier connector built on the same SDK closely enough
+that a reader of one would recognise the other; four gotchas were found there
+and reproduce here unchanged:
 
 1. **Mounting is not enough.** `mcp.streamable_http_app()` returns a
    Starlette app whose own `lifespan=` starts its session manager --
@@ -48,7 +48,7 @@ reproduce here unchanged:
    -- `/mcp` is gated by the token check either way.
 
 Auth: reuse `_check_token()` (`app/main.py`) via middleware wrapping the
-mounted sub-app, exactly as meeting-transcriber's `_RequireAuth` does --
+mounted sub-app, exactly as the earlier connector's `_RequireAuth` does --
 FastAPI's `Depends` machinery (`ReadAuth`/`WriteAuth`) does not apply to a
 raw mounted Starlette app.
 
@@ -56,12 +56,12 @@ raw mounted Starlette app.
 module calls back into main's `CONFIG`/`VAULT`/`_check_token`/`_rate_limit`),
 so every reference to `app.main` here is `from . import main as appmain`
 *inside* a function body, looked up at call time rather than at import time.
-The one exception is `_transport_security()`, called once at module load to
-build the `mcp` object below -- it does the same deferred lookup, but its
-call happens synchronously during `app/main.py`'s own bottom-of-file
-`from . import mcp_endpoint` statement, at which point `app.main.CONFIG` is
-already set (it's assigned near the top of that file, long before the
-import that pulls this module in).
+The exceptions are `_transport_security()` and `_git_mode()`, called once at
+module load to build the `mcp` object and the tool descriptions below -- they
+do the same deferred lookup, but their calls happen synchronously during
+`app/main.py`'s own bottom-of-file `from . import mcp_endpoint` statement, at
+which point `app.main.CONFIG` is already set (it's assigned near the top of
+that file, long before the import that pulls this module in).
 """
 
 # Deliberately NOT `from __future__ import annotations`, unlike every other
@@ -111,12 +111,7 @@ _INSTRUCTIONS = """\
 A file API scoped to one shared folder on a remote machine, exposed here as
 MCP tools instead of raw REST calls.
 
-This folder is a git repository. Anything written through these tools is
-committed and pushed automatically, usually within a couple of minutes --
-writes are effectively permanent and enter public git history. Never write
-credentials, tokens, keys, or personal data. There is no append or partial
-edit, only whole-file replace: assemble a file completely, then write it
-once, rather than using the folder as scratch space.
+{persistence}
 
 To upload a file that already exists on your machine, use request_upload
 and run the curl command it returns -- never paste a file's contents into
@@ -132,6 +127,75 @@ under. A file too large or too binary for a tool result is refused with an
 explanation naming the equivalent REST endpoint, never silently truncated
 or mangled.
 """
+
+# What an agent is told becomes of a write once it lands. Exactly one applies,
+# picked once at startup by _git_mode(). AGENT.md's "If this folder is a git
+# repository" section says the same things to REST agents; keep them in step.
+#
+#   autocommit  AUTOCOMMIT_NOTICE=true: the operator runs the autocommit
+#               sidecar (autocommit/), which commits and pushes for the agent.
+#   git_tools   ENABLE_GIT_WRITE=true: the agent commits and pushes itself.
+#               Wins over AUTOCOMMIT_NOTICE, whose claim would then be false.
+#   none        The default. No claim about git at all: the server can't see
+#               whether anything commits its folder, so it says nothing.
+_PERSISTENCE = {
+    "autocommit": (
+        "This folder is a git repository. Anything written through these tools is\n"
+        "committed and pushed automatically, usually within a couple of minutes --\n"
+        "writes are effectively permanent and enter public git history.\n"
+    ),
+    "git_tools": (
+        "This folder is inside a git repository, and nothing is committed or pushed\n"
+        "automatically: when you want your changes in git, call git_status, then\n"
+        "git_commit and git_push yourself. Once pushed, writes are effectively\n"
+        "permanent and enter public git history.\n"
+    ),
+    "none": (
+        "Files written here persist on the host, where anyone else with access to\n"
+        "this folder -- people or other agents -- can read them.\n"
+    ),
+}
+
+# Follows the paragraph above in every mode.
+_HANDLING = (
+    "Never write credentials, tokens, keys, or personal data. There is no append\n"
+    "or partial edit, only whole-file replace: assemble a file completely, then\n"
+    "write it once, rather than using the folder as scratch space."
+)
+
+# The last sentence of each tool description that depends on the mode, filled
+# in by _git_note(). A tool description is read at the moment of use and the
+# instructions may not be (docs/plan-mcp-connector.md, "Self-documenting the
+# connector"), so each repeats the part of _PERSISTENCE that matters for it.
+_TOOL_GIT_NOTES = {
+    "write_file": {
+        "autocommit": (
+            "Remember: this folder is a git repository and writes are committed "
+            "and pushed automatically -- never write credentials or secrets."
+        ),
+        "git_tools": (
+            "Nothing is committed until you call git_commit, but once pushed a "
+            "write is permanent git history -- never write credentials or secrets."
+        ),
+        "none": (
+            "Others with access to this folder can read what you write -- never "
+            "write credentials or secrets."
+        ),
+    },
+    "delete_file": {
+        "autocommit": (
+            "Deleting does NOT remove the file from git history: the shared "
+            "folder is auto-committed and pushed, so a prior version remains "
+            "reachable in `git log` even after this call."
+        ),
+        "git_tools": (
+            "Deleting does NOT remove the file from git history: a version "
+            "already committed stays reachable in `git log`, and the deletion "
+            "itself reaches git only when you git_commit it."
+        ),
+        "none": "",
+    },
+}
 
 
 def _transport_security() -> TransportSecuritySettings:
@@ -154,27 +218,39 @@ def _transport_security() -> TransportSecuritySettings:
     return TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
 
-def _build_instructions() -> str:
-    """The server instructions, with one sentence swapped when the git write
-    tools are on: "committed and pushed automatically" describes the autocommit
-    sidecar, and is simply untrue when the agent is the one who commits."""
+def _git_mode() -> str:
+    """Which _PERSISTENCE paragraph this deployment gets ("autocommit",
+    "git_tools" or "none"). Read once, at import, like _transport_security():
+    the instructions and tool descriptions are fixed when the tools register."""
     from . import main as appmain
 
-    if not appmain.CONFIG.enable_git_write:
-        return _INSTRUCTIONS
-    old = (
-        "This folder is a git repository. Anything written through these tools is\n"
-        "committed and pushed automatically, usually within a couple of minutes --\n"
-        "writes are effectively permanent and enter public git history. Never write"
-    )
-    new = (
-        "This folder is inside a git repository, and nothing is committed or pushed\n"
-        "automatically: when you want your changes in git, call git_status, then\n"
-        "git_commit and git_push yourself. Once pushed, writes are effectively\n"
-        "permanent and enter public git history. Never write"
-    )
-    assert old in _INSTRUCTIONS
-    return _INSTRUCTIONS.replace(old, new)
+    cfg = appmain.CONFIG
+    if cfg.enable_git_write:
+        if cfg.autocommit_notice:
+            log.warning(
+                "AUTOCOMMIT_NOTICE is ignored because ENABLE_GIT_WRITE is on: agents are "
+                "told to commit and push with the git tools themselves. Don't also run the "
+                "autocommit sidecar on this repository; the two race on git's index lock "
+                "(README.md, \"Working alongside everything else\")."
+            )
+        return "git_tools"
+    return "autocommit" if cfg.autocommit_notice else "none"
+
+
+_GIT_MODE = _git_mode()
+
+
+def _build_instructions() -> str:
+    return _INSTRUCTIONS.replace("{persistence}", _PERSISTENCE[_GIT_MODE] + _HANDLING)
+
+
+def _git_note(fn):  # type: ignore[no-untyped-def]
+    """Replace the `{git_note}` marker in a tool's docstring with that tool's
+    sentence for _GIT_MODE. Apply it UNDER @mcp.tool(): decorators run bottom
+    up, so the SDK reads the docstring as its description after this edit."""
+    assert fn.__doc__ and "{git_note}" in fn.__doc__, fn.__name__
+    fn.__doc__ = fn.__doc__.replace("{git_note}", _TOOL_GIT_NOTES[fn.__name__][_GIT_MODE]).rstrip()
+    return fn
 
 
 def _load_extensions() -> list[_ext.LoadedExtension]:
@@ -805,6 +881,7 @@ def read_file(
 
 
 @mcp.tool()
+@_git_note
 def write_file(
     path: str,
     content: str,
@@ -834,9 +911,7 @@ def write_file(
     base64 write over 1 KB decoded -- read_file's result on a source file
     already carries both, so a copy can forward them without computing
     anything. Writes are atomic -- a reader never sees a half-written file.
-    Requires a read-write token. Remember: this folder is a git repository
-    and writes are committed and pushed automatically -- never write
-    credentials or secrets."""
+    Requires a read-write token. {git_note}"""
     from . import main as appmain
 
     _require_write(ctx)
@@ -1212,13 +1287,11 @@ def abort_write(upload_id: str, ctx: Context) -> dict[str, Any]:
 
 
 @mcp.tool()
+@_git_note
 def delete_file(path: str, ctx: Context, recursive: bool = False) -> dict[str, Any]:
     """Delete a file, or a directory (with recursive=true for a non-empty
     one). Honours ALLOW_DELETE -- refused entirely if the server disables
-    deletion. Deleting does NOT remove the file from git history: the
-    shared folder is auto-committed and pushed, so a prior version remains
-    reachable in `git log` even after this call. Requires a read-write
-    token."""
+    deletion. Requires a read-write token. {git_note}"""
     from . import main as appmain
 
     _require_write(ctx)

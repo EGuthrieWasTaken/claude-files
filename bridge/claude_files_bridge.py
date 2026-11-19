@@ -68,7 +68,7 @@ if not log.handlers:
     log.setLevel(logging.INFO)
     log.propagate = False
 
-USER_AGENT = "claude-files-bridge/1.1.0"
+USER_AGENT = "claude-files-bridge/1.4.0"
 
 _UPLOAD_HASH_BLOCK = 1024 * 1024        # 1 MiB -- hashing block size
 _DOWNLOAD_BLOCK = 256 * 1024            # 256 KiB -- download streaming block size
@@ -616,9 +616,10 @@ def _serve() -> int:
         any text file over a few KB, instead of the connector's
         `write_file`, which requires you to type the content out.
         `remote_path` is relative to the shared folder root. Returns the
-        size and a sha256 verified by the server. Remember: that folder is
-        a git repository and writes are committed and pushed automatically
-        -- never upload credentials or secrets."""
+        size and a sha256 verified by the server. Never upload credentials
+        or secrets: others with access to that folder can read it, and if
+        it is committed to git (the connector's instructions say whether),
+        a file outlives its deletion."""
         return upload(local_path, remote_path, overwrite=overwrite, parents=parents)
 
     @mcp_server.tool()

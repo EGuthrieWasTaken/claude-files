@@ -7,8 +7,8 @@
   <MyIP/>
   <Shell>sh</Shell>
   <Privileged>false</Privileged>
-  <Support/>
-  <Project/>
+  <Support>https://github.com/EGuthrieWasTaken/claude-files/issues</Support>
+  <Project>https://github.com/EGuthrieWasTaken/claude-files</Project>
   <Overview>
     REST file API confined to a single shared folder. Give Claude (or any
     agent) upload/download/replace/delete access to one subfolder of a git
@@ -79,7 +79,7 @@
           Type="Variable" Display="always" Required="false" Mask="false">true</Config>
 
   <Config Name="MCP Public Hostname" Target="MCP_PUBLIC_HOSTNAME" Default="" Mode=""
-          Description="This container's public hostname as reached through your reverse proxy / tunnel, e.g. claude-files.example.dev. Allow-lists that Host header for the MCP SDK's DNS-rebinding guard. Left blank, that guard is disabled instead of 421ing every real request -- /mcp is still gated by the API Token either way."
+          Description="This container's public hostname as reached through your reverse proxy / tunnel, e.g. files.example.com. Allow-lists that Host header for the MCP SDK's DNS-rebinding guard. Left blank, that guard is disabled instead of 421ing every real request -- /mcp is still gated by the API Token either way."
           Type="Variable" Display="always" Required="false" Mask="false"></Config>
 
   <Config Name="MCP Inline Limit (chars)" Target="MCP_INLINE_LIMIT_CHARS" Default="100000" Mode=""
@@ -101,6 +101,10 @@
   <Config Name="MCP Upload Chunk Advisory (bytes)" Target="MCP_UPLOAD_CHUNK_ADVISORY_BYTES" Default="3072" Mode=""
           Description="Suggested chunk size for write_chunk, reported by begin_write and get_folder_info. Advisory only -- not enforced."
           Type="Variable" Display="advanced" Required="false" Mask="false">3072</Config>
+
+  <Config Name="Autocommit Notice" Target="AUTOCOMMIT_NOTICE" Default="false" Mode=""
+          Description="Set true ONLY if the claude-files-autocommit container (or anything else) commits and pushes this folder: the MCP connector then tells agents their writes are committed and pushed automatically. Left false, it makes no claim about git. Changes only what agents are told, never what is committed. Ignored when Enable Git Write Tools is true."
+          Type="Variable" Display="always" Required="false" Mask="false">false</Config>
 
   <!-- Git tools (docs/plan-mcp-git-ops.md). Off by default. To use them, add
        the three Path entries described in the README ("Git tools": repo root

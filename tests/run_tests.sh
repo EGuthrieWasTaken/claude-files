@@ -51,7 +51,7 @@ MCP_UPLOAD_CHUNK_ADVISORY_BYTES=3072
 FAIL=0
 
 cleanup() {
-  docker rm -f cf-test-a cf-test-b cf-test-nomcp cf-test-offswitch cf-test-git >/dev/null 2>&1 || true
+  docker rm -f cf-test-a cf-test-b cf-test-nomcp cf-test-offswitch cf-test-notice cf-test-git >/dev/null 2>&1 || true
   [[ "${KEEP_FIXTURE:-0}" == "1" ]] || rm -rf "$FIXTURE_BASE"
 }
 trap cleanup EXIT
@@ -310,6 +310,43 @@ else
 fi
 docker rm -f cf-test-offswitch >/dev/null 2>&1 || true
 
+# The connector's instructions (initialize) as the real image serves them.
+mcp_instructions() {  # mcp_instructions <port>
+  curl -s -X POST "http://127.0.0.1:$1/mcp" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"run_tests","version":"1"}}}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['result']['instructions'])"
+}
+
+echo
+echo "==> AUTOCOMMIT_NOTICE: what the connector tells agents about git follows the setting"
+for notice in unset true; do
+  new_fixture
+  notice_env=()
+  [[ "$notice" == unset ]] || notice_env=(-e "AUTOCOMMIT_NOTICE=$notice")
+  docker rm -f cf-test-notice >/dev/null 2>&1 || true
+  docker run "${common_flags[@]}" --name cf-test-notice -p "127.0.0.1:18085:8080" \
+    ${notice_env[@]+"${notice_env[@]}"} -v "$FIXTURE/repo/shared:/data" "$IMAGE" >/dev/null
+  if wait_healthy cf-test-notice 18085; then
+    text=$(mcp_instructions 18085 || true)
+    if [[ "$notice" == unset ]]; then
+      if grep -q "Never write credentials" <<<"$text" && ! grep -qi "git" <<<"$text"; then
+        echo "  PASS  unset: no claim about git, credential warning kept"
+      else
+        echo "  FAIL  unset: unexpected instructions: $text" | head -8; FAIL=1
+      fi
+    elif grep -q "committed and pushed automatically" <<<"$text"; then
+      echo "  PASS  AUTOCOMMIT_NOTICE=true: agents are told writes are committed and pushed"
+    else
+      echo "  FAIL  AUTOCOMMIT_NOTICE=true: unexpected instructions: $text" | head -8; FAIL=1
+    fi
+  else
+    echo "  FAIL  the AUTOCOMMIT_NOTICE=$notice container never became healthy (log above)"; FAIL=1
+  fi
+  docker rm -f cf-test-notice >/dev/null 2>&1 || true
+done
+
 # --------------------------------------------------------------------------
 # Git tools (docs/plan-mcp-git-ops.md) in a REAL container, in the layout the
 # "kernel boundary" claim rests on: the repository root mounted read-only, with
@@ -357,6 +394,11 @@ if wait_healthy cf-test-git 18084; then
     echo "  PASS  /v1/info reports scope shared/ and a kernel write boundary"
   else
     echo "  FAIL  unexpected git info: $info"; FAIL=1
+  fi
+  if grep -q "git_commit and git_push yourself" <<<"$(mcp_instructions 18084 || true)"; then
+    echo "  PASS  with the write tools on, agents are told to commit and push themselves"
+  else
+    echo "  FAIL  the git-mode instructions don't tell agents to commit themselves"; FAIL=1
   fi
 
   # The kernel, not the application, refuses a write outside the folder.

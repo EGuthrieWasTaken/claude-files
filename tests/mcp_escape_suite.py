@@ -1290,7 +1290,7 @@ def read_mode_tests() -> None:
         else R.bad("read", "offset+base64", f"{r!r}"[:200])
 
     # -- PDF text extraction -------------------------------------------
-    pdf = _make_pdf([f"Homework solution number {i} alpha{i}" for i in range(1, 8)])
+    pdf = _make_pdf([f"Report section number {i} alpha{i}" for i in range(1, 8)])
     (shared / "mcp-doc.pdf").write_bytes(pdf)
     pdf_sha = hashlib.sha256(pdf).hexdigest()
 

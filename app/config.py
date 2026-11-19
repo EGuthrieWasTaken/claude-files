@@ -69,6 +69,11 @@ class Config:
     download_ticket_ttl_seconds: int = 900
     download_tickets_max: int = 100
     public_base_url: str = ""
+    # Tell MCP agents that writes are committed and pushed automatically. Set
+    # it only when the operator also runs the autocommit sidecar (autocommit/):
+    # it changes what agents are told, never what is committed. Ignored when
+    # enable_git_write is on, because then the agent commits by itself.
+    autocommit_notice: bool = False
     # -- git tools (docs/plan-mcp-git-ops.md) --------------------------------
     # Two independent switches. A disabled class is not registered at all.
     enable_git_read: bool = False
@@ -134,6 +139,7 @@ class Config:
             download_ticket_ttl_seconds=_env_int("DOWNLOAD_TICKET_TTL_SECONDS", 900),
             download_tickets_max=_env_int("DOWNLOAD_TICKETS_MAX", 100),
             public_base_url=os.environ.get("PUBLIC_BASE_URL", "").strip(),
+            autocommit_notice=_env_bool("AUTOCOMMIT_NOTICE", False),
             enable_git_read=_env_bool("ENABLE_GIT_READ", False),
             enable_git_write=_env_bool("ENABLE_GIT_WRITE", False),
             git_repo_root=os.environ.get("GIT_REPO_ROOT", "").strip(),

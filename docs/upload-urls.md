@@ -114,7 +114,7 @@ Response `201`:
 ```json
 {
   "upload_id": "u_3f9c…",
-  "upload_url": "https://claude-files.guthrieec.dev/v1/uploads/u_3f9c…/<secret>",
+  "upload_url": "https://files.example.com/v1/uploads/u_3f9c…/<secret>",
   "method": "PUT",
   "expires_at": 1790000000.0,
   "max_bytes": 52428800,
@@ -289,8 +289,8 @@ below needs a test:
 
 ## Open question for whoever implements this
 
-Check that the environments agents actually run in can reach
-`claude-files.guthrieec.dev`:
+Check that the environments agents actually run in can reach the
+deployment's public hostname:
 
 - Claude Code sessions (local and cloud) can.
 - The claude.ai code-execution sandbox has an egress allowlist, and the

@@ -31,7 +31,7 @@ An agent using the live connector was asked to re-upload an already-archived
 > file as one inline base64 string, and I hit a hard ceiling on how much text I
 > can generate in a single tool call — every attempt truncated at the same
 > ~6.5KB mark, **silently producing a corrupt, invalid PDF** at
-> `daily-briefs/2026/2026-09-22-daily-brief.pdf`. I caught this, and rather
+> `reports/2026/2026-09-22-report.pdf`. I caught this, and rather
 > than leave a broken file sitting there, I deleted it.
 
 The agent did everything right: called `get_folder_info` first as instructed,

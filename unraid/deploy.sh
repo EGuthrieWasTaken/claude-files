@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Redeploy claude-files after a new image version ships (e.g. the 1.1.0 bump
-# in docs/feature-request-path-based-upload.md, "Part 0").
+# Redeploy claude-files after a new image version ships, and check from a
+# client's point of view that the new version is what's actually serving.
 #
 # Works whether this container is managed by `docker compose` (this repo's
 # docker-compose.yml) or was created through unRAID's own Docker Manager UI
@@ -23,12 +23,12 @@ COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.yml}"
 _default_tag() {
   # Whatever docker-compose.yml is currently pinned to -- the same source of
   # truth README.md points at ("docker-compose.yml stays pinned ... on
-  # purpose"). Falls back to 1.3.0 if the file or the pin isn't found, so
+  # purpose"). Falls back to 1.4.0 if the file or the pin isn't found, so
   # this script still runs from outside a checkout.
   grep -oE "${IMAGE//\//\\/}:[0-9][0-9A-Za-z.+-]*" "$COMPOSE_FILE" 2>/dev/null | head -1 | cut -d: -f2
 }
 TAG="${TAG:-$(_default_tag)}"
-TAG="${TAG:-1.3.0}"
+TAG="${TAG:-1.4.0}"
 
 GREEN=$'\033[32m'; RED=$'\033[31m'; YELLOW=$'\033[33m'; RESET=$'\033[0m'
 ok()   { echo "  ${GREEN}OK${RESET}    $*"; }
@@ -39,9 +39,11 @@ usage() {
   cat <<USAGE
 Usage: $(basename "$0") [build|pull|deploy|verify|all]
 
-  build    docker buildx build + push a new multi-arch image (needs Docker
-           Hub login and buildx -- matches README.md "Publishing a new
-           version"). Skip this if the image is already pushed.
+  build    docker buildx build + push a multi-arch image to
+           ${IMAGE} (needs buildx and a login to that registry).
+           Official images are built by CI when a GitHub release vX.Y.Z
+           is published (README.md, "Cutting a release"); this is for
+           publishing by hand, or your own build under your own IMAGE.
   pull     docker pull ${IMAGE}:${TAG}
   deploy   pull, then recreate the container (via docker compose, if that's
            how it's managed -- otherwise prints the unRAID "Force Update"
@@ -82,7 +84,7 @@ cmd_deploy() {
   cmd_pull
   if ! docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
     note "No running container named '$CONTAINER_NAME' found."
-    note "Start it the way README.md 'Quick start' or 'unRAID setup' describes,"
+    note "Start it the way README.md 'Quick start' or 'Running on unRAID' describes,"
     note "then re-run: $(basename "$0") verify"
     return 0
   fi

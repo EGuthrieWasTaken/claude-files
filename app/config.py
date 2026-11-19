@@ -30,6 +30,14 @@ def _env_set(name: str, default: set[str]) -> frozenset[str]:
     return frozenset(n.strip().lower() for n in raw.split(",") if n.strip())
 
 
+def _env_modules(name: str) -> tuple[str, ...]:
+    # Validated here, at config time, so a typo fails the same way whether or
+    # not the image has the MCP SDK installed.
+    from .extensions import parse_module_list
+
+    return parse_module_list(os.environ.get(name, ""))
+
+
 @dataclass(frozen=True)
 class Config:
     root: str = "/data"
@@ -80,6 +88,9 @@ class Config:
     ssh_key_path: str = ""
     ssh_known_hosts_path: str = ""
     git_token: str = ""
+    # -- extension modules (docs/extensions.md) ------------------------------
+    # Dotted module names whose register(api) adds MCP tools at startup.
+    extra_tool_modules: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -140,4 +151,5 @@ class Config:
             ssh_key_path=os.environ.get("SSH_KEY_PATH", "").strip(),
             ssh_known_hosts_path=os.environ.get("SSH_KNOWN_HOSTS_PATH", "").strip(),
             git_token=os.environ.get("GIT_TOKEN", "").strip(),
+            extra_tool_modules=_env_modules("EXTRA_TOOL_MODULES"),
         )

@@ -574,6 +574,21 @@ with the paths involved and the next step in the message. The image needs
 leaves them out, and then enabling a git switch is a startup error that says
 so). Tests: [Verifying it yourself](#verifying-it-yourself).
 
+### Extension modules
+
+A separate project can add its own tools to `/mcp` without forking this repo.
+It builds a derived image `FROM` a pinned claude-files tag, copies a Python
+package in, and sets `EXTRA_TOOL_MODULES` to that package. Its `register(api)`
+adds tools that sit beside the core ones, behind the same token check,
+reading and writing through the same path-contained `Vault` and worktree
+gate. A tool registered with `read_only=False` is refused for a read-only
+token before the extension's code runs. `get_folder_info` reports what
+loaded. A broken extension stops the server from starting rather than
+quietly leaving its tools out.
+
+The contract, its gotchas, and a minimal example are in
+[`docs/extensions.md`](docs/extensions.md).
+
 ### Adding it as a connector
 
 1. Set `ENABLE_MCP=true` (the default) and, if this service sits behind a
@@ -940,6 +955,7 @@ reproducible, and `:latest` there would silently change what runs on the next
 | `MCP_UPLOAD_SESSION_TTL_SECONDS` | `900` | Idle timeout for a `begin_write` session, reaped lazily. |
 | `MCP_MAX_CONCURRENT_UPLOADS` | `8` | Cap on open chunked-upload sessions at once. |
 | `MCP_UPLOAD_CHUNK_ADVISORY_BYTES` | `3072` | Suggested chunk size, reported by `begin_write`/`get_folder_info`. Advisory, not enforced. |
+| `EXTRA_TOOL_MODULES` | — | Comma-separated Python modules whose `register(api)` adds tools to `/mcp` at startup ([extension modules](#extension-modules)). Meant to be set by a derived image, not by hand. A module that fails to load stops the server from starting. |
 | `ENABLE_GIT_READ` | `false` | Register `git_status`, `git_log`, `git_diff` ([git tools](#git-tools)). Works with the read-only token. |
 | `ENABLE_GIT_WRITE` | `false` | Register `git_commit`, `git_pull`, `git_push`, `git_merge`, `git_fetch`. Needs the read-write token. Nothing is committed or pushed automatically. |
 | `GIT_REPO_ROOT` | `DATA_ROOT` | Where the repository root is mounted. `DATA_ROOT` must be it or a folder under it; the difference is the agent's scope. |

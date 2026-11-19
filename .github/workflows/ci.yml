@@ -75,7 +75,7 @@ jobs:
         run: bash tests/autocommit_tests.sh
 
   git-tools:
-    name: Git tools (real git, in-process)
+    name: Git tools and extensions (in-process)
     needs: quick-checks
     runs-on: ubuntu-latest
     steps:
@@ -103,3 +103,9 @@ jobs:
       # mapping, uploads-in-flight, and a bad deployment refusing to start.
       - name: tests/git_surface_tests.py
         run: python3 tests/git_surface_tests.py
+
+      # EXTRA_TOOL_MODULES (docs/extensions.md): extension tools through /mcp,
+      # the read-only gate on read_only=False tools, Vault containment for
+      # extension file access, and every broken extension refusing to start.
+      - name: tests/extension_tests.py
+        run: python3 tests/extension_tests.py

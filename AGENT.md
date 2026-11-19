@@ -247,7 +247,13 @@ path hoping to get through; fix the path or stop.
   creation if never used (`/v1/info` reports the live TTL and how many
   tickets can be outstanding at once).
 
-## This folder is a git repository
+## If this folder is a git repository
+
+Your operator may keep this folder inside a git repository. If so, one of two
+things applies. If you also have the MCP connector, its instructions say
+which; otherwise ask the user if you aren't sure.
+
+### If an autocommit sidecar is running
 
 Anything you write is **automatically committed and pushed within a few
 minutes**. Two consequences:

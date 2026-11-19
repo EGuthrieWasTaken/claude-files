@@ -102,6 +102,10 @@
           Description="Suggested chunk size for write_chunk, reported by begin_write and get_folder_info. Advisory only -- not enforced."
           Type="Variable" Display="advanced" Required="false" Mask="false">3072</Config>
 
+  <Config Name="Autocommit Notice" Target="AUTOCOMMIT_NOTICE" Default="false" Mode=""
+          Description="Set true ONLY if the claude-files-autocommit container (or anything else) commits and pushes this folder: the MCP connector then tells agents their writes are committed and pushed automatically. Left false, it makes no claim about git. Changes only what agents are told, never what is committed. Ignored when Enable Git Write Tools is true."
+          Type="Variable" Display="always" Required="false" Mask="false">false</Config>
+
   <!-- Git tools (docs/plan-mcp-git-ops.md). Off by default. To use them, add
        the three Path entries described in the README ("Git tools": repo root
        read-only, .git, and the shared folder), and point Shared Folder's

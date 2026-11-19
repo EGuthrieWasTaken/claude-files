@@ -122,7 +122,8 @@ jobs:
 
       # The same tools through /mcp and REST: tool registration for each
       # ENABLE_GIT_READ x ENABLE_GIT_WRITE combination, token scopes, error
-      # mapping, uploads-in-flight, and a bad deployment refusing to start.
+      # mapping, uploads-in-flight, what agents are told about git for each
+      # AUTOCOMMIT_NOTICE setting, and a bad deployment refusing to start.
       - name: tests/git_surface_tests.py
         run: python3 tests/git_surface_tests.py
 

@@ -55,6 +55,11 @@ services:
       MCP_UPLOAD_SESSION_TTL_SECONDS: "900"   # begin_write session idle timeout
       MCP_MAX_CONCURRENT_UPLOADS: "8"         # cap on open chunked-upload sessions
       MCP_UPLOAD_CHUNK_ADVISORY_BYTES: "3072" # suggested write_chunk size (advisory only)
+      # true ONLY while the autocommit service below commits this folder: the
+      # connector then tells agents their writes are committed and pushed
+      # automatically. false makes no claim about git. Set it in .env; ignored
+      # when ENABLE_GIT_WRITE is on (the agent commits by itself then).
+      AUTOCOMMIT_NOTICE: "${AUTOCOMMIT_NOTICE:-false}"
 
       # -- Optional git tools (docs/plan-mcp-git-ops.md) ---------------------
       # Off by default. To turn them on, ALSO change the volumes above to the
@@ -105,6 +110,10 @@ services:
   # because it needs .git to make a commit. Its containment is different in
   # kind: SUBDIR scopes every `git add`, so it can only ever commit the same
   # folder the API can write. Anything else in the working tree is left alone.
+  #
+  # When you run it, set AUTOCOMMIT_NOTICE=true in .env and recreate the API
+  # (`docker compose up -d claude-files`), so the MCP connector tells agents
+  # that what they write is committed and pushed.
   # ------------------------------------------------------------------------
   autocommit:
     image: ghcr.io/eguthriewastaken/claude-files-autocommit:1.3.0

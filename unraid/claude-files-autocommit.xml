@@ -23,6 +23,10 @@
     container refuses to start if it is empty, absolute, or contains "..",
     since any of those would silently widen it to the whole repository.
 
+    Then set Autocommit Notice to true on the claude-files container, so its
+    MCP connector tells agents that what they write is committed and pushed.
+    Left at its default, the connector makes no claim about git.
+
     It also works as a general autocommit for any git repository on the
     server: set Commit Subfolder to "." and it commits everything in the
     repository that .gitignore does not exclude.
@@ -41,7 +45,7 @@
   <DateInstalled/>
   <DonateText/>
   <DonateLink/>
-  <Requires>Pairs with the claude-files container pointed at the same folder.</Requires>
+  <Requires>Pairs with the claude-files container pointed at the same folder, with its Autocommit Notice set to true.</Requires>
 
   <Config Name="Repository Root" Target="/repo" Default="" Mode="rw"
           Description="HOST PATH OF THE REPOSITORY ROOT (the folder containing .git), e.g. /mnt/user/appdata/repos/myrepo. This is wider than what claude-files mounts, because committing requires .git. Scope is enforced by Commit Subfolder below."

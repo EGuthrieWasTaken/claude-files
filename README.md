@@ -566,8 +566,9 @@ is refused in both modes. It needs the repo root mounted read-write.
 - **The autocommit sidecar:** with `ENABLE_GIT_WRITE` on, stop the sidecar for
   that repository — the two would race on the index lock and the agent's
   picture of what's pushed would go stale. With only `ENABLE_GIT_READ`, they
-  coexist fine. (`get_folder_info`'s instruction text stops claiming writes are
-  "committed and pushed automatically" when the write tools are on.)
+  coexist fine. With the write tools on, the connector tells agents to commit
+  and push themselves even if `AUTOCOMMIT_NOTICE` is also set; that
+  combination logs a warning at startup.
 - Run a **single worker** (the image does): the locks are in-process.
 
 Errors carry a stable `code` — `outside_scope`, `outside_scope_commits`,
@@ -777,6 +778,12 @@ their defaults. If you declare an SSH key path but don't mount a key, the
 container refuses to start and says so in the log rather than running without
 push access.
 
+**Then set `AUTOCOMMIT_NOTICE=true` on `claude-files`** (in `.env`, or the
+unRAID template's **Autocommit Notice** field) and recreate that container.
+That is what makes the MCP connector tell agents their writes are committed
+and pushed automatically. `claude-files` can't see whether a sidecar is
+running, so without the setting its instructions make no claim about git.
+
 It isn't tied to `claude-files`, either. Set Commit Subfolder to `.` and it
 commits the whole repository instead — a general-purpose autocommit for any
 git working tree on the server (see [whole-repository mode](#whole-repository-mode)).
@@ -876,7 +883,16 @@ open.
 > and `get_folder_info` gain an `extensions` block. Derived images should
 > build `FROM ghcr.io/eguthriewastaken/claude-files:1.3.0` (or later), not
 > `:latest`. Nothing changes for a deployment that leaves `EXTRA_TOOL_MODULES`
-> unset. After redeploying, **verify from a client, not the host**:
+> unset. **The MCP connector no longer tells every agent its writes are
+> "committed and pushed automatically"**: it says so only with the new
+> `AUTOCOMMIT_NOTICE=true`, and by default makes no claim about git. If you run
+> the [autocommit sidecar](#auto-committing-what-agents-write), set
+> `AUTOCOMMIT_NOTICE=true` on `claude-files` (`docker-compose.yml` reads it from
+> `.env`; an unRAID container made from the older template doesn't gain the new
+> field when its image updates, so add the variable by hand), then remove and
+> re-add the claude.ai connector so it reloads the instructions and tool
+> descriptions. With `ENABLE_GIT_WRITE=true`, nothing changes. After
+> redeploying, **verify from a client, not the host**:
 > `GET /health` reports `"version":"1.3.0"`, and `GET /v1/info` has
 > `"extensions": {"api_version": 1, ...}`. `unraid/deploy.sh verify` checks
 > the version for you. (There is no 1.2.0 from this source: that tag was
@@ -1002,6 +1018,7 @@ reproducible, and `:latest` there would silently change what runs on the next
 | `MCP_MAX_CONCURRENT_UPLOADS` | `8` | Cap on open chunked-upload sessions at once. |
 | `MCP_UPLOAD_CHUNK_ADVISORY_BYTES` | `3072` | Suggested chunk size, reported by `begin_write`/`get_folder_info`. Advisory, not enforced. |
 | `EXTRA_TOOL_MODULES` | — | Comma-separated Python modules whose `register(api)` adds tools to `/mcp` at startup ([extension modules](#extension-modules)). Meant to be set by a derived image, not by hand. A module that fails to load stops the server from starting. |
+| `AUTOCOMMIT_NOTICE` | `false` | `true` tells MCP agents (in the server instructions and the `write_file`/`delete_file` descriptions) that their writes are committed and pushed automatically. Set it only when the [autocommit sidecar](#auto-committing-what-agents-write), or something else, commits this folder. `false` makes no claim about git. Changes only what agents are told, never what is committed. Ignored when `ENABLE_GIT_WRITE` is on: agents are then told to commit and push themselves. |
 | `ENABLE_GIT_READ` | `false` | Register `git_status`, `git_log`, `git_diff` ([git tools](#git-tools)). Works with the read-only token. |
 | `ENABLE_GIT_WRITE` | `false` | Register `git_commit`, `git_pull`, `git_push`, `git_merge`, `git_fetch`. Needs the read-write token. Nothing is committed or pushed automatically. |
 | `GIT_REPO_ROOT` | `DATA_ROOT` | Where the repository root is mounted. `DATA_ROOT` must be it or a folder under it; the difference is the agent's scope. |

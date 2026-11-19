@@ -6,12 +6,15 @@ tests/git_suite.py proves app.git_ops is right. This proves the wiring is:
 which tools exist under each ENABLE_GIT_READ x ENABLE_GIT_WRITE combination,
 what a read-only token may do, how a refusal reaches the caller, that a
 pull is refused while an upload is open, that a tool's message tells the agent
-what to do, and that a bad deployment stops the server from starting.
+what to do, what agents are told about git under each AUTOCOMMIT_NOTICE x
+ENABLE_GIT_WRITE setting, and that a bad deployment stops the server from
+starting.
 
     python3 tests/git_surface_tests.py
 
 Tool registration happens at import time, so each combination runs in its own
-subprocess (`... child <read> <write>`); this parent just collects results.
+subprocess (`... child combo|notice|startup ...`); this parent just collects
+results.
 Like tests/git_suite.py it reaches its remote over git's file transport via
 test-only seams in app.git_ops; the ssh transport needs an sshd and is covered
 by the container-level run.
@@ -92,6 +95,7 @@ def child(read: bool, write: bool) -> int:
     print(f"## {label}")
     seam_on()
     w = World()
+    os.environ.pop("AUTOCOMMIT_NOTICE", None)
     os.environ.update(
         API_TOKEN=TOKEN, API_TOKEN_READONLY=RO_TOKEN, REQUIRE_MOUNT="false",
         DATA_ROOT=str(w.repo / "sub-folder-1"), GIT_REPO_ROOT=str(w.repo),
@@ -146,15 +150,7 @@ def child(read: bool, write: bool) -> int:
             note = info["token_scope_note"]
             check(f"[{label}] the ro-token note lists git_status", "git_status" in note)
 
-        # -- instructions ---------------------------------------------------------
-        init = rpc.raw(TOKEN, "initialize", {
-            "protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"},
-        })["result"]["instructions"]
-        if write:
-            check(f"[{label}] instructions stop claiming auto-commit", "committed and pushed automatically" not in init
-                  and "git_commit" in init and "yourself" in init, init[:200])
-        else:
-            check(f"[{label}] instructions unchanged without write tools", "committed and pushed automatically" in init)
+        # (what the instructions say about git is notice_child's job, below)
 
         # -- REST: disabled classes 404, enabled ones answer ---------------------------
         read_routes = [("GET", "/v1/git/status"), ("GET", "/v1/git/log"), ("GET", "/v1/git/diff")]
@@ -298,6 +294,105 @@ def _all_async() -> bool:
 
 
 # ----------------------------------------------------------------------------
+# what agents are told about git: initialize's instructions and the write_file /
+# delete_file descriptions, for each AUTOCOMMIT_NOTICE x ENABLE_GIT_WRITE setting
+# ----------------------------------------------------------------------------
+
+# A phrase only that mode's paragraph contains (app/mcp_endpoint.py, _PERSISTENCE).
+MODE_MARKERS = {
+    "autocommit": "committed and pushed automatically",
+    "git_tools": "git_commit and git_push yourself",
+    "none": "persist on the host",
+}
+# The guidance every mode keeps.
+HANDLING = (
+    "Never write credentials, tokens, keys, or personal data",
+    "only whole-file replace",
+    "write it once",
+)
+# (ENABLE_GIT_READ, ENABLE_GIT_WRITE, AUTOCOMMIT_NOTICE or None for unset, what the agent must be told)
+NOTICE_CASES = [
+    (False, False, None, "none"),          # the default makes no git claim
+    (False, False, "false", "none"),
+    (False, False, "true", "autocommit"),  # the operator runs the sidecar
+    (True, False, None, "none"),           # read tools alone don't imply a sidecar
+    (True, False, "true", "autocommit"),   # read tools coexist with the sidecar
+    (True, True, None, "git_tools"),
+    (True, True, "true", "git_tools"),     # the write tools win, with a warning
+    (False, True, "true", "git_tools"),
+]
+
+
+def notice_child(read: bool, write: bool, notice: str | None, want: str) -> int:
+    from git_suite import World, seam_on
+
+    label = (f"read={'on' if read else 'off'} write={'on' if write else 'off'} "
+             f"AUTOCOMMIT_NOTICE={'unset' if notice is None else notice}")
+    print(f"## {label} -> {want}")
+    seam_on()
+    w = World()
+    os.environ.pop("AUTOCOMMIT_NOTICE", None)
+    if notice is not None:
+        os.environ["AUTOCOMMIT_NOTICE"] = notice
+    os.environ.update(
+        API_TOKEN=TOKEN, REQUIRE_MOUNT="false",
+        DATA_ROOT=str(w.repo / "sub-folder-1"), GIT_REPO_ROOT=str(w.repo),
+        ENABLE_GIT_READ="true" if read else "false", ENABLE_GIT_WRITE="true" if write else "false",
+        GIT_REMOTE="origin", GIT_BRANCH="main", LOG_LEVEL="WARNING",
+    )
+
+    warnings: list[str] = []
+
+    class Grab(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.levelno >= logging.WARNING:
+                warnings.append(record.getMessage())
+
+    logging.getLogger("claude-files.mcp").addHandler(Grab())
+
+    from fastapi.testclient import TestClient
+
+    from app import main as appmain
+
+    with TestClient(appmain.app) as client:
+        rpc = Rpc(client)
+        init = rpc.raw(TOKEN, "initialize", {
+            "protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"},
+        })["result"]["instructions"]
+        check(f"[{label}] initialize gives the {want} paragraph", MODE_MARKERS[want] in init, init[:400])
+        for other, marker in MODE_MARKERS.items():
+            if other != want:
+                check(f"[{label}] ... and not the {other} one", marker not in init, init[:400])
+        if want == "none":
+            check(f"[{label}] the instructions make no git claim at all", "git" not in init.lower(), init)
+        for phrase in HANDLING:
+            check(f"[{label}] the instructions keep {phrase!r}", phrase in init, init[:400])
+
+        tools = {t["name"]: t.get("description") or "" for t in rpc.raw(TOKEN, "tools/list")["result"]["tools"]}
+        wf, df = tools["write_file"], tools["delete_file"]
+        check(f"[{label}] no tool description has an unfilled marker",
+              not any("{git_note}" in d for d in tools.values()))
+        check(f"[{label}] write_file still says never to write secrets", "never write credentials or secrets" in wf, wf[-300:])
+        check(f"[{label}] write_file claims auto-commit only with the notice",
+              ("committed and pushed automatically" in wf) == (want == "autocommit"), wf[-300:])
+        check(f"[{label}] write_file names git_commit only with the write tools",
+              ("git_commit" in wf) == (want == "git_tools"), wf[-300:])
+        check(f"[{label}] delete_file mentions git history only when the folder is in git",
+              ("git history" in df) == (want != "none"), df)
+        check(f"[{label}] delete_file claims auto-commit only with the notice",
+              ("auto-committed" in df) == (want == "autocommit"), df)
+        if want == "none":
+            check(f"[{label}] write_file and delete_file make no git claim",
+                  "git" not in wf.lower() and "git" not in df.lower(), wf[-300:] + " | " + df)
+
+    conflict = write and notice == "true"
+    warned = any("AUTOCOMMIT_NOTICE is ignored" in m for m in warnings)
+    check(f"[{label}] " + ("the conflicting settings are warned about at startup" if conflict
+                           else "no AUTOCOMMIT_NOTICE warning"), warned == conflict, str(warnings))
+    return 0
+
+
+# ----------------------------------------------------------------------------
 # startup refusals: the server must not start in a bad git deployment
 # ----------------------------------------------------------------------------
 
@@ -363,6 +458,13 @@ def main() -> int:
             if rc != 0 or any(ln.startswith("  FAIL") for ln in lines) or not any("PASS" in ln for ln in lines):
                 failed += 1
                 print(out[-3000:])
+    for read, write, notice, want in NOTICE_CASES:
+        rc, out = run_child("notice", str(int(read)), str(int(write)), notice or "-", want)
+        lines = [ln for ln in out.splitlines() if ln.startswith(("##", "  PASS", "  FAIL"))]
+        print("\n".join(lines))
+        if rc != 0 or any(ln.startswith("  FAIL") for ln in lines) or not any("PASS" in ln for ln in lines):
+            failed += 1
+            print(out[-3000:])
     print("## startup refusals")
     for case, needle in STARTUP_CASES.items():
         rc, out = run_child("startup", case)
@@ -380,6 +482,9 @@ if __name__ == "__main__":
         try:
             if sys.argv[2] == "combo":
                 rc = child(sys.argv[3] == "1", sys.argv[4] == "1")
+            elif sys.argv[2] == "notice":
+                rc = notice_child(sys.argv[3] == "1", sys.argv[4] == "1",
+                                  None if sys.argv[5] == "-" else sys.argv[5], sys.argv[6])
             else:
                 rc = startup_child(sys.argv[3])
         except Exception:  # noqa: BLE001

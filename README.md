@@ -874,6 +874,19 @@ open.
 
 ## Publishing a new version
 
+> **1.4.0's release notes should say:** the MCP connector no longer tells
+> every agent its writes are "committed and pushed automatically". It says so
+> only with the new `AUTOCOMMIT_NOTICE=true`, and by default makes no claim
+> about git. If you run the [autocommit sidecar](#auto-committing-what-agents-write),
+> set `AUTOCOMMIT_NOTICE=true` on `claude-files` (`docker-compose.yml` reads it
+> from `.env`; an unRAID container made from the older template doesn't gain
+> the new field when its image updates, so add the variable by hand), then
+> remove and re-add the claude.ai connector so it reloads the instructions and
+> tool descriptions. With `ENABLE_GIT_WRITE=true`, nothing changes. After
+> redeploying, **verify from a client, not the host**: `GET /health` reports
+> `"version":"1.4.0"`, and `initialize` on `/mcp` returns the paragraph for
+> your setting.
+
 > **1.3.0's release notes should say:** images now live on GHCR
 > (`ghcr.io/eguthriewastaken/claude-files`, `.../claude-files-autocommit`);
 > Docker Hub keeps the old tags but gets no new ones, so switch the Repository
@@ -883,16 +896,7 @@ open.
 > and `get_folder_info` gain an `extensions` block. Derived images should
 > build `FROM ghcr.io/eguthriewastaken/claude-files:1.3.0` (or later), not
 > `:latest`. Nothing changes for a deployment that leaves `EXTRA_TOOL_MODULES`
-> unset. **The MCP connector no longer tells every agent its writes are
-> "committed and pushed automatically"**: it says so only with the new
-> `AUTOCOMMIT_NOTICE=true`, and by default makes no claim about git. If you run
-> the [autocommit sidecar](#auto-committing-what-agents-write), set
-> `AUTOCOMMIT_NOTICE=true` on `claude-files` (`docker-compose.yml` reads it from
-> `.env`; an unRAID container made from the older template doesn't gain the new
-> field when its image updates, so add the variable by hand), then remove and
-> re-add the claude.ai connector so it reloads the instructions and tool
-> descriptions. With `ENABLE_GIT_WRITE=true`, nothing changes. After
-> redeploying, **verify from a client, not the host**:
+> unset. After redeploying, **verify from a client, not the host**:
 > `GET /health` reports `"version":"1.3.0"`, and `GET /v1/info` has
 > `"extensions": {"api_version": 1, ...}`. `unraid/deploy.sh verify` checks
 > the version for you. (There is no 1.2.0 from this source: that tag was
@@ -956,19 +960,19 @@ The image is multi-arch (`linux/amd64` for unRAID, `linux/arm64` for local
 work on Apple silicon). Build both in one shot and push a single manifest:
 
 ```bash
-docker buildx build --platform linux/amd64,linux/arm64 --tag ghcr.io/eguthriewastaken/claude-files:1.3.0 --tag ghcr.io/eguthriewastaken/claude-files:latest --push .
+docker buildx build --platform linux/amd64,linux/arm64 --tag ghcr.io/eguthriewastaken/claude-files:1.4.0 --tag ghcr.io/eguthriewastaken/claude-files:latest --push .
 ```
 
 Confirm both architectures landed under one tag:
 
 ```bash
-docker buildx imagetools inspect ghcr.io/eguthriewastaken/claude-files:1.3.0
+docker buildx imagetools inspect ghcr.io/eguthriewastaken/claude-files:1.4.0
 ```
 
 The sidecar is a separate image, built the same way:
 
 ```bash
-docker buildx build --platform linux/amd64,linux/arm64 --tag ghcr.io/eguthriewastaken/claude-files-autocommit:1.3.0 --tag ghcr.io/eguthriewastaken/claude-files-autocommit:latest --push ./autocommit
+docker buildx build --platform linux/amd64,linux/arm64 --tag ghcr.io/eguthriewastaken/claude-files-autocommit:1.4.0 --tag ghcr.io/eguthriewastaken/claude-files-autocommit:latest --push ./autocommit
 ```
 
 Building on separate machines and pushing to the same tag does **not** produce
@@ -976,13 +980,13 @@ a multi-arch image -- the second push replaces the first. If you build
 natively on each host, push arch-suffixed tags and merge them:
 
 ```bash
-docker buildx imagetools create --tag ghcr.io/eguthriewastaken/claude-files:1.3.0 ghcr.io/eguthriewastaken/claude-files:1.3.0-arm64 ghcr.io/eguthriewastaken/claude-files:1.3.0-amd64
+docker buildx imagetools create --tag ghcr.io/eguthriewastaken/claude-files:1.4.0 ghcr.io/eguthriewastaken/claude-files:1.4.0-arm64 ghcr.io/eguthriewastaken/claude-files:1.4.0-amd64
 ```
 
 On Arch Linux, `docker buildx` is a separate package: `sudo pacman -S docker-buildx`.
 
 The unRAID templates pull `:latest`, so always push both tags. `docker-compose.yml`
-stays pinned to `:1.3.0` on purpose — compose deployments should be
+stays pinned to `:1.4.0` on purpose — compose deployments should be
 reproducible, and `:latest` there would silently change what runs on the next
 `up`.
 

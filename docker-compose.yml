@@ -1,6 +1,6 @@
 services:
   claude-files:
-    image: ghcr.io/eguthriewastaken/claude-files:1.3.0
+    image: ghcr.io/eguthriewastaken/claude-files:1.4.0
     # Uncomment to build from source instead of pulling:
     # build: .
     container_name: claude-files
@@ -116,7 +116,7 @@ services:
   # that what they write is committed and pushed.
   # ------------------------------------------------------------------------
   autocommit:
-    image: ghcr.io/eguthriewastaken/claude-files-autocommit:1.3.0
+    image: ghcr.io/eguthriewastaken/claude-files-autocommit:1.4.0
     # build: ./autocommit
     container_name: claude-files-autocommit
     restart: unless-stopped

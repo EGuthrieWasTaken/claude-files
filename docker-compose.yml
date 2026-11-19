@@ -1,6 +1,6 @@
 services:
   claude-files:
-    image: eguthriewastaken2/claude-files:1.3.0
+    image: ghcr.io/eguthriewastaken/claude-files:1.3.0
     # Uncomment to build from source instead of pulling:
     # build: .
     container_name: claude-files
@@ -107,7 +107,7 @@ services:
   # folder the API can write. Anything else in the working tree is left alone.
   # ------------------------------------------------------------------------
   autocommit:
-    image: eguthriewastaken2/claude-files-autocommit:1.3.0
+    image: ghcr.io/eguthriewastaken/claude-files-autocommit:1.3.0
     # build: ./autocommit
     container_name: claude-files-autocommit
     restart: unless-stopped

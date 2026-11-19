@@ -38,8 +38,9 @@ jobs:
     name: Version is new and consistent
     runs-on: ubuntu-latest
     # Every PR must ship a version that has never been released: app/main.py's
-    # version= must not already be a tag of either image on Docker Hub, nor a
-    # git tag vX.Y.Z, and docker-compose.yml / unraid/deploy.sh must match it.
+    # version= must not already be a git tag vX.Y.Z (every release creates
+    # one) or one of the versions once published on Docker Hub, and
+    # docker-compose.yml / unraid/deploy.sh must match it.
     # On a push to main only the consistency half runs -- once a release is
     # published, main's version is "taken" until the next PR bumps it.
     # .github/scripts/check-version.sh holds the logic; the release workflow

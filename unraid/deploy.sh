@@ -16,7 +16,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-IMAGE="${IMAGE:-eguthriewastaken2/claude-files}"
+IMAGE="${IMAGE:-ghcr.io/eguthriewastaken/claude-files}"
 CONTAINER_NAME="${CONTAINER_NAME:-claude-files}"
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.yml}"
 

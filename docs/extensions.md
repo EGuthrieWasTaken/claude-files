@@ -12,7 +12,7 @@ live in their own repository and image, and this one carries only the hook.
 claude-files (this repo)                    claude-files-org (separate repo)
   app/extensions.py   <-- the contract        claude_files_org/__init__.py   register(api)
   EXTRA_TOOL_MODULES  <-- the switch          Dockerfile:
-                                                FROM eguthriewastaken2/claude-files:<pinned tag>
+                                                FROM ghcr.io/eguthriewastaken/claude-files:<pinned tag>
                                                 COPY claude_files_org/ /srv/claude_files_org/
                                                 ENV EXTRA_TOOL_MODULES=claude_files_org
 ```

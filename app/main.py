@@ -167,7 +167,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="claude-files",
     description=DESCRIPTION,
-    version="1.1.0",
+    version="1.3.0",
     docs_url="/docs" if CONFIG.enable_docs else None,
     redoc_url=None,
     openapi_url="/openapi.json" if CONFIG.enable_docs else None,

@@ -80,12 +80,17 @@ mkdir -p /mnt/user/appdata/repos/myrepo/shared && chown 99:100 /mnt/user/appdata
 
 ### 2. Nothing to build
 
-The image is published multi-arch on Docker Hub, so unRAID pulls `linux/amd64`
-on its own:
+The image is published multi-arch on GitHub Container Registry (GHCR), so
+unRAID pulls `linux/amd64` on its own:
 
 ```bash
-docker pull eguthriewastaken2/claude-files:latest
+docker pull ghcr.io/eguthriewastaken/claude-files:latest
 ```
+
+Versions up to 1.2.0 were on Docker Hub as `eguthriewastaken2/claude-files`;
+1.3.0 and later are only on GHCR. An existing container switches over by
+changing its Repository to the GHCR name (the templates in `unraid/` already
+use it).
 
 ### 3. Generate a token
 
@@ -108,7 +113,7 @@ it if you only want the API. To add the API by hand instead:
 
 | Field | Value |
 |---|---|
-| Repository | `eguthriewastaken2/claude-files:latest` |
+| Repository | `ghcr.io/eguthriewastaken/claude-files:latest` |
 | Network Type | `bridge` |
 | Port | `8080` → `8080` |
 | Path | **Container** `/data` → **Host** `/mnt/user/appdata/repos/myrepo/shared` (Read/Write) |
@@ -862,18 +867,59 @@ open.
 
 ## Publishing a new version
 
-> **1.1.0's release notes should say:** the integrity floor
-> (`X-Expect-Bytes`/`X-Expect-Sha256`, `sha256` in every write response) and
-> `GET /v1/bridge.py` (see [the local bridge](#uploading-binary-files-the-local-bridge))
-> are both new in this version — a deployment still running `1.0.0` reports
-> neither, which is exactly the gap
-> [`docs/feature-request-path-based-upload.md`](docs/feature-request-path-based-upload.md)
-> (Part 0) was written against. After redeploying, **verify from a client,
-> not the host**: `GET /health` reports `"version":"1.1.0"`, and `GET
-> /v1/info` reports `bridge_available:true`. If a claude.ai connector still
-> shows the old tool list, its tool cache needs refreshing — remove and
-> re-add the connector. `unraid/deploy.sh verify` runs exactly these checks
-> for you.
+> **1.3.0's release notes should say:** images now live on GHCR
+> (`ghcr.io/eguthriewastaken/claude-files`, `.../claude-files-autocommit`);
+> Docker Hub keeps the old tags but gets no new ones, so switch the Repository
+> of an existing container. `EXTRA_TOOL_MODULES`
+> ([extension modules](#extension-modules), [`docs/extensions.md`](docs/extensions.md))
+> is new: a derived image can add its own tools to `/mcp`, and `GET /v1/info`
+> and `get_folder_info` gain an `extensions` block. Derived images should
+> build `FROM ghcr.io/eguthriewastaken/claude-files:1.3.0` (or later), not
+> `:latest`. Nothing changes for a deployment that leaves `EXTRA_TOOL_MODULES`
+> unset. After redeploying, **verify from a client, not the host**:
+> `GET /health` reports `"version":"1.3.0"`, and `GET /v1/info` has
+> `"extensions": {"api_version": 1, ...}`. `unraid/deploy.sh verify` checks
+> the version for you. (There is no 1.2.0 from this source: that tag was
+> already on Docker Hub, pushed 2026-09-23 from a build that still said 1.1.0,
+> so this release skips to 1.3.0.)
+
+### Releases are automatic
+
+1. **Every PR bumps the version.** `version=` in `app/main.py` is the one
+   source of truth; the `docker-compose.yml` pins (both images) and
+   `unraid/deploy.sh`'s fallback `TAG` must match it. CI's
+   *Version is new and consistent* job fails a PR whose version was already
+   released (a git tag `vX.Y.Z` exists, or it is one of the old Docker Hub
+   versions 1.0.0, 1.0.1, 1.1.0 and 1.2.0) or whose pins disagree.
+   `.github/scripts/check-version.sh unpublished` runs the same check locally.
+2. **Merge, then publish a GitHub release** tagged `vX.Y.Z` (exactly
+   `v` + `app/main.py`'s version) from `main`. The *Release* workflow
+   (`.github/workflows/release.yml`) checks the tag again, checks neither
+   image already has that tag on GHCR, builds both for `linux/amd64` and
+   `linux/arm64`, pushes `:X.Y.Z` and `:latest` (not `:latest` for a release
+   marked pre-release), and confirms both architectures landed.
+3. **Redeploy** with `unraid/deploy.sh` (below), or unRAID's "Force Update".
+
+The workflow pushes with the repository's own `GITHUB_TOKEN`, so it needs no
+secrets. To make the version check block merges, mark *Version is new and
+consistent* as a required status check on `main` (Settings → Branches).
+
+**Package visibility.** GHCR makes a package private the first time it is
+pushed. After the first release, open each package (your GitHub profile →
+Packages → `claude-files`, then `claude-files-autocommit`) → Package settings,
+and set it to Public, or log the pulling host in with
+`docker login ghcr.io` and a personal access token with `read:packages`.
+
+If a release run fails after pushing one image but not the other, the re-run
+is refused because that tag now exists. Bump to the next patch version
+rather than deleting a published tag.
+
+### By hand
+
+The commands below are what the workflow does, for publishing without it.
+Log in first with `docker login ghcr.io` (a personal access token with
+`write:packages`), and push the matching git tag `vX.Y.Z` afterwards, so the
+version check knows the number is taken.
 
 `unraid/deploy.sh` scripts the redeploy-and-verify half of this section —
 `build` (the buildx command below), `pull` + recreate (via `docker compose`
@@ -894,19 +940,19 @@ The image is multi-arch (`linux/amd64` for unRAID, `linux/arm64` for local
 work on Apple silicon). Build both in one shot and push a single manifest:
 
 ```bash
-docker buildx build --platform linux/amd64,linux/arm64 --tag eguthriewastaken2/claude-files:1.1.0 --tag eguthriewastaken2/claude-files:latest --push .
+docker buildx build --platform linux/amd64,linux/arm64 --tag ghcr.io/eguthriewastaken/claude-files:1.3.0 --tag ghcr.io/eguthriewastaken/claude-files:latest --push .
 ```
 
 Confirm both architectures landed under one tag:
 
 ```bash
-docker buildx imagetools inspect eguthriewastaken2/claude-files:1.1.0
+docker buildx imagetools inspect ghcr.io/eguthriewastaken/claude-files:1.3.0
 ```
 
 The sidecar is a separate image, built the same way:
 
 ```bash
-docker buildx build --platform linux/amd64,linux/arm64 --tag eguthriewastaken2/claude-files-autocommit:1.1.0 --tag eguthriewastaken2/claude-files-autocommit:latest --push ./autocommit
+docker buildx build --platform linux/amd64,linux/arm64 --tag ghcr.io/eguthriewastaken/claude-files-autocommit:1.3.0 --tag ghcr.io/eguthriewastaken/claude-files-autocommit:latest --push ./autocommit
 ```
 
 Building on separate machines and pushing to the same tag does **not** produce
@@ -914,13 +960,13 @@ a multi-arch image -- the second push replaces the first. If you build
 natively on each host, push arch-suffixed tags and merge them:
 
 ```bash
-docker buildx imagetools create --tag eguthriewastaken2/claude-files:1.1.0 eguthriewastaken2/claude-files:1.1.0-arm64 eguthriewastaken2/claude-files:1.1.0-amd64
+docker buildx imagetools create --tag ghcr.io/eguthriewastaken/claude-files:1.3.0 ghcr.io/eguthriewastaken/claude-files:1.3.0-arm64 ghcr.io/eguthriewastaken/claude-files:1.3.0-amd64
 ```
 
 On Arch Linux, `docker buildx` is a separate package: `sudo pacman -S docker-buildx`.
 
 The unRAID templates pull `:latest`, so always push both tags. `docker-compose.yml`
-stays pinned to `:1.1.0` on purpose — compose deployments should be
+stays pinned to `:1.3.0` on purpose — compose deployments should be
 reproducible, and `:latest` there would silently change what runs on the next
 `up`.
 

@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>claude-files-autocommit</Name>
-  <Repository>eguthriewastaken2/claude-files-autocommit:latest</Repository>
-  <Registry>https://hub.docker.com/r/eguthriewastaken2/claude-files-autocommit</Registry>
+  <Repository>ghcr.io/eguthriewastaken/claude-files-autocommit:latest</Repository>
+  <Registry>https://github.com/EGuthrieWasTaken/claude-files/pkgs/container/claude-files-autocommit</Registry>
   <Network>bridge</Network>
   <MyIP/>
   <Shell>bash</Shell>

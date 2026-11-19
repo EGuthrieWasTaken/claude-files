@@ -1,0 +1,106 @@
+name: Release
+
+# Publishing a GitHub release tagged vX.Y.Z builds both images for
+# linux/amd64 and linux/arm64 and pushes them to GHCR
+# (ghcr.io/eguthriewastaken/claude-files and .../claude-files-autocommit) as
+# :X.Y.Z, plus :latest unless the release is marked as a pre-release. The tag
+# must equal app/main.py's version (see .github/scripts/check-version.sh), and
+# a release never overwrites a tag that is already on GHCR.
+#
+# Pushes with this repository's GITHUB_TOKEN: no secrets to configure.
+
+on:
+  release:
+    types: [published]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io/eguthriewastaken
+
+jobs:
+  publish:
+    name: Build and push images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Tag matches app/main.py and is not yet on GHCR
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/check-version.sh release "$TAG"
+
+      - name: Work out image tags
+        id: tags
+        env:
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          v=$(bash .github/scripts/check-version.sh print)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          for img in claude-files claude-files-autocommit; do
+            tags="${REGISTRY}/${img}:${v}"
+            if [[ "$PRERELEASE" != "true" ]]; then
+              tags="${tags},${REGISTRY}/${img}:latest"
+            fi
+            echo "${img//-/_}=${tags}" >> "$GITHUB_OUTPUT"
+          done
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # org.opencontainers.image.source links each package to this repository
+      # (GHCR shows it on the repo page, and this workflow's token can then
+      # read it on later releases).
+      - name: Build and push claude-files
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.claude_files }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.tags.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Build and push claude-files-autocommit
+        uses: docker/build-push-action@v6
+        with:
+          context: ./autocommit
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.claude_files_autocommit }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.tags.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Both architectures landed under one tag
+        env:
+          V: ${{ steps.tags.outputs.version }}
+        run: |
+          for img in claude-files claude-files-autocommit; do
+            docker buildx imagetools inspect "${REGISTRY}/${img}:${V}" | tee /tmp/inspect.txt
+            for arch in linux/amd64 linux/arm64; do
+              if ! grep -q "$arch" /tmp/inspect.txt; then
+                echo "::error::${REGISTRY}/${img}:${V} is missing ${arch}"
+                exit 1
+              fi
+            done
+          done

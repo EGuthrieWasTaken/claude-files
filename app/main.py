@@ -326,7 +326,7 @@ def _check_token(authorization: str | None, api_key: str | None = None) -> str:
     Accepts `Authorization: Bearer <token>` (the documented REST credential)
     or `X-API-Key: <token>` (what the claude.ai custom-connector dialog
     sends -- it offers a static header with `x-api-key` as a preset name,
-    the arrangement the sibling meeting-transcriber connector already runs
+    the arrangement an earlier connector on the same SDK already runs
     on). If `Authorization` is present it wins and `X-API-Key` is ignored --
     never "try each until one matches", which would turn one request into
     two guesses against the rate limiter.

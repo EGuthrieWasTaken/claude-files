@@ -1,14 +1,14 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>claude-files-autocommit</Name>
-  <Repository>eguthriewastaken2/claude-files-autocommit:latest</Repository>
-  <Registry>https://hub.docker.com/r/eguthriewastaken2/claude-files-autocommit</Registry>
+  <Repository>ghcr.io/eguthriewastaken/claude-files-autocommit:latest</Repository>
+  <Registry>https://github.com/EGuthrieWasTaken/claude-files/pkgs/container/claude-files-autocommit</Registry>
   <Network>bridge</Network>
   <MyIP/>
   <Shell>bash</Shell>
   <Privileged>false</Privileged>
-  <Support/>
-  <Project/>
+  <Support>https://github.com/EGuthrieWasTaken/claude-files/issues</Support>
+  <Project>https://github.com/EGuthrieWasTaken/claude-files</Project>
   <Overview>
     Optional companion to claude-files. Polls the shared folder and commits
     and pushes whatever an agent writes there.

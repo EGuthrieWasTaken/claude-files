@@ -11,7 +11,7 @@ true alongside the `WITH_MCP` build arg).
 
 **What was NOT re-verified while implementing this**, and is worth flagging
 for whoever deploys it first: every "Verified" note this document inherited
-from `meeting-transcriber`'s own build (the four mounting gotchas, the
+from an earlier connector's own build (the four mounting gotchas, the
 `stateless_http=True` transport, `FastMCP(instructions=...)` surfacing) was
 reproduced there against the real SDK, not re-reproduced here -- this
 implementation trusts that prior verification rather than repeating it,
@@ -29,30 +29,30 @@ reasoning:
 
 | Gate | Resolution |
 |---|---|
-| **1. Auth header** | **`X-API-Key`.** Confirmed working in practice — it is what the `meeting-transcriber` connector runs on today. Widen `_check_token()` to accept it. |
+| **1. Auth header** | **`X-API-Key`.** Confirmed working in practice — it is what an earlier connector on the same SDK runs on today. Widen `_check_token()` to accept it. |
 | **2. Dependencies** | **Option A — hold every current pin** and let the resolver backtrack `mcp` to 1.12.4. No existing pin moves. |
 | **3. Image surface** | Optional at build time (`WITH_MCP`) + `ENABLE_MCP` env var, **defaulting to `true`**. |
 
 One thing changed while writing this up and is worth reading before the
 Dockerfile is touched: **Option A only survives if `requirements.txt` and
 `requirements-mcp.txt` are installed in a single `pip` invocation.** The
-sibling repo's separate-layer pattern reproduces the exact `starlette`
+earlier connector's separate-layer pattern reproduces the exact `starlette`
 conflict Option A exists to avoid. Measured both ways under decision gate 2.
 
-The reference implementation for all of this is the sibling repo
-`meeting-transcriber`, which already ships a working remote MCP endpoint:
-`app/mcp_endpoint.py`, its design brief `docs/plan-phase4-remote-mcp.md`, and
-its tests `tests/test_mcp_remote.py`. Read that brief before starting — it
-paid for four gotchas in production that this document inherits for free, and
-three of them reproduce identically here.
+The reference implementation for all of this was an earlier, separate
+connector project (not published here) that already shipped a working remote
+MCP endpoint on the same SDK. It paid for four gotchas in production that this
+document inherits for free, and three of them reproduce identically here; they
+are written out in full under [Implementation](#implementation) so nothing
+below depends on reading that project.
 
 ---
 
 ## Goal
 
 Mount a Streamable HTTP MCP endpoint at `/mcp` on the existing FastAPI app
-(`app/main.py`), so this service — already behind a Cloudflare tunnel at
-`claude-files.guthrieec.dev` — can be added **once** as a custom connector in
+(`app/main.py`), so this service — for example behind a Cloudflare tunnel at
+`files.example.com` — can be added **once** as a custom connector in
 Cowork / claude.ai and used from every surface, with the shared folder
 appearing as a set of tools rather than as a REST API an agent has to be
 taught.
@@ -74,7 +74,7 @@ correct `curl`/`fetch` calls — including remembering `?parents=true`, the
 | Correct-by-construction paths | agent must get it right | tool schema + server-side validation |
 
 The REST API does not go away and is not deprecated. `/mcp` is a second front
-end onto the same `Vault`, exactly as `meeting-transcriber` kept its stdio
+end onto the same `Vault`, exactly as the earlier connector kept its stdio
 server after mounting `/mcp`. Anything too big or too binary for a tool call
 still goes over REST, and the tool errors say so explicitly.
 
@@ -82,7 +82,7 @@ still goes over REST, and the tool errors say so explicitly.
 
 ## The two hard limitations
 
-`meeting-transcriber`'s Phase 4 had one ("a remote MCP server cannot take a
+The earlier connector had one ("a remote MCP server cannot take a
 file off your laptop"). A file API has two, and both are more central here
 because moving file bytes *is* the product.
 
@@ -90,18 +90,17 @@ because moving file bytes *is* the product.
 
 A tool result is a JSON string in a model's context window. `MAX_UPLOAD_BYTES`
 is 256 MiB (`app/config.py:38`). Those two facts do not meet. No design gets
-around it — the same constraint that forced `meeting-transcriber` to keep a
+around it — the same constraint that forced the earlier connector to keep a
 stdio server for local uploads.
 
 **Consequence:** `/mcp` gets its own inline budget, well below
 `MAX_UPLOAD_BYTES`, and every over-budget result is an *explicit, explanatory*
 truncation that names the REST URL for the full bytes — never a silent cut.
-Follow the shape `meeting-transcriber`'s `get_transcript` already uses
-(`app/mcp_endpoint.py`, the `{"preview", "bytes", "truncated", "note"}`
-return).
+Follow the shape the earlier connector's own read tool already uses (a
+`{"preview", "bytes", "truncated", "note"}` return).
 
 Proposed setting: `MCP_INLINE_LIMIT_CHARS`, default **100 000** characters,
-matching the sibling repo's `TRANSCRIBE_MCP_INLINE_LIMIT_CHARS`. Add it to
+matching the earlier connector's own inline budget. Add it to
 `Config` (`app/config.py:33`) via the existing `_env_int` helper.
 
 ### 2. Binary files are worse than large ones.
@@ -140,7 +139,7 @@ context to buy nothing.
 
 ## Decision gate 1 — auth header: **resolved, `X-API-Key`**
 
-**Resolved: replicate `meeting-transcriber`'s arrangement exactly.** That
+**Resolved: replicate the earlier connector's arrangement exactly.** That
 connector runs on a static `x-api-key` header today and it works, so there is
 nothing left to discover here and no reason to invent a second scheme. The
 open question was only ever whether `Authorization` would *also* be accepted
@@ -154,7 +153,7 @@ if not authorization or not authorization.startswith("Bearer "):
 ```
 
 **The change:** widen it to also read the token from `X-API-Key`, mirroring
-`meeting-transcriber`'s `app/auth.py`. Shape it so the REST path is untouched
+the earlier connector's auth module. Shape it so the REST path is untouched
 and the precedence is explicit:
 
 ```python
@@ -162,8 +161,8 @@ def _check_token(authorization: str | None, api_key: str | None = None) -> str:
     """Return "rw" or "ro". Accepts `Authorization: Bearer <token>` (the
     documented REST credential) or `X-API-Key: <token>` (what the Claude
     custom-connector dialog sends -- it offers a static header with
-    `x-api-key` as a preset name, and that is the arrangement the sibling
-    meeting-transcriber connector has been running on).
+    `x-api-key` as a preset name, and that is the arrangement an earlier
+    connector on the same SDK has been running on).
     """
     presented = None
     if authorization and authorization.startswith("Bearer "):
@@ -236,7 +235,7 @@ starlette<0.42.0,>=0.40.0, but you have starlette 1.6.0 which is incompatible.
 
 `mcp` 1.30.0 pulls `starlette` 1.6.0 and `pydantic` 2.13.5, silently
 overwriting a pin `fastapi==0.115.6` declares it cannot work with. A separate
-`requirements-mcp.txt` installed as its own Docker layer — the sibling repo's
+`requirements-mcp.txt` installed as its own Docker layer — the earlier connector's
 pattern — does **not** save you here, because unlike that repo's ML pins,
 `mcp` and `fastapi` genuinely share `starlette`.
 
@@ -247,7 +246,7 @@ to build.**
 |---|---|---|---|---|---|
 | **A. Hold every current pin** | 0.115.6 *(unchanged)* | 2.10.4 *(unchanged)* | **1.12.4** | 0.41.3 | Resolver backtracks `mcp` to fit. No existing pin moves. |
 | **B. Hold `pydantic`, bump `fastapi`** | 0.141.1 | 2.10.4 *(unchanged)* | **1.12.4** | 1.6.0 | `pydantic` is what pins `mcp` back, so bumping `fastapi` alone buys nothing. |
-| **C. Bump both** | 0.141.1 | 2.13.5 | **1.30.0** | 1.6.0 | Newest SDK; matches `meeting-transcriber`'s verified set exactly. |
+| **C. Bump both** | 0.141.1 | 2.13.5 | **1.30.0** | 1.6.0 | Newest SDK; matches the earlier connector's verified set exactly. |
 
 **Resolved: A.** Keeping a security-audited image's dependency graph still for
 a feature that is purely additive is worth more than the newest SDK. `mcp`
@@ -262,7 +261,7 @@ built, not a different one.
 
 Revisit only for a concrete `mcp` ≥1.13 feature. At that point take **C**
 wholesale rather than assembling a fourth combination — C is already running
-in production in the sibling repo, which is the only reason to prefer it.
+in production in the earlier connector, which is the only reason to prefer it.
 
 ### What this means for the requirements files
 
@@ -285,7 +284,7 @@ mcp==1.12.4
 
 ### Option A only holds if it resolves in **one** `pip install`
 
-**Verified, and it dictates the Dockerfile.** The sibling repo installs its
+**Verified, and it dictates the Dockerfile.** The earlier connector installs its
 `requirements-mcp.txt` as a *separate* layer, specifically to keep the
 resolver away from its ML pins. Copying that pattern here **reproduces the
 exact break Option A was chosen to avoid**, because `mcp` and `fastapi` share
@@ -293,7 +292,7 @@ exact break Option A was chosen to avoid**, because `mcp` and `fastapi` share
 already-installed packages as constraints:
 
 ```
-# two invocations -- the sibling repo's pattern
+# two invocations -- the earlier connector's pattern
 $ pip install fastapi==0.115.6 "uvicorn[standard]==0.34.0" pydantic==2.10.4
 $ pip install mcp==1.12.4
 $ pip check
@@ -377,8 +376,8 @@ discovered.
 1. **Build-time.** `app/requirements-mcp.txt`, installed in the same `pip`
    invocation as `requirements.txt` under `ARG WITH_MCP` (see "Option A only
    holds if it resolves in one `pip install`" above — *not* a separate layer).
-   Guard the import in `app/main.py`, as `meeting-transcriber`'s
-   `app/main.py:713-720` does:
+   Guard the import in `app/main.py`, as the earlier connector
+   does:
 
    ```python
    try:
@@ -427,8 +426,8 @@ probing.
 ## Implementation
 
 Target file: **`app/mcp_endpoint.py`**, mirroring
-`meeting-transcriber/app/mcp_endpoint.py` closely enough that a reader of one
-recognises the other.
+the earlier connector's endpoint module closely enough that a reader of one
+would recognise the other.
 
 ### Mounting, and the three gotchas that come with it
 
@@ -555,7 +554,7 @@ supports it — but confirm during step 0 and record the answer here.
 The mounted sub-app is a raw Starlette app, so FastAPI's `Depends` machinery
 (`ReadAuth`/`WriteAuth`, `app/main.py:162-163`) does not apply to it. Gate the
 whole surface with a `BaseHTTPMiddleware` wrapping the sub-app, exactly as
-`meeting-transcriber`'s `_RequireAuth` does:
+the earlier connector's `_RequireAuth` does:
 
 ```python
 class _RequireAuth(BaseHTTPMiddleware):
@@ -703,7 +702,7 @@ well in a tool list, not to mirror HTTP verbs.
 | `delete_file(path, recursive=False)` | `DELETE /v1/content` (`app/main.py:374`) | Honours `ALLOW_DELETE`. Description must state that deletion does not remove the file from git history. Write-scope only. |
 | `make_directory(path, parents=True)` | `POST /v1/mkdir` (`app/main.py:391`) | Already idempotent; say so (`created: false`, not an error). Write-scope only. |
 | `move_file(src, dst, overwrite=False, parents=False)` | `POST /v1/move` (`app/main.py:405`) | Write-scope only. |
-| `find_files(pattern, path="", limit=200)` | *new* | `fnmatch` over `VAULT.walk()` (`app/safepath.py:364`). Not a REST endpoint. Optional, but it is the difference between a connector and a remote control — the same role `list_incoming_files` plays in `meeting-transcriber`. Add only if `list_files(recursive=True)` proves clumsy in real use. |
+| `find_files(pattern, path="", limit=200)` | *new* | `fnmatch` over `VAULT.walk()` (`app/safepath.py:364`). Not a REST endpoint. Optional, but it is the difference between a connector and a remote control — the same role a file-listing tool played in the earlier connector. Add only if `list_files(recursive=True)` proves clumsy in real use. |
 
 Deliberately **not** included, with reasons:
 
@@ -746,7 +745,7 @@ inside it, not beside it.**
 4. **Read-only token.** Every write tool refused, with the same message text
    as `require_write` produces.
 5. **Unauthenticated `tools/call`** gets 401 without reaching a tool; a correct
-   token gets through. Both branches, per `meeting-transcriber`'s "test 10".
+   token gets through. Both branches, as the earlier connector tests it.
 6. **Bare `/mcp` does not redirect.** `POST /mcp` returns 200, not 307 — the
    `static_headers_probe_redirect` regression test. Confirm it fails with the
    `_ExactPathForward` route removed.
@@ -758,7 +757,7 @@ inside it, not beside it.**
    image), the app boots and serves REST with `/mcp` absent. With `mcp`
    installed but `ENABLE_MCP=false`, `/mcp` **404s** — assert the status, not
    just that no tool ran, since the failure mode of a half-threaded flag is a
-   mounted-but-unlisted endpoint. `meeting-transcriber`'s "test 9" notes the
+   mounted-but-unlisted endpoint. The earlier connector's tests note the
    import-guard half is fiddlier than it looks: a subprocess hides the branch
    from coverage, and an in-process `sys.meta_path` blocker is insufficient on
    its own because the stale package attribute satisfies the import.
@@ -807,7 +806,7 @@ convention and does not need one.
 - **`docker-compose.yml`** — the new env vars, commented, at their defaults.
 - **This file** — replace "proposed" with what was actually built, record the
   connector-setup findings, and note anything that turned out differently.
-  That is the convention `meeting-transcriber`'s `CLAUDE.md` describes and it
+  That is the convention the earlier connector's notes describe, and it
   is what makes these documents worth writing.
 
 ---

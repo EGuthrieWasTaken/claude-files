@@ -404,19 +404,19 @@ def commit_explicit_paths_include_new_untracked_files_whole_repo_scope() -> None
 
 @test
 def commit_new_file_beside_tracked_files_is_committed_with_explicit_paths() -> None:
-    """The reported shape exactly: daily-briefs/news-log.md (tracked, modified)
-    plus daily-briefs/2026/x.pdf, a new file in a folder that already holds
+    """The reported shape exactly: reports/news-log.md (tracked, modified)
+    plus reports/2026/x.pdf, a new file in a folder that already holds
     tracked files. This is the shape git 2.47 got wrong in whole-repo scope."""
     for scope_dir, base in (("sub-folder-1", "sub-folder-1/"), (None, "")):
         w = World(scope_dir=scope_dir)
-        w.host_commit(f"{base}daily-briefs/news-log.md", "log\n")
-        w.host_commit(f"{base}daily-briefs/2026/old.pdf", "old\n")
+        w.host_commit(f"{base}reports/news-log.md", "log\n")
+        w.host_commit(f"{base}reports/2026/old.pdf", "old\n")
         g = w.ops()
-        w.write(f"{base}daily-briefs/news-log.md", "log\nmore\n")
-        (w.repo / f"{base}daily-briefs/2026/x.pdf").write_bytes(b"%PDF-1.4\n\x00\xff binary\n")
-        res = g.commit("brief", paths=["daily-briefs/news-log.md", "daily-briefs/2026/x.pdf"])
+        w.write(f"{base}reports/news-log.md", "log\nmore\n")
+        (w.repo / f"{base}reports/2026/x.pdf").write_bytes(b"%PDF-1.4\n\x00\xff binary\n")
+        res = g.commit("report", paths=["reports/news-log.md", "reports/2026/x.pdf"])
         assert res["files_changed"] == 2 and not res.get("skipped"), res
-        assert changed_in_head(w) == {f"{base}daily-briefs/news-log.md", f"{base}daily-briefs/2026/x.pdf"}
+        assert changed_in_head(w) == {f"{base}reports/news-log.md", f"{base}reports/2026/x.pdf"}
         assert w.host("status", "--porcelain").strip() == ""
 
 

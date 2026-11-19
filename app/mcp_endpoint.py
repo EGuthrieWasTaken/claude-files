@@ -1,9 +1,9 @@
 """Streamable HTTP MCP endpoint mounted at /mcp.
 
 Design brief: docs/plan-mcp-connector.md -- read that before touching this
-file. It mirrors meeting-transcriber/app/mcp_endpoint.py closely enough that
-a reader of one recognises the other; four gotchas were found there and
-reproduce here unchanged:
+file. It mirrors an earlier connector built on the same SDK closely enough
+that a reader of one would recognise the other; four gotchas were found there
+and reproduce here unchanged:
 
 1. **Mounting is not enough.** `mcp.streamable_http_app()` returns a
    Starlette app whose own `lifespan=` starts its session manager --
@@ -48,7 +48,7 @@ reproduce here unchanged:
    -- `/mcp` is gated by the token check either way.
 
 Auth: reuse `_check_token()` (`app/main.py`) via middleware wrapping the
-mounted sub-app, exactly as meeting-transcriber's `_RequireAuth` does --
+mounted sub-app, exactly as the earlier connector's `_RequireAuth` does --
 FastAPI's `Depends` machinery (`ReadAuth`/`WriteAuth`) does not apply to a
 raw mounted Starlette app.
 

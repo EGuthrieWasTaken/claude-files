@@ -1,6 +1,6 @@
 services:
   claude-files:
-    image: eguthriewastaken2/claude-files:1.1.0
+    image: ghcr.io/eguthriewastaken/claude-files:1.1.0
     # Uncomment to build from source instead of pulling:
     # build: .
     container_name: claude-files
@@ -15,15 +15,15 @@ services:
     #   right side = always /data
     # ------------------------------------------------------------------
     volumes:
-      - /mnt/user/appdata/repos/myrepo/shared:/data
+      - /srv/repos/myrepo/shared:/data
       # GIT TOOLS (ENABLE_GIT_READ/WRITE), subfolder layout. Replace the line
       # above with these, so git can see the repository but the KERNEL still
       # stops anything except .git and the shared folder from being written:
-      #   - /mnt/user/appdata/repos/myrepo:/repo:ro
-      #   - /mnt/user/appdata/repos/myrepo/.git:/repo/.git
-      #   - /mnt/user/appdata/repos/myrepo/shared:/repo/shared
-      #   - /mnt/user/appdata/keys/deploy_ed25519:/keys/id_ed25519:ro
-      #   - /mnt/user/appdata/keys/known_hosts:/keys/known_hosts:ro
+      #   - /srv/repos/myrepo:/repo:ro
+      #   - /srv/repos/myrepo/.git:/repo/.git
+      #   - /srv/repos/myrepo/shared:/repo/shared
+      #   - /srv/keys/deploy_ed25519:/keys/id_ed25519:ro
+      #   - /srv/keys/known_hosts:/keys/known_hosts:ro
       # and set DATA_ROOT=/repo/shared, GIT_REPO_ROOT=/repo (below). Use a
       # deploy key scoped to this one repository.
 
@@ -43,12 +43,16 @@ services:
 
       # -- Optional MCP connector (see README.md, "MCP connector") --------
       ENABLE_MCP: "true"        # mount /mcp; set false to disable at runtime
-      # This service's public hostname, e.g. claude-files.example.dev. Used
-      # only to allow-list the Host header the MCP SDK's DNS-rebinding guard
-      # checks; left blank, that guard is disabled rather than 421ing every
-      # request through the tunnel. /mcp is still gated by API_TOKEN either
-      # way.
-      MCP_PUBLIC_HOSTNAME: ""
+      # This service's public hostname, e.g. files.example.com. Used only to
+      # allow-list the Host header the MCP SDK's DNS-rebinding guard checks;
+      # left blank, that guard is disabled rather than 421ing every request
+      # through your reverse proxy or tunnel. /mcp is still gated by
+      # API_TOKEN either way.
+      MCP_PUBLIC_HOSTNAME: "${MCP_PUBLIC_HOSTNAME:-}"
+      # Base URL for the one-time upload/download links (request_upload /
+      # request_download). Unset: https://$MCP_PUBLIC_HOSTNAME, else the
+      # request's forwarded host.
+      PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:-}"
       MCP_INLINE_LIMIT_CHARS: "100000"    # read_file's inline text budget
       MCP_BASE64_LIMIT_BYTES: "8192"      # write_file's single-shot base64 cap (advisory); over
                                            # it, write_file refuses and names begin_write
@@ -72,8 +76,12 @@ services:
       # SSH_KNOWN_HOSTS_PATH: "/keys/known_hosts"   # required with a key; no trust-on-first-use
       # GIT_PULL_OUTSIDE_SCOPE: "false"         # needs the repo root mounted read-write
 
-    # unRAID's nobody:users. Files the API writes will be owned by this.
-    user: "99:100"
+    # Files the API writes are owned by this uid:gid, and the shared folder
+    # must be writable by it. Set PUID/PGID in .env to match the folder's
+    # owner (on unRAID: 99 and 100, nobody:users). For the git tools over
+    # ssh, use 1000 or 99: those are the uids the image has passwd entries
+    # for, and OpenSSH refuses to run without one.
+    user: "${PUID:-1000}:${PGID:-1000}"
 
     ports:
       - "8080:8080"
@@ -107,7 +115,7 @@ services:
   # folder the API can write. Anything else in the working tree is left alone.
   # ------------------------------------------------------------------------
   autocommit:
-    image: eguthriewastaken2/claude-files-autocommit:1.1.0
+    image: ghcr.io/eguthriewastaken/claude-files-autocommit:1.1.0
     # build: ./autocommit
     container_name: claude-files-autocommit
     restart: unless-stopped
@@ -116,10 +124,10 @@ services:
 
     volumes:
       # The repo root -- .git is required to commit.
-      - /mnt/user/appdata/repos/myrepo:/repo
+      - /srv/repos/myrepo:/repo
       # A deploy key with write access to this one repo, read-only to us.
-      - /mnt/user/appdata/keys/deploy_ed25519:/keys/id_ed25519:ro
-      - /mnt/user/appdata/keys/known_hosts:/keys/known_hosts:ro
+      - /srv/keys/deploy_ed25519:/keys/id_ed25519:ro
+      - /srv/keys/known_hosts:/keys/known_hosts:ro
 
     environment:
       REPO_PATH: "/repo"
@@ -137,7 +145,8 @@ services:
       SSH_KNOWN_HOSTS_PATH: "/keys/known_hosts"
       PUSH: "true"
 
-    user: "99:100"
+    # Same uid:gid as the API above, so the two agree on file ownership.
+    user: "${PUID:-1000}:${PGID:-1000}"
 
     read_only: true
     tmpfs:

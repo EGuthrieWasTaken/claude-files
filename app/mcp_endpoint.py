@@ -99,6 +99,7 @@ from mcp.types import ToolAnnotations
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
+from . import extensions as _ext
 from .git_ops import GitOpError, GitRepo
 from .safepath import PathError
 
@@ -176,9 +177,20 @@ def _build_instructions() -> str:
     return _INSTRUCTIONS.replace(old, new)
 
 
+def _load_extensions() -> list[_ext.LoadedExtension]:
+    """Import the EXTRA_TOOL_MODULES (docs/extensions.md) before the server is
+    built, so their INSTRUCTIONS can join the server instructions. Their tools
+    are registered at the bottom of this module, after the core ones."""
+    from . import main as appmain
+
+    return _ext.load(appmain.CONFIG.extra_tool_modules)
+
+
+_EXTENSIONS = _load_extensions()
+
 mcp = FastMCP(
     "claude-files",
-    instructions=_build_instructions(),
+    instructions=_ext.combined_instructions(_build_instructions(), _EXTENSIONS),
     streamable_http_path="/",
     transport_security=_transport_security(),
     stateless_http=True,
@@ -477,6 +489,7 @@ def get_folder_info(ctx: Context) -> dict[str, Any]:
         },
     }
     info["git"] = appmain.GIT.info_block() if appmain.GIT is not None else GitRepo.disabled_info()
+    info["extensions"] = _ext.info_block(_EXTENSIONS)
     return info
 
 
@@ -1560,3 +1573,32 @@ def _register_git_tools() -> None:
 
 
 _register_git_tools()
+
+
+# =============================================================================
+# Extension tools -- docs/extensions.md
+#
+# Last, so a core tool always owns its name: an extension that tries to reuse
+# one stops the server from starting (ExtensionAPI.add_tool).
+# =============================================================================
+
+
+def _register_extensions() -> None:
+    from . import main as appmain
+
+    _ext.register_all(
+        _EXTENSIONS,
+        mcp=mcp,
+        config=appmain.CONFIG,
+        vault=appmain.VAULT,
+        git=appmain.GIT,
+        guard=_guard,
+        require_write=_require_write,
+    )
+
+
+_register_extensions()
+
+
+def extensions_info() -> dict[str, Any]:
+    return _ext.info_block(_EXTENSIONS)

@@ -470,6 +470,7 @@ def info(scope: ReadAuth) -> dict[str, Any]:
         "download_ticket_ttl_seconds": CONFIG.download_ticket_ttl_seconds,
         "download_tickets_max": CONFIG.download_tickets_max,
         "git": GIT.info_block() if GIT is not None else GitRepo.disabled_info(),
+        "extensions": _mcp_endpoint.extensions_info() if _mcp_endpoint is not None else None,
     }
 
 
@@ -1271,6 +1272,15 @@ def git_merge(req: GitMergeRequest, _: WriteAuth) -> dict[str, Any]:
 try:
     from . import mcp_endpoint as _mcp_endpoint
 except ImportError:
+    if CONFIG.extra_tool_modules:
+        # The extensions' tools only exist on /mcp; starting without it would
+        # leave them silently missing. (An extension that fails to import
+        # raises ExtensionError, a RuntimeError, so it never lands here.)
+        raise RuntimeError(
+            "EXTRA_TOOL_MODULES is set, but this image was built without the MCP SDK "
+            "(--build-arg WITH_MCP=0), so there is no /mcp endpoint to add tools to. "
+            "Rebuild with WITH_MCP=1, or unset EXTRA_TOOL_MODULES."
+        ) from None
     _mcp_endpoint = None
     log.info("mcp not installed; /mcp endpoint disabled (REST API unaffected)")
 else:
@@ -1280,3 +1290,8 @@ else:
     else:
         _mcp_endpoint = None
         log.info("ENABLE_MCP=false; /mcp endpoint disabled")
+        if CONFIG.extra_tool_modules:
+            log.warning(
+                "ENABLE_MCP=false: the tools from EXTRA_TOOL_MODULES (%s) are unreachable",
+                ", ".join(CONFIG.extra_tool_modules),
+            )

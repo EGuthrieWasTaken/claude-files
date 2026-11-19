@@ -862,18 +862,16 @@ open.
 
 ## Publishing a new version
 
-> **1.1.0's release notes should say:** the integrity floor
-> (`X-Expect-Bytes`/`X-Expect-Sha256`, `sha256` in every write response) and
-> `GET /v1/bridge.py` (see [the local bridge](#uploading-binary-files-the-local-bridge))
-> are both new in this version — a deployment still running `1.0.0` reports
-> neither, which is exactly the gap
-> [`docs/feature-request-path-based-upload.md`](docs/feature-request-path-based-upload.md)
-> (Part 0) was written against. After redeploying, **verify from a client,
-> not the host**: `GET /health` reports `"version":"1.1.0"`, and `GET
-> /v1/info` reports `bridge_available:true`. If a claude.ai connector still
-> shows the old tool list, its tool cache needs refreshing — remove and
-> re-add the connector. `unraid/deploy.sh verify` runs exactly these checks
-> for you.
+> **1.2.0's release notes should say:** `EXTRA_TOOL_MODULES`
+> ([extension modules](#extension-modules), [`docs/extensions.md`](docs/extensions.md))
+> is new in this version: a derived image can add its own tools to `/mcp`, and
+> `GET /v1/info` and `get_folder_info` gain an `extensions` block. Derived
+> images should build `FROM eguthriewastaken2/claude-files:1.2.0` (or later),
+> not `:latest`. Nothing changes for a deployment that leaves
+> `EXTRA_TOOL_MODULES` unset. After redeploying, **verify from a client, not
+> the host**: `GET /health` reports `"version":"1.2.0"`, and `GET /v1/info`
+> has `"extensions": {"api_version": 1, ...}`. `unraid/deploy.sh verify`
+> checks the version for you.
 
 `unraid/deploy.sh` scripts the redeploy-and-verify half of this section —
 `build` (the buildx command below), `pull` + recreate (via `docker compose`
@@ -894,19 +892,19 @@ The image is multi-arch (`linux/amd64` for unRAID, `linux/arm64` for local
 work on Apple silicon). Build both in one shot and push a single manifest:
 
 ```bash
-docker buildx build --platform linux/amd64,linux/arm64 --tag eguthriewastaken2/claude-files:1.1.0 --tag eguthriewastaken2/claude-files:latest --push .
+docker buildx build --platform linux/amd64,linux/arm64 --tag eguthriewastaken2/claude-files:1.2.0 --tag eguthriewastaken2/claude-files:latest --push .
 ```
 
 Confirm both architectures landed under one tag:
 
 ```bash
-docker buildx imagetools inspect eguthriewastaken2/claude-files:1.1.0
+docker buildx imagetools inspect eguthriewastaken2/claude-files:1.2.0
 ```
 
 The sidecar is a separate image, built the same way:
 
 ```bash
-docker buildx build --platform linux/amd64,linux/arm64 --tag eguthriewastaken2/claude-files-autocommit:1.1.0 --tag eguthriewastaken2/claude-files-autocommit:latest --push ./autocommit
+docker buildx build --platform linux/amd64,linux/arm64 --tag eguthriewastaken2/claude-files-autocommit:1.2.0 --tag eguthriewastaken2/claude-files-autocommit:latest --push ./autocommit
 ```
 
 Building on separate machines and pushing to the same tag does **not** produce
@@ -914,13 +912,13 @@ a multi-arch image -- the second push replaces the first. If you build
 natively on each host, push arch-suffixed tags and merge them:
 
 ```bash
-docker buildx imagetools create --tag eguthriewastaken2/claude-files:1.1.0 eguthriewastaken2/claude-files:1.1.0-arm64 eguthriewastaken2/claude-files:1.1.0-amd64
+docker buildx imagetools create --tag eguthriewastaken2/claude-files:1.2.0 eguthriewastaken2/claude-files:1.2.0-arm64 eguthriewastaken2/claude-files:1.2.0-amd64
 ```
 
 On Arch Linux, `docker buildx` is a separate package: `sudo pacman -S docker-buildx`.
 
 The unRAID templates pull `:latest`, so always push both tags. `docker-compose.yml`
-stays pinned to `:1.1.0` on purpose — compose deployments should be
+stays pinned to `:1.2.0` on purpose — compose deployments should be
 reproducible, and `:latest` there would silently change what runs on the next
 `up`.
 
